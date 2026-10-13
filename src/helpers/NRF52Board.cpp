@@ -32,6 +32,22 @@ void NRF52Board::begin() {
   #endif
 }
 
+// MeshCore never starts the nRF52 watchdog, but it can inherit a running one: a
+// started watchdog survives soft resets and bootloader DFU (serial and BLE
+// observed) and only stops on a power-on or watchdog reset. Meshtastic >= 2.7.16
+// arms a 90 s watchdog, so after switching such a node to MeshCore it resets
+// once, ~90 s into its first boot. Keep any inherited watchdog fed; this is a
+// no-op when none is running.
+void NRF52Board::loop() {
+  if (NRF_WDT->RUNSTATUS & WDT_RUNSTATUS_RUNSTATUS_Msk) {
+    for (uint8_t i = 0; i < sizeof(NRF_WDT->RR) / sizeof(NRF_WDT->RR[0]); i++) {
+      if (NRF_WDT->RREN & (1UL << i)) {
+        NRF_WDT->RR[i] = WDT_RR_RR_Reload;
+      }
+    }
+  }
+}
+
 #ifdef NRF52_POWER_MANAGEMENT
 #include "nrf.h"
 
