@@ -22,6 +22,23 @@ void halt() {
 }
 
 static char command[MAX_POST_TEXT_LEN+1];
+
+#if defined(ESP32)
+// powersaving: first sleep this long after boot (time to reach the CLI)
+#define POWERSAVING_FIRSTSLEEP_MILLIS  (120 * 1000UL)
+// ...and this long after the user button is pressed. A sleeping ESP32-S3
+// cannot answer USB enumeration, so: press the button, then plug in a computer.
+#define POWERSAVING_BUTTON_AWAKE_MILLIS  (120 * 1000UL)
+static unsigned long stay_awake_until = 0;
+
+static bool usbHostConnected() {
+#if ARDUINO_USB_MODE && ARDUINO_USB_CDC_ON_BOOT
+  return HWCDC::isConnected();   // a host is polling the USB-Serial/JTAG port
+#else
+  return false;
+#endif
+}
+#endif
 #ifdef ETHERNET_ENABLED
 static char ethernet_command[MAX_POST_TEXT_LEN+1];
 #endif
@@ -31,6 +48,9 @@ void setup() {
   delay(1000);
 
   board.begin();
+#if defined(ESP32) && defined(PIN_USER_BTN)
+  pinMode(PIN_USER_BTN, INPUT_PULLUP);   // powersaving stay-awake button
+#endif
 
 #ifdef HAS_EXTERNAL_WATCHDOG
   external_watchdog.begin();
@@ -156,5 +176,29 @@ void loop() {
   rtc_clock.tick();
 #ifdef HAS_EXTERNAL_WATCHDOG
   external_watchdog.loop();
+#endif
+
+#if defined(ESP32)
+  // Light sleep kills USB serial, so never while a computer is attached: on
+  // a charger it sleeps, on the desk the CLI keeps working.
+#ifdef PIN_USER_BTN
+  if (digitalRead(PIN_USER_BTN) == LOW) {   // button held (active low)
+    stay_awake_until = millis() + POWERSAVING_BUTTON_AWAKE_MILLIS;
+  }
+#endif
+  if (the_mesh.getNodePrefs()->powersaving_enabled && !usbHostConnected()
+      && the_mesh.millisHasNowPassed(POWERSAVING_FIRSTSLEEP_MILLIS)
+      && (stay_awake_until == 0 || the_mesh.millisHasNowPassed(stay_awake_until))
+      && !the_mesh.hasPendingWork()) {
+#ifdef PIN_USER_BTN
+    gpio_wakeup_enable((gpio_num_t)PIN_USER_BTN, GPIO_INTR_LOW_LEVEL);   // button also wakes it
+#endif
+    unsigned long t0 = millis();
+    board.sleep(30);   // wakes on a LoRa packet (DIO1), the button, or after 30 s
+    the_mesh.noteSleep(millis() - t0);
+#ifdef PIN_USER_BTN
+    gpio_wakeup_disable((gpio_num_t)PIN_USER_BTN);
+#endif
+  }
 #endif
 }

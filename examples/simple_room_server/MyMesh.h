@@ -125,7 +125,9 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   uint8_t pending_sf;
   uint8_t pending_cr;
   int  matching_peer_indexes[MAX_CLIENTS];
-  char private_password[16];   // blank = private room disabled
+  char private_password[16];
+  uint32_t _num_sleeps;
+  uint64_t _slept_millis;   // blank = private room disabled
 
   static uint8_t clientRoom(const ClientInfo* client);
   bool isPostFor(const PostInfo& post, const ClientInfo* client) const;
@@ -241,4 +243,6 @@ public:
   void clearStats() override;
   void handleCommand(uint32_t sender_timestamp, char* command, char* reply);
   void loop();
+  bool hasPendingWork();   // true = must stay awake (powersaving)
+  void noteSleep(unsigned long slept_millis) { _num_sleeps++; _slept_millis += slept_millis; }
 };

@@ -734,6 +734,8 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   _prefs.radio_fem_txgain = 0;
 
   memset(private_password, 0, sizeof(private_password));
+  _num_sleeps = 0;
+  _slept_millis = 0;
   next_post_idx = 0;
   next_client_idx = 0;
   next_push = 0;
@@ -1039,6 +1041,10 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
   } else if (strcmp(command, "set room.private.password") == 0) {
     private_password[0] = 0;
     strcpy(reply, savePrivatePassword() ? "OK - private room is admin-only" : "Err - save failed");
+  } else if (strcmp(command, "powersaving") == 0) {   // state + how much it actually sleeps
+    uint32_t pct = uptime_millis ? (uint32_t)(_slept_millis * 100 / uptime_millis) : 0;
+    sprintf(reply, "%s - slept %lu times, %lu%% of uptime", _prefs.powersaving_enabled ? "on" : "off",
+            (unsigned long)_num_sleeps, (unsigned long)pct);
   } else if (strcmp(command, "get room.private.password") == 0) {
     sprintf(reply, "> %s", private_password);
   } else if (strncmp(command, "room.post.private", 17) == 0) {
@@ -1066,6 +1072,21 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
 
 bool MyMesh::saveFilter(ClientInfo* client) {
   return client->isAdmin();    // only save Admins
+}
+
+// powersaving may light-sleep the MCU only when nothing is time-driven: LoRa
+// RX wakes it (DIO1) and a 30 s timer covers adverts, so anything else that
+// runs off a millis() deadline has to keep it awake.
+bool MyMesh::hasPendingWork() {
+  if (_mgr->getOutboundTotal() > 0) return true;   // packets waiting to transmit
+  if (dirty_contacts_expiry || set_radio_at) return true;
+  for (int i = 0; i < acl.getNumClients(); i++) {
+    auto c = acl.getClientByIdx(i);
+    if (c->extra.room.pending_ack) return true;    // push in flight, ack timeout runs
+    if (c->last_activity != 0 && c->extra.room.push_failures < 3
+        && getUnsyncedCount(c) > 0) return true;   // posts to push (same gate as loop())
+  }
+  return false;
 }
 
 void MyMesh::loop() {
