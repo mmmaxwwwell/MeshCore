@@ -27,6 +27,7 @@ struct ClientInfo {
       uint32_t push_post_timestamp;
       unsigned long ack_timeout;
       uint8_t  push_failures;
+      uint8_t  room_id;      // which room this client logged into (simple_room_server)
     } room;
   } extra;
   

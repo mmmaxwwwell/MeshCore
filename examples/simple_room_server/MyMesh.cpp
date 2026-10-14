@@ -38,22 +38,66 @@ struct ServerStats {
   uint16_t n_posted, n_post_push;
 };
 
-void MyMesh::addPost(ClientInfo *client, const char *postData) {
-  storePost(client->id, postData);
+uint8_t MyMesh::clientRoom(const ClientInfo *client) {
+  // Admins always sit in the private room. Only admins are persisted in the
+  // ACL (saveFilter), so this also gives reloaded entries the right room.
+  return client->isAdmin() ? ROOM_PRIVATE : client->extra.room.room_id;
 }
 
-void MyMesh::addSystemPost(const char *postData) {
+bool MyMesh::isPostFor(const PostInfo &post, const ClientInfo *client) const {
+  return post.post_timestamp > client->extra.room.sync_since // is new post for this Client?
+      && post.room_id == clientRoom(client)                  // ...in this Client's room?
+      && !post.author.matches(client->id);                   // don't push posts to the author
+}
+
+void MyMesh::loadPrivatePassword() {
+  memset(private_password, 0, sizeof(private_password));
+  if (!_fs->exists(PRIVATE_PW_FILE)) return;
+#if defined(RP2040_PLATFORM)
+  File f = _fs->open(PRIVATE_PW_FILE, "r");
+#else
+  File f = _fs->open(PRIVATE_PW_FILE);
+#endif
+  if (f) {
+    f.read((uint8_t *)private_password, sizeof(private_password) - 1);
+    f.close();
+  }
+}
+
+bool MyMesh::savePrivatePassword() {
+  if (_fs->exists(PRIVATE_PW_FILE)) _fs->remove(PRIVATE_PW_FILE);
+  if (private_password[0] == 0) return true;   // blank = disabled, no file
+#if defined(NRF52_PLATFORM)
+  File f = _fs->open(PRIVATE_PW_FILE, FILE_O_WRITE);
+#elif defined(RP2040_PLATFORM)
+  File f = _fs->open(PRIVATE_PW_FILE, "w");
+#else
+  File f = _fs->open(PRIVATE_PW_FILE, "w", true);
+#endif
+  if (!f) return false;
+  size_t n = strlen(private_password);
+  bool ok = f.write((const uint8_t *)private_password, n) == n;
+  f.close();
+  return ok;
+}
+
+void MyMesh::addPost(ClientInfo *client, const char *postData) {
+  storePost(client->id, clientRoom(client), postData);
+}
+
+void MyMesh::addSystemPost(const char *postData, uint8_t room_id) {
   if (!postData || postData[0] == 0) return;
 
-  MESH_DEBUG_PRINTLN("room.post: addSystemPost: %s", postData);
+  MESH_DEBUG_PRINTLN("room.post: addSystemPost: room=%d %s", (uint32_t)room_id, postData);
 
-  storePost(self_id, postData);
+  storePost(self_id, room_id, postData);
 }
 
-void MyMesh::storePost(const mesh::Identity &author, const char *postData) {
+void MyMesh::storePost(const mesh::Identity &author, uint8_t room_id, const char *postData) {
   int idx = next_post_idx;
   // TODO: suggested postData format: <title>/<descrption>
   posts[idx].author = author; // add to cyclic queue
+  posts[idx].room_id = room_id;
   StrHelper::strncpy(posts[idx].text, postData, MAX_POST_TEXT_LEN);
 
   posts[idx].post_timestamp = getRTCClock()->getCurrentTimeUnique();
@@ -110,8 +154,7 @@ void MyMesh::pushPostToClient(ClientInfo *client, PostInfo &post) {
 uint8_t MyMesh::getUnsyncedCount(ClientInfo *client) {
   uint8_t count = 0;
   for (int k = 0; k < MAX_UNSYNCED_POSTS; k++) {
-    if (posts[k].post_timestamp > client->extra.room.sync_since // is new post for this Client?
-        && !posts[k].author.matches(client->id)) {   // don't push posts to the author
+    if (isPostFor(posts[k], client)) {
       count++;
     }
   }
@@ -342,10 +385,15 @@ void MyMesh::onAnonDataRecv(mesh::Packet *packet, const uint8_t *secret, const m
     }
     if (client == NULL) {
       uint8_t perm;
+      uint8_t room_id = ROOM_PUBLIC;
       if (strcmp((char *)&data[8], _prefs.password) == 0) { // check for valid admin password
         perm = PERM_ACL_ADMIN;
+        room_id = ROOM_PRIVATE;
       } else {
-        if (strcmp((char *)&data[8], _prefs.guest_password) == 0) {   // check the room/public password
+        if (private_password[0] && strcmp((char *)&data[8], private_password) == 0) {   // the private room
+          perm = PERM_ACL_READ_WRITE;
+          room_id = ROOM_PRIVATE;
+        } else if (strcmp((char *)&data[8], _prefs.guest_password) == 0) {   // check the room/public password
           perm = PERM_ACL_READ_WRITE;
         } else if (_prefs.allow_read_only) {
           perm = PERM_ACL_GUEST;
@@ -366,6 +414,7 @@ void MyMesh::onAnonDataRecv(mesh::Packet *packet, const uint8_t *secret, const m
       client->extra.room.sync_since = sender_sync_since;
       client->extra.room.pending_ack = 0;
       client->extra.room.push_failures = 0;
+      client->extra.room.room_id = room_id;
 
       client->last_activity = getRTCClock()->getCurrentTime();
       client->permissions &= ~0x03;
@@ -684,6 +733,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   _prefs.radio_fem_rxgain = 1;
   _prefs.radio_fem_txgain = 0;
 
+  memset(private_password, 0, sizeof(private_password));
   next_post_idx = 0;
   next_client_idx = 0;
   next_push = 0;
@@ -701,6 +751,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
 
   acl.load(_fs, self_id);
   region_map.load(_fs);
+  loadPrivatePassword();
 
   // establish default-scope
   {
@@ -974,13 +1025,38 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
       Serial.printf("\n");
     }
     reply[0] = 0;
+  } else if (memcmp(command, "set room.private.password ", 26) == 0) {
+    // blank (no argument) disables the private room; only admins can then reach it
+    const char* pw = &command[26];
+    if (strlen(pw) >= sizeof(private_password)) {
+      sprintf(reply, "Err - max %d chars", (int)sizeof(private_password) - 1);
+    } else if (pw[0] && (strcmp(pw, _prefs.guest_password) == 0 || strcmp(pw, _prefs.password) == 0)) {
+      strcpy(reply, "Err - must differ from guest and admin passwords");
+    } else {
+      StrHelper::strncpy(private_password, pw, sizeof(private_password));
+      strcpy(reply, savePrivatePassword() ? "OK" : "Err - save failed");
+    }
+  } else if (strcmp(command, "set room.private.password") == 0) {
+    private_password[0] = 0;
+    strcpy(reply, savePrivatePassword() ? "OK - private room is admin-only" : "Err - save failed");
+  } else if (strcmp(command, "get room.private.password") == 0) {
+    sprintf(reply, "> %s", private_password);
+  } else if (strncmp(command, "room.post.private", 17) == 0) {
+    char* msg = command + 17;
+    while (*msg == ' ') msg++;
+    if (*msg == 0) {
+      snprintf(reply, MAX_POST_TEXT_LEN, "ERR empty message");
+    } else {
+      addSystemPost(msg, ROOM_PRIVATE);
+      snprintf(reply, MAX_POST_TEXT_LEN, "OK");
+    }
   } else if (strncmp(command, "room.post", 9) == 0) {
     char* msg = command + 9;
     while (*msg == ' ') msg++;
     if (*msg == 0) {
       snprintf(reply, MAX_POST_TEXT_LEN, "ERR empty message");
     } else {
-      addSystemPost(msg);
+      addSystemPost(msg, ROOM_PUBLIC);
       snprintf(reply, MAX_POST_TEXT_LEN, "OK");
     }
   } else{
@@ -1014,9 +1090,7 @@ void MyMesh::loop() {
       uint32_t now = getRTCClock()->getCurrentTime();
       for (int k = 0, idx = next_post_idx; k < MAX_UNSYNCED_POSTS; k++) {
         auto p = &posts[idx];
-        if (now >= p->post_timestamp + POST_SYNC_DELAY_SECS &&
-            p->post_timestamp > client->extra.room.sync_since // is new post for this Client?
-            && !p->author.matches(client->id)) {   // don't push posts to the author
+        if (now >= p->post_timestamp + POST_SYNC_DELAY_SECS && isPostFor(*p, client)) {
           // push this post to Client, then wait for ACK
           pushPostToClient(client, *p);
           did_push = true;

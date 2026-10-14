@@ -83,9 +83,16 @@
 
 #define MAX_POST_TEXT_LEN    (160-9)
 
+// Two rooms behind one identity: the password a client logs in with picks
+// the room. Posts are only ever pushed to clients of the same room.
+#define ROOM_PUBLIC    0   // guest password
+#define ROOM_PRIVATE   1   // private password, and every admin
+#define PRIVATE_PW_FILE  "/room_private_pw"
+
 struct PostInfo {
   mesh::Identity author;
   uint32_t post_timestamp;   // by OUR clock
+  uint8_t room_id;
   char text[MAX_POST_TEXT_LEN+1];
 };
 
@@ -118,9 +125,14 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   uint8_t pending_sf;
   uint8_t pending_cr;
   int  matching_peer_indexes[MAX_CLIENTS];
+  char private_password[16];   // blank = private room disabled
 
+  static uint8_t clientRoom(const ClientInfo* client);
+  bool isPostFor(const PostInfo& post, const ClientInfo* client) const;
+  void loadPrivatePassword();
+  bool savePrivatePassword();
   void addPost(ClientInfo* client, const char* postData);
-  void storePost(const mesh::Identity& author, const char* postData);
+  void storePost(const mesh::Identity& author, uint8_t room_id, const char* postData);
   void pushPostToClient(ClientInfo* client, PostInfo& post);
   uint8_t getUnsyncedCount(ClientInfo* client);
   bool processAck(const uint8_t *data);
@@ -178,7 +190,7 @@ public:
   MyMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh::MillisecondClock& ms, mesh::RNG& rng, mesh::RTCClock& rtc, mesh::MeshTables& tables);
 
   void begin(FILESYSTEM* fs);
-  void addSystemPost(const char* postData);
+  void addSystemPost(const char* postData, uint8_t room_id = ROOM_PUBLIC);
 
   const char* getFirmwareVer() override { return FIRMWARE_VERSION; }
   const char* getBuildDate() override { return FIRMWARE_BUILD_DATE; }
