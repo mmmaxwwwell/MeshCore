@@ -20,6 +20,9 @@ class ESP32Board : public mesh::MainBoard {
 protected:
   uint8_t startup_reason;
   bool inhibit_sleep = false;
+  const char* ota_password = NULL;   // opt-in WPA2 for the OTA access point
+  unsigned long ota_off_at = 0;      // opt-in auto-off (otaLoop)
+  void* ota_server = NULL;
   static inline portMUX_TYPE sleepMux = portMUX_INITIALIZER_UNLOCKED;
 
 public:
@@ -155,6 +158,14 @@ public:
   }
 
   bool startOTAUpdate(const char* id, char reply[]) override;
+
+  // Opt-in OTA hardening. A firmware that calls setOTAPassword() gets a WPA2
+  // access point keyed with that password (8+ chars, else `start ota` is
+  // refused) instead of an open one; calling otaLoop() from loop() switches
+  // the OTA window off once it has been idle (no station) for
+  // OTA_IDLE_TIMEOUT_MILLIS. Builds that call neither behave as before.
+  void setOTAPassword(const char* pw) { ota_password = pw; }
+  void otaLoop();
 
   void setInhibitSleep(bool inhibit) {
     inhibit_sleep = inhibit;
