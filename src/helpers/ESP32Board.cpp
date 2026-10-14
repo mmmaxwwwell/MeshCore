@@ -11,9 +11,21 @@
 
 #include <SPIFFS.h>
 
+#ifndef OTA_IDLE_TIMEOUT_MILLIS
+  #define OTA_IDLE_TIMEOUT_MILLIS  (10 * 60 * 1000UL)
+#endif
+
 bool ESP32Board::startOTAUpdate(const char* id, char reply[]) {
+  if (ota_server) {
+    strcpy(reply, "Err - OTA already running");
+    return true;
+  }
+  if (ota_password && strlen(ota_password) < 8) {   // WPA2 needs 8..63 chars
+    strcpy(reply, "Err - admin password must be 8+ chars for WPA2 OTA");
+    return true;
+  }
   inhibit_sleep = true;   // prevent sleep during OTA
-  WiFi.softAP("MeshCore-OTA", NULL);
+  WiFi.softAP("MeshCore-OTA", ota_password);   // NULL = open AP (upstream default)
 
   sprintf(reply, "Started: http://%s/update", WiFi.softAPIP().toString().c_str());
   MESH_DEBUG_PRINTLN("startOTAUpdate: %s", reply);
@@ -35,14 +47,33 @@ bool ESP32Board::startOTAUpdate(const char* id, char reply[]) {
   AsyncElegantOTA.setID(id_buf);
   AsyncElegantOTA.begin(server);    // Start ElegantOTA
   server->begin();
+  ota_server = server;
+  ota_off_at = millis() + OTA_IDLE_TIMEOUT_MILLIS;
+  if (ota_password) strcat(reply, " (WPA2: admin password)");
 
   return true;
+}
+
+void ESP32Board::otaLoop() {
+  if (ota_server == NULL || (long)(millis() - ota_off_at) < 0) return;
+  if (WiFi.softAPgetStationNum() > 0) {   // someone is still on: give them another minute
+    ota_off_at = millis() + 60 * 1000UL;
+    return;
+  }
+  ((AsyncWebServer*)ota_server)->end();
+  delete (AsyncWebServer*)ota_server;
+  ota_server = NULL;
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+  inhibit_sleep = false;
+  MESH_DEBUG_PRINTLN("OTA window closed (idle)");
 }
 
 #else
 bool ESP32Board::startOTAUpdate(const char* id, char reply[]) {
   return false; // not supported
 }
+void ESP32Board::otaLoop() { }
 #endif
 
 void ESP32Board::powerOff() {
