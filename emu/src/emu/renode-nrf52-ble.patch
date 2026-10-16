@@ -1,0 +1,1260 @@
+diff --git a/src/Emulator/Main/Peripherals/Timers/ComparingTimer.cs b/src/Emulator/Main/Peripherals/Timers/ComparingTimer.cs
+index f6919535e..b29104b5c 100644
+--- a/src/Emulator/Main/Peripherals/Timers/ComparingTimer.cs
++++ b/src/Emulator/Main/Peripherals/Timers/ComparingTimer.cs
+@@ -116,7 +116,12 @@ public ulong Value
+                 var currentValue = 0UL;
+                 clockSource.GetClockEntryInLockContext(CompareReachedInternal, entry =>
+                 {
+-                    currentValue = valueAccumulatedSoFar + entry.Value;
++                    // The entry can run past its period before CompareReachedInternal is scheduled;
++                    // that handler then adds only the period and restarts from 0, so reporting the
++                    // overshoot here made the value step BACKWARDS on the next read (an nRF52 RTC
++                    // COUNTER went 307 -> 306, and FreeRTOS's tick catch-up wrapped to ~2^24 ticks).
++                    // Hold at the compare point until the handler has run.
++                    currentValue = valueAccumulatedSoFar + Math.Min(entry.Value, entry.Period);
+                 });
+                 return currentValue;
+             }
+diff --git a/src/Emulator/Peripherals/Peripherals/Analog/NRF52840_SAADC.cs b/src/Emulator/Peripherals/Peripherals/Analog/NRF52840_SAADC.cs
+new file mode 100644
+index 000000000..49a7e0b74
+--- /dev/null
++++ b/src/Emulator/Peripherals/Peripherals/Analog/NRF52840_SAADC.cs
+@@ -0,0 +1,108 @@
++//
++// nRF52840 SAADC, minimal: every task completes instantly. SAMPLE writes
++// RESULT.MAXCNT 16-bit samples of SampleValue to RESULT.PTR and raises
++// END/DONE/RESULTDONE, which is all a polled analogRead() needs.
++//
++using System;
++using System.Collections.Generic;
++
++using Antmicro.Renode.Core;
++using Antmicro.Renode.Peripherals.Bus;
++
++namespace Antmicro.Renode.Peripherals.Analog
++{
++    public sealed class NRF52840_SAADC : IDoubleWordPeripheral, IKnownSize
++    {
++        public NRF52840_SAADC(IMachine machine)
++        {
++            sysbus = machine.GetSystemBus(this);
++            IRQ = new GPIO();
++        }
++
++        public long Size => 0x1000;
++        public GPIO IRQ { get; }
++
++        // Raw result returned for every channel (12-bit scale by default).
++        public short SampleValue { get; set; } = 2200;
++
++        public void Reset()
++        {
++            regs.Clear();
++            IRQ.Unset();
++        }
++
++        public uint ReadDoubleWord(long offset)
++        {
++            if(offset == IntEnSet || offset == IntEnClr) offset = IntEn;
++            if(offset == Status) return 0;   // ready
++            return regs.TryGetValue(offset, out var v) ? v : 0;
++        }
++
++        public void WriteDoubleWord(long offset, uint value)
++        {
++            switch(offset)
++            {
++            case TaskStart: if(value != 0) Fire(EvStarted); return;
++            case TaskSample:
++                if(value == 0) return;
++                var count = (int)Get(ResultMaxCnt);
++                var ptr = Get(ResultPtr);
++                for(var i = 0; i < count; i++)
++                {
++                    sysbus.WriteWord(ptr + (ulong)(2 * i), (ushort)SampleValue);
++                }
++                regs[ResultAmount] = (uint)count;
++                Fire(EvResultDone); Fire(EvDone); Fire(EvEnd);
++                return;
++            case TaskStop: if(value != 0) Fire(EvStopped); return;
++            case TaskCalibrate: if(value != 0) Fire(EvCalibrateDone); return;
++            case IntEnSet: regs[IntEn] = Get(IntEn) | value; Update(); return;
++            case IntEnClr: regs[IntEn] = Get(IntEn) & ~value; Update(); return;
++            default:
++                regs[offset] = value;
++                if(offset >= 0x100 && offset < 0x200 || offset == IntEn) Update();
++                return;
++            }
++        }
++
++        private uint Get(long o) => regs.TryGetValue(o, out var v) ? v : 0;
++
++        private void Fire(long ev)
++        {
++            regs[ev] = 1;
++            Update();
++        }
++
++        private void Update()
++        {
++            var en = Get(IntEn);
++            var on = false;
++            for(var i = 0; i < 22; i++)
++            {
++                if((en & (1u << i)) != 0 && Get(0x100 + 4 * i) != 0) on = true;
++            }
++            IRQ.Set(on);
++        }
++
++        private readonly IBusController sysbus;
++        private readonly Dictionary<long, uint> regs = new Dictionary<long, uint>();
++
++        private const long TaskStart = 0x000;
++        private const long TaskSample = 0x004;
++        private const long TaskStop = 0x008;
++        private const long TaskCalibrate = 0x00C;
++        private const long EvStarted = 0x100;
++        private const long EvEnd = 0x104;
++        private const long EvDone = 0x108;
++        private const long EvResultDone = 0x10C;
++        private const long EvCalibrateDone = 0x110;
++        private const long EvStopped = 0x114;
++        private const long IntEn = 0x300;
++        private const long IntEnSet = 0x304;
++        private const long IntEnClr = 0x308;
++        private const long Status = 0x400;
++        private const long ResultPtr = 0x62C;
++        private const long ResultMaxCnt = 0x630;
++        private const long ResultAmount = 0x634;
++    }
++}
+diff --git a/src/Emulator/Peripherals/Peripherals/Miscellaneous/NRF52840_CCM.cs b/src/Emulator/Peripherals/Peripherals/Miscellaneous/NRF52840_CCM.cs
+new file mode 100644
+index 000000000..2bd506810
+--- /dev/null
++++ b/src/Emulator/Peripherals/Peripherals/Miscellaneous/NRF52840_CCM.cs
+@@ -0,0 +1,306 @@
++//
++// nRF52840 CCM + AAR (shared base 0x4000F000), modelled for BLE link
++// encryption in emulation. Not cycle accurate:
++//  - encrypt runs at the CRYPT task (the radio reads OUTPTR afterwards, at START);
++//  - decrypt is deferred to the radio's END event, when the received packet
++//    is in RAM (the hardware decrypts on the fly while receiving).
++// Packet layout in RAM: [S0 header][LENGTH][S1/RFU][payload][MIC].
++//
++using System;
++using System.Collections.Generic;
++using System.Security.Cryptography;
++
++using Antmicro.Renode.Core;
++using Antmicro.Renode.Logging;
++using Antmicro.Renode.Peripherals.Bus;
++using Antmicro.Renode.Peripherals.Wireless;
++
++namespace Antmicro.Renode.Peripherals.Miscellaneous
++{
++    public sealed class NRF52840_CCM : IDoubleWordPeripheral, IKnownSize, INRFEventProvider
++    {
++        public NRF52840_CCM(IMachine machine, NRF52840_Radio radio)
++        {
++            this.machine = machine;
++            sysbus = machine.GetSystemBus(this);
++            IRQ = new GPIO();
++            radio.EventTriggered += OnRadioEvent;
++            Reset();
++        }
++
++        public void Reset()
++        {
++            regs.Clear();
++            pendingDecrypt = false;
++            IRQ.Unset();
++        }
++
++        public long Size => 0x1000;
++        public GPIO IRQ { get; }
++        public event Action<uint> EventTriggered;
++
++        public uint ReadDoubleWord(long offset)
++        {
++            if(offset == IntEnClr) offset = IntEnSet;
++            return regs.TryGetValue(offset, out var v) ? v : 0;
++        }
++
++        public void WriteDoubleWord(long offset, uint value)
++        {
++            switch(offset)
++            {
++            case TaskKsgenOrAarStart:
++                if(value == 0) return;
++                if(AarMode) { RunAar(); }
++                else
++                {
++                    Fire(EvEndKsgen);
++                    if((Get(Shorts) & 1) != 0) { Crypt(); }
++                }
++                return;
++            case TaskCrypt:
++                if(value != 0 && !AarMode) Crypt();
++                return;
++            case TaskStop:
++                pendingDecrypt = false;
++                return;
++            case IntEnSet:
++                regs[IntEnSet] = Get(IntEnSet) | value;
++                Update();
++                return;
++            case IntEnClr:
++                regs[IntEnSet] = Get(IntEnSet) & ~value;
++                Update();
++                return;
++            default:
++                regs[offset] = value;
++                if(offset >= 0x100 && offset < 0x200) Update();
++                return;
++            }
++        }
++
++        private bool AarMode => (Get(Enable) & 3) == 3;
++        private uint Get(long o) => regs.TryGetValue(o, out var v) ? v : 0;
++
++        private void Fire(long ev)
++        {
++            regs[ev] = 1;
++            EventTriggered?.Invoke((uint)ev);
++            Update();
++        }
++
++        private void Update()
++        {
++            var en = Get(IntEnSet);
++            var on = false;
++            for(var i = 0; i < 3; i++)
++            {
++                if((en & (1u << i)) != 0 && Get(0x100 + i * 4) != 0) on = true;
++            }
++            IRQ.Set(on);
++        }
++
++        private void Crypt()
++        {
++            if((Get(Mode) & 1) == 0)
++            {
++                Encrypt();
++                Fire(EvEndCrypt);
++            }
++            else
++            {
++                pendingDecrypt = true;
++            }
++        }
++
++        private void OnRadioEvent(uint offset)
++        {
++            if(offset == RadioEventEnd && pendingDecrypt)
++            {
++                pendingDecrypt = false;
++                Decrypt();
++                Fire(EvEndCrypt);
++            }
++        }
++
++        private void LoadConfig(out byte[] key, out byte[] nonce)
++        {
++            var cnf = sysbus.ReadBytes(Get(CnfPtr), 33);
++            key = new byte[16];
++            Array.Copy(cnf, 0, key, 0, 16);
++            nonce = new byte[13];
++            Array.Copy(cnf, 16, nonce, 0, 5);
++            nonce[4] = (byte)((nonce[4] & 0x7F) | ((cnf[24] & 1) << 7));
++            Array.Copy(cnf, 25, nonce, 5, 8);
++        }
++
++        private void Encrypt()
++        {
++            var inPtr = Get(InPtr);
++            var outPtr = Get(OutPtr);
++            var hdr = sysbus.ReadBytes(inPtr, 3);
++            int len = hdr[1];
++            if(len == 0)
++            {
++                sysbus.WriteBytes(hdr, outPtr);
++                return;
++            }
++            var pt = sysbus.ReadBytes(inPtr + 3, len);
++            LoadConfig(out var key, out var nonce);
++            var ct = Ccm(key, nonce, (byte)(hdr[0] & 0xE3), pt, true, out var mic, null);
++            var output = new byte[3 + len + 4];
++            output[0] = hdr[0];
++            output[1] = (byte)(len + 4);
++            output[2] = hdr[2];
++            Array.Copy(ct, 0, output, 3, len);
++            Array.Copy(mic, 0, output, 3 + len, 4);
++            sysbus.WriteBytes(output, outPtr);
++            this.Log(LogLevel.Debug, "CCM encrypt len={0}", len);
++        }
++
++        private void Decrypt()
++        {
++            var inPtr = Get(InPtr);
++            var outPtr = Get(OutPtr);
++            var hdr = sysbus.ReadBytes(inPtr, 3);
++            int len = hdr[1];
++            if(len == 0)
++            {
++                sysbus.WriteBytes(hdr, outPtr);
++                regs[MicStatus] = 1;
++                return;
++            }
++            if(len < 5)
++            {
++                regs[MicStatus] = 0;
++                Fire(EvError);
++                return;
++            }
++            var data = sysbus.ReadBytes(inPtr + 3, len);
++            var ct = new byte[len - 4];
++            Array.Copy(data, 0, ct, 0, len - 4);
++            var micIn = new byte[4];
++            Array.Copy(data, len - 4, micIn, 0, 4);
++            LoadConfig(out var key, out var nonce);
++            var pt = Ccm(key, nonce, (byte)(hdr[0] & 0xE3), ct, false, out var mic, micIn);
++            var ok = mic[0] == micIn[0] && mic[1] == micIn[1] && mic[2] == micIn[2] && mic[3] == micIn[3];
++            regs[MicStatus] = ok ? 1u : 0u;
++            var output = new byte[3 + len - 4];
++            output[0] = hdr[0];
++            output[1] = (byte)(len - 4);
++            output[2] = hdr[2];
++            Array.Copy(pt, 0, output, 3, len - 4);
++            sysbus.WriteBytes(output, outPtr);
++            this.Log(ok ? LogLevel.Debug : LogLevel.Warning, "CCM decrypt len={0} mic={1}", len - 4, ok ? "ok" : "FAIL");
++        }
++
++        // AES-CCM, RFC 3610 with M=4, L=2, 1 byte of AAD (the BLE profile).
++        private static byte[] Ccm(byte[] key, byte[] nonce, byte aad, byte[] input, bool encrypt, out byte[] mic, byte[] micIn)
++        {
++            using(var aes = Aes.Create())
++            {
++                aes.Key = key;
++                Func<byte[], byte[]> E = b => aes.EncryptEcb(b, PaddingMode.None);
++                var n = input.Length;
++                var output = new byte[n];
++                // CTR
++                for(int i = 0, blk = 1; i < n; i += 16, blk++)
++                {
++                    var a = new byte[16];
++                    a[0] = 0x01;
++                    Array.Copy(nonce, 0, a, 1, 13);
++                    a[14] = (byte)(blk >> 8);
++                    a[15] = (byte)blk;
++                    var s = E(a);
++                    for(var j = 0; j < 16 && i + j < n; j++) output[i + j] = (byte)(input[i + j] ^ s[j]);
++                }
++                var plain = encrypt ? input : output;
++                // CBC-MAC
++                var b0 = new byte[16];
++                b0[0] = 0x49;
++                Array.Copy(nonce, 0, b0, 1, 13);
++                b0[14] = (byte)(n >> 8);
++                b0[15] = (byte)n;
++                var x = E(b0);
++                var b1 = new byte[16];
++                b1[1] = 1;
++                b1[2] = aad;
++                for(var j = 0; j < 16; j++) b1[j] ^= x[j];
++                x = E(b1);
++                for(var i = 0; i < n; i += 16)
++                {
++                    var blk = (byte[])x.Clone();
++                    for(var j = 0; j < 16 && i + j < n; j++) blk[j] ^= plain[i + j];
++                    x = E(blk);
++                }
++                var a0 = new byte[16];
++                a0[0] = 0x01;
++                Array.Copy(nonce, 0, a0, 1, 13);
++                var s0 = E(a0);
++                mic = new byte[4];
++                for(var j = 0; j < 4; j++) mic[j] = (byte)(x[j] ^ s0[j]);
++                return output;
++            }
++        }
++
++        // AAR: resolve the address at ADDRPTR (+3: after S0/LENGTH/S1) against NIRK IRKs.
++        private void RunAar()
++        {
++            var nirk = (int)Math.Min(Get(AarNirk) & 0x1F, 16);
++            var addr = sysbus.ReadBytes(Get(AarAddrPtr) + 3, 6);
++            var resolved = -1;
++            using(var aes = Aes.Create())
++            {
++                for(var i = 0; i < nirk && resolved < 0; i++)
++                {
++                    aes.Key = sysbus.ReadBytes(Get(AarIrkPtr) + (ulong)(16 * i), 16);
++                    var r = new byte[16];
++                    r[13] = addr[5];
++                    r[14] = addr[4];
++                    r[15] = addr[3];
++                    var h = aes.EncryptEcb(r, PaddingMode.None);
++                    if(h[15] == addr[0] && h[14] == addr[1] && h[13] == addr[2]) resolved = i;
++                }
++            }
++            if(resolved >= 0)
++            {
++                regs[AarStatus] = (uint)resolved;
++                Fire(EvAarResolved);
++            }
++            else
++            {
++                Fire(EvAarNotResolved);
++            }
++            Fire(EvAarEnd);
++        }
++
++        private readonly IMachine machine;
++        private readonly IBusController sysbus;
++        private readonly Dictionary<long, uint> regs = new Dictionary<long, uint>();
++        private bool pendingDecrypt;
++
++        private const long TaskKsgenOrAarStart = 0x000;
++        private const long TaskCrypt = 0x004;
++        private const long TaskStop = 0x008;
++        private const long EvEndKsgen = 0x100;
++        private const long EvEndCrypt = 0x104;
++        private const long EvError = 0x108;
++        private const long EvAarEnd = 0x100;
++        private const long EvAarResolved = 0x104;
++        private const long EvAarNotResolved = 0x108;
++        private const long Shorts = 0x200;
++        private const long IntEnSet = 0x304;
++        private const long IntEnClr = 0x308;
++        private const long MicStatus = 0x400;
++        private const long AarStatus = 0x400;
++        private const long Enable = 0x500;
++        private const long Mode = 0x504;
++        private const long AarNirk = 0x504;
++        private const long CnfPtr = 0x508;
++        private const long AarIrkPtr = 0x508;
++        private const long InPtr = 0x50C;
++        private const long OutPtr = 0x510;
++        private const long AarAddrPtr = 0x510;
++        private const uint RadioEventEnd = 0x10C;
++    }
++}
+diff --git a/src/Emulator/Peripherals/Peripherals/Miscellaneous/NRF52840_PPI.cs b/src/Emulator/Peripherals/Peripherals/Miscellaneous/NRF52840_PPI.cs
+index 0ac366307..ea9e0901a 100644
+--- a/src/Emulator/Peripherals/Peripherals/Miscellaneous/NRF52840_PPI.cs
++++ b/src/Emulator/Peripherals/Peripherals/Miscellaneous/NRF52840_PPI.cs
+@@ -254,7 +254,7 @@ private void EventReceived(int id, uint offset)
+             if(taskEndpoint[id] != 0)
+             {
+                 this.Log(LogLevel.Noisy, "Received an event on channel {0} from 0x{1:X}. Triggering task at 0x{2:X}", id, eventEndpoint[id], taskEndpoint[id]);
+-                machine.LocalTimeSource.ExecuteInNearestSyncedState(_ => sysbus.WriteDoubleWord(taskEndpoint[id], 1));
++                sysbus.WriteDoubleWord(taskEndpoint[id], 1);
+             }
+             else
+             {
+@@ -263,7 +263,7 @@ private void EventReceived(int id, uint offset)
+             if(forkEndpoint[id] != 0)
+             {
+                 this.Log(LogLevel.Noisy, "Received an event on channel {0} from 0x{1:X}. Triggering fork task at 0x{2:X}", id, eventEndpoint[id], forkEndpoint[id]);
+-                machine.LocalTimeSource.ExecuteInNearestSyncedState(_ => sysbus.WriteDoubleWord(forkEndpoint[id], 1));
++                sysbus.WriteDoubleWord(forkEndpoint[id], 1);
+             }
+         }
+ 
+diff --git a/src/Emulator/Peripherals/Peripherals/Miscellaneous/NRF52840_QSPI.cs b/src/Emulator/Peripherals/Peripherals/Miscellaneous/NRF52840_QSPI.cs
+new file mode 100644
+index 000000000..7c404c173
+--- /dev/null
++++ b/src/Emulator/Peripherals/Peripherals/Miscellaneous/NRF52840_QSPI.cs
+@@ -0,0 +1,219 @@
++//
++// nRF52840 QSPI controller with an attached NOR flash (default: P25Q16H, 2 MiB).
++// Tasks complete instantly and raise EVENTS_READY. Flash semantics: program ANDs
++// bits, erase sets 0xFF. The XIP window (0x12000000) is not modelled.
++// LoadImage/SaveImage move the flash contents to and from a host file.
++//
++using System;
++using System.Collections.Generic;
++using System.IO;
++
++using Antmicro.Renode.Core;
++using Antmicro.Renode.Logging;
++using Antmicro.Renode.Peripherals.Bus;
++
++namespace Antmicro.Renode.Peripherals.Miscellaneous
++{
++    public sealed class NRF52840_QSPI : IDoubleWordPeripheral, IKnownSize
++    {
++        public NRF52840_QSPI(IMachine machine, int flashSize = 0x200000, uint jedecId = 0x156085)
++        {
++            sysbus = machine.GetSystemBus(this);
++            this.jedecId = jedecId;
++            flash = new byte[flashSize];
++            for(var i = 0; i < flash.Length; i++) flash[i] = 0xFF;
++            IRQ = new GPIO();
++            Reset();
++        }
++
++        public long Size => 0x1000;
++        public GPIO IRQ { get; }
++
++        public void LoadImage(string path)
++        {
++            var data = File.ReadAllBytes(path);
++            Array.Copy(data, flash, Math.Min(data.Length, flash.Length));
++            this.Log(LogLevel.Info, "loaded {0} bytes from {1}", data.Length, path);
++        }
++
++        // Backing file: loaded when set (if it exists), then rewritten every 5 s while dirty,
++        // so the flash contents survive emulator restarts.
++        public string ImagePath
++        {
++            get => imagePath;
++            set
++            {
++                imagePath = value;
++                if(File.Exists(value)) LoadImage(value);
++                autosave?.Dispose();
++                autosave = new System.Threading.Timer(_ => { if(dirty) { dirty = false; SaveImage(imagePath); } }, null, 5000, 5000);
++            }
++        }
++
++        public void SaveImage(string path)
++        {
++            var tmp = path + ".tmp";
++            File.WriteAllBytes(tmp, flash);
++            File.Move(tmp, path, true);
++            this.Log(LogLevel.Info, "saved {0} bytes to {1}", flash.Length, path);
++        }
++
++        public void Reset()
++        {
++            regs.Clear();
++            sr1 = 0; sr2 = 0x02;   // QE set
++            IRQ.Unset();
++        }
++
++        public uint ReadDoubleWord(long offset)
++        {
++            switch(offset)
++            {
++            case IntEnClr: return Get(IntEn);
++            case IntEnSet: return Get(IntEn);
++            case Status: return (1u << 3) | ((uint)sr1 << 24);   // READY, SREG
++            default: return Get(offset);
++            }
++        }
++
++        public void WriteDoubleWord(long offset, uint value)
++        {
++            switch(offset)
++            {
++            case TaskActivate:
++            case TaskDeactivate:
++                if(value != 0) Ready();
++                return;
++            case TaskReadStart:
++                if(value != 0) { Read(); Ready(); }
++                return;
++            case TaskWriteStart:
++                if(value != 0) { Write(); Ready(); }
++                return;
++            case TaskEraseStart:
++                if(value != 0) { Erase(); Ready(); }
++                return;
++            case EventReady:
++                regs[offset] = value;
++                Update();
++                return;
++            case IntEn:
++                regs[IntEn] = value; Update(); return;
++            case IntEnSet:
++                regs[IntEn] = Get(IntEn) | value; Update(); return;
++            case IntEnClr:
++                regs[IntEn] = Get(IntEn) & ~value; Update(); return;
++            case CinstrConf:
++                regs[offset] = value;
++                CustomInstruction(value);
++                Ready();
++                return;
++            default:
++                regs[offset] = value;
++                return;
++            }
++        }
++
++        private uint Get(long o) => regs.TryGetValue(o, out var v) ? v : 0;
++
++        private void Ready()
++        {
++            regs[EventReady] = 1;
++            Update();
++        }
++
++        private void Update() => IRQ.Set(Get(EventReady) != 0 && (Get(IntEn) & 1) != 0);
++
++        private void Read()
++        {
++            var src = (int)Get(ReadSrc);
++            var cnt = (int)Get(ReadCnt);
++            var data = new byte[cnt];
++            for(var i = 0; i < cnt; i++) data[i] = flash[(src + i) % flash.Length];
++            sysbus.WriteBytes(data, Get(ReadDst));
++        }
++
++        private void Write()
++        {
++            var dst = (int)Get(WriteDst);
++            var cnt = (int)Get(WriteCnt);
++            var data = sysbus.ReadBytes(Get(WriteSrc), cnt);
++            for(var i = 0; i < cnt; i++) flash[(dst + i) % flash.Length] &= data[i];
++            dirty = true;
++        }
++
++        private void Erase()
++        {
++            var ptr = (int)Get(ErasePtr);
++            var len = Get(EraseLen);
++            int start, size;
++            if(len == 2) { start = 0; size = flash.Length; }
++            else { size = len == 1 ? 0x10000 : 0x1000; start = ptr & ~(size - 1); }
++            for(var i = 0; i < size && start + i < flash.Length; i++) flash[start + i] = 0xFF;
++            dirty = true;
++        }
++
++        private void CustomInstruction(uint conf)
++        {
++            var opcode = conf & 0xFF;
++            var length = (int)((conf >> 8) & 0xF);   // 1 = opcode only, n = opcode + (n-1) data bytes
++            var dataIn = new byte[8];
++            BitConverter.GetBytes(Get(CinstrDat0)).CopyTo(dataIn, 0);
++            BitConverter.GetBytes(Get(CinstrDat1)).CopyTo(dataIn, 4);
++            var dataOut = new byte[8];
++            switch(opcode)
++            {
++            case 0x9F:   // JEDEC ID
++                dataOut[0] = (byte)jedecId; dataOut[1] = (byte)(jedecId >> 8); dataOut[2] = (byte)(jedecId >> 16);
++                break;
++            case 0x05: dataOut[0] = sr1; break;
++            case 0x35: dataOut[0] = sr2; break;
++            case 0x01:   // write status (SR1 [SR2])
++                if(length >= 2) sr1 = (byte)(dataIn[0] & 0xFC);
++                if(length >= 3) sr2 = dataIn[1];
++                break;
++            case 0x31: if(length >= 2) sr2 = dataIn[0]; break;
++            case 0xC7:
++            case 0x60:
++                for(var i = 0; i < flash.Length; i++) flash[i] = 0xFF;
++                dirty = true;
++                break;
++            default:     // 0x06 WREN, 0x04 WRDI, 0xAB release DPD, 0xB9 DPD, 0x66/0x99 reset ...
++                break;
++            }
++            regs[CinstrDat0] = BitConverter.ToUInt32(dataOut, 0);
++            regs[CinstrDat1] = BitConverter.ToUInt32(dataOut, 4);
++        }
++
++        private readonly IBusController sysbus;
++        private readonly Dictionary<long, uint> regs = new Dictionary<long, uint>();
++        private readonly byte[] flash;
++        private readonly uint jedecId;
++        private byte sr1, sr2;
++        private string imagePath;
++        private System.Threading.Timer autosave;
++        private volatile bool dirty;
++
++        private const long TaskActivate = 0x000;
++        private const long TaskReadStart = 0x004;
++        private const long TaskWriteStart = 0x008;
++        private const long TaskEraseStart = 0x00C;
++        private const long TaskDeactivate = 0x010;
++        private const long EventReady = 0x100;
++        private const long IntEn = 0x300;
++        private const long IntEnSet = 0x304;
++        private const long IntEnClr = 0x308;
++        private const long ReadSrc = 0x504;
++        private const long ReadDst = 0x508;
++        private const long ReadCnt = 0x50C;
++        private const long WriteDst = 0x510;
++        private const long WriteSrc = 0x514;
++        private const long WriteCnt = 0x518;
++        private const long ErasePtr = 0x51C;
++        private const long EraseLen = 0x520;
++        private const long Status = 0x604;
++        private const long CinstrConf = 0x634;
++        private const long CinstrDat0 = 0x638;
++        private const long CinstrDat1 = 0x63C;
++    }
++}
+diff --git a/src/Emulator/Peripherals/Peripherals/Miscellaneous/NRF_CLOCK.cs b/src/Emulator/Peripherals/Peripherals/Miscellaneous/NRF_CLOCK.cs
+index 273e56556..2ddcedce5 100644
+--- a/src/Emulator/Peripherals/Peripherals/Miscellaneous/NRF_CLOCK.cs
++++ b/src/Emulator/Peripherals/Peripherals/Miscellaneous/NRF_CLOCK.cs
+@@ -47,6 +47,10 @@ public override void Reset()
+ 
+         public GPIO IRQ { get; }
+ 
++        // USB cable (VBUS) present: the default keeps the old always-attached behaviour;
++        // false models a battery-powered board with nothing on USB
++        public bool VbusPresent { get; set; } = true;
++
+         private void Update()
+         {
+             bool irq = (lfclkEventGenerated.Value && lfclkStartedEventEnabled.Value)
+@@ -124,21 +128,21 @@ private void DefineRegisters()
+                 }).WithReservedBits(1, 31);
+ 
+             Registers.PowerUsbRegisterStatus.Define(this)
+-                .WithFlag(0, FieldMode.Read, valueProviderCallback: _ => true, name: "VBUSDETECT")
+-                .WithFlag(1, FieldMode.Read, valueProviderCallback: _ => true, name: "OUTPUTRDY")
++                .WithFlag(0, FieldMode.Read, valueProviderCallback: _ => VbusPresent, name: "VBUSDETECT")
++                .WithFlag(1, FieldMode.Read, valueProviderCallback: _ => VbusPresent, name: "OUTPUTRDY")
+                 .WithReservedBits(2, 30);
+ 
+             Registers.PowerUSBUsbRemovedEvent.Define(this)
+-                .WithFlag(0, valueProviderCallback: _ => false, name: "EVENTS_USBDETECTED")
++                .WithFlag(0, valueProviderCallback: _ => false, name: "EVENTS_USBREMOVED")
+                 .WithReservedBits(1, 31);
+ 
+             Registers.PowerUSBDetectedEvent.Define(this)
+                 .WithFlag(0,
+-                    valueProviderCallback: _ => true, name: "EVENTS_USBREMOVED")
++                    valueProviderCallback: _ => VbusPresent, name: "EVENTS_USBDETECTED")
+                 .WithReservedBits(1, 31);
+ 
+             Registers.PowerUSBPowerReadyEvent.Define(this)
+-                .WithFlag(0, valueProviderCallback: _ => true, name: "EVENTS_USBPWRRDY")
++                .WithFlag(0, valueProviderCallback: _ => VbusPresent, name: "EVENTS_USBPWRRDY")
+                 .WithReservedBits(1, 31);
+ 
+             Registers.StopLFCLK.Define(this)
+diff --git a/src/Emulator/Peripherals/Peripherals/Timers/NRF52840_RTC.cs b/src/Emulator/Peripherals/Peripherals/Timers/NRF52840_RTC.cs
+index 25c22a936..28699be47 100644
+--- a/src/Emulator/Peripherals/Peripherals/Timers/NRF52840_RTC.cs
++++ b/src/Emulator/Peripherals/Peripherals/Timers/NRF52840_RTC.cs
+@@ -100,10 +100,9 @@ private void UpdateTimersEnable(bool? global = null, bool? tick = null)
+             // the tick timer disabled as long as possible
+             // - we enable it only when the global timer is
+             // enabled and the tick event is unmasked
+-            if(tick.HasValue || (global.HasValue && !global.Value))
+-            {
+-                tickTimer.Enabled = innerTimers[0].Enabled && tick.Value;
+-            }
++            // Re-evaluate on every change: software may unmask TICK before TASKS_START (FreeRTOS's
++            // nRF52 port does), and then starting the RTC must start the tick timer too.
++            tickTimer.Enabled = innerTimers[0].Enabled && (tick ?? tickInterruptEnabled.Value);
+         }
+ 
+         private void DefineRegisters()
+diff --git a/src/Emulator/Peripherals/Peripherals/Timers/NRF52840_Timer.cs b/src/Emulator/Peripherals/Peripherals/Timers/NRF52840_Timer.cs
+index 1fc00e9cd..7824f75a2 100644
+--- a/src/Emulator/Peripherals/Peripherals/Timers/NRF52840_Timer.cs
++++ b/src/Emulator/Peripherals/Peripherals/Timers/NRF52840_Timer.cs
+@@ -128,6 +128,26 @@ private void DefineRegisters()
+                 .WithReservedBits(1, 31)
+             ;
+ 
++            // TASKS_SHUTDOWN: stop and power the timer down, which also resets the counter.
++            // The S140 SoftDevice shuts TIMER0 down between radio/flash timeslots and relies on it
++            // restarting from 0 (PPI RTC0.COMPARE[0] -> TIMER0.START): ignoring it left TIMER0 past
++            // its compare after the first timeslot, so no later timeslot ever ran.
++            Register.Shutdown.Define(this)
++                .WithFlag(0, FieldMode.Write, name: "TASKS_SHUTDOWN", writeCallback: (_, value) =>
++                {
++                    if(value)
++                    {
++                        timerRunning = false;
++                        foreach(var timer in innerTimers)
++                        {
++                            timer.Enabled = false;
++                            timer.Value = 0;
++                        }
++                    }
++                })
++                .WithReservedBits(1, 31)
++            ;
++
+             Register.Clear.Define(this)
+                 .WithFlag(0, FieldMode.Write, name: "TASK_CLEAR", writeCallback: (_, value) =>
+                 {
+diff --git a/src/Emulator/Peripherals/Peripherals/USB/NRF_USBD.cs b/src/Emulator/Peripherals/Peripherals/USB/NRF_USBD.cs
+index 8e5fcfa93..bdfaa0fc6 100644
+--- a/src/Emulator/Peripherals/Peripherals/USB/NRF_USBD.cs
++++ b/src/Emulator/Peripherals/Peripherals/USB/NRF_USBD.cs
+@@ -179,7 +179,8 @@ private void DefineRegisters()
+                 .WithTaggedFlag("EVENT_SUSPEND", 8)
+                 .WithTaggedFlag("EVENT_RESUME", 9)
+                 .WithTaggedFlag("EVENT_USBWUALLOWED", 10)
+-                .WithFlag(11, name: "EVENT_READY")
++                // set by ENABLE once the peripheral is up; write 1 to clear (as on the chip)
++                .WithFlag(11, out eventReady, FieldMode.Read | FieldMode.WriteOneToClear, name: "EVENT_READY")
+                 .WithReservedBits(12, 20);
+ 
+             Registers.EndpointStatus.Define(this)
+@@ -254,7 +255,7 @@ private void DefineRegisters()
+                 .WithReservedBits(8, 24);
+ 
+             Registers.Enable.Define(this)
+-                .WithFlag(0, out usbEnable, name: "ENABLE")
++                .WithFlag(0, out usbEnable, writeCallback: (_, val) => { if(val) { eventReady.Value = true; } }, name: "ENABLE")
+                 .WithReservedBits(1, 31);
+ 
+             Registers.UsbPullup.Define(this)
+@@ -492,6 +493,7 @@ private void InitiateUSBCore()
+ 
+         private IFlagRegisterField usbPullup;
+         private IFlagRegisterField usbEnable;
++        private IFlagRegisterField eventReady;
+         private IFlagRegisterField ep0InEnabled;
+         private IFlagRegisterField ep0OutEnabled;
+ 
+diff --git a/src/Emulator/Peripherals/Peripherals/Wireless/NRF52840_Radio.cs b/src/Emulator/Peripherals/Peripherals/Wireless/NRF52840_Radio.cs
+index 9f225a7a1..2d255936f 100644
+--- a/src/Emulator/Peripherals/Peripherals/Wireless/NRF52840_Radio.cs
++++ b/src/Emulator/Peripherals/Peripherals/Wireless/NRF52840_Radio.cs
+@@ -26,7 +26,7 @@ public NRF52840_Radio(IMachine machine) : base(machine)
+             interruptManager = new InterruptManager<Events>(this, IRQ, "RadioIrq");
+             shorts = new Shorts();
+             events = new IFlagRegisterField[(int)Events.PHYEnd + 1];
+-            rxBuffer = new ConcurrentQueue<KeyValuePair<byte[], IRadio>>();
++            rxBuffer = new ConcurrentQueue<QueuedFrame>();
+             DefineRegisters();
+             Reset();
+         }
+@@ -49,7 +49,11 @@ public void ReceiveFrame(byte[] frame, IRadio sender)
+         {
+             if(radioState != State.RxIdle)
+             {
+-                rxBuffer.Enqueue(new KeyValuePair<byte[], IRadio>(frame, sender));
++                if(Environment.GetEnvironmentVariable("RENODE_RADIO_TXLOG") != null)
++                {
++                    this.Log(LogLevel.Info, "RXQUEUE t={0} state={1} f={2} {3}", machine.LocalTimeSource.ElapsedVirtualTime.TotalMicroseconds, radioState, Frequency, BitConverter.ToString(frame, 0, Math.Min(frame.Length, 8)).Replace("-", ""));
++                }
++                rxBuffer.Enqueue(new QueuedFrame { Frame = frame, Sender = sender, Frequency = Frequency, Time = machine.LocalTimeSource.ElapsedVirtualTime });
+                 return;
+             }
+ 
+@@ -61,6 +65,7 @@ public void ReceiveFrame(byte[] frame, IRadio sender)
+             sysbus.WriteBytes(frame, address: dataAddress, startingIndex: addressLength, count: headerLengthInRAM);
+             var payloadLength = Math.Min(frame[addressLength + (int)s0Length.Value], (byte)maxPacketLength.Value);
+             sysbus.WriteBytes(frame, address: (ulong)(dataAddress + headerLengthInRAM), startingIndex: addressLength + headerLengthInAir, count: payloadLength);
++            DeviceAddressMatch(frame, addressLength, headerLengthInAir, payloadLength);
+ 
+             var crcLen = 4;
+             ScheduleRadioEvents((uint)(headerLengthInAir + payloadLength + crcLen));
+@@ -137,6 +142,26 @@ private void DefineRegisters()
+ 
+             DefineEvent(Registers.RadioDisabled, Disable, Events.Disabled, "EVENTS_DISABLED");
+ 
++            // Device address match (DAB/DAP/DACNF -> DEVMATCH/DEVMISS, DAI):
++            // BLE link layers (Zephyr's) filter advertisers through it for the accept list.
++            DefineEvent(Registers.DeviceMatch, () => {}, Events.DeviceAddressMatch, "EVENTS_DEVMATCH");
++            DefineEvent(Registers.DeviceMiss, () => {}, Events.DeviceAddressMiss, "EVENTS_DEVMISS");
++            for(var i = 0; i < 8; i++)
++            {
++                ((Registers)((int)Registers.DeviceAddressBaseSegment0 + i * 4)).Define(this, name: "DAB")
++                    .WithValueField(0, 32, out deviceAddressBase[i]);
++                ((Registers)((int)Registers.DeviceAddressPrefix0 + i * 4)).Define(this, name: "DAP")
++                    .WithValueField(0, 16, out deviceAddressPrefix[i])
++                    .WithReservedBits(16, 16);
++            }
++            Registers.DeviceAddressMatchConfiguration.Define(this, name: "DACNF")
++                .WithValueField(0, 8, out deviceAddressMatchEnable, name: "ENA")
++                .WithValueField(8, 8, out deviceAddressMatchTxAdd, name: "TXADD")
++                .WithReservedBits(16, 16);
++            Registers.DeviceAddressMatchIndex.Define(this, name: "DAI")
++                .WithValueField(0, 3, out deviceAddressMatchIndex, FieldMode.Read, name: "DAI")
++                .WithReservedBits(3, 29);
++
+             DefineEvent(Registers.TxReady, TxEnable, Events.TxReady, "EVENTS_TXREADY");
+ 
+             DefineEvent(Registers.RxReady, RxEnable, Events.RxReady, "EVENTS_RXREADY");
+@@ -194,7 +219,7 @@ private void DefineRegisters()
+             ;
+ 
+             Registers.Mode.Define(this, name: "MODE")
+-                .WithValueField(0, 4, name: "MODE") // just RW
++                .WithValueField(0, 4, out radioMode, name: "MODE") // RW; sets on-air time per byte
+                 .WithReservedBits(4, 24)
+             ;
+ 
+@@ -391,10 +416,16 @@ private void Start()
+             }
+             else if(radioState == State.RxIdle)
+             {
+-                // Can only receive one packet per enable
+-                if(rxBuffer.TryDequeue(out var pair))
++                // Can only receive one packet per enable; skip frames that went stale
++                // or were sent on another channel while we were not listening
++                var now = machine.LocalTimeSource.ElapsedVirtualTime;
++                while(rxBuffer.TryDequeue(out var queued))
+                 {
+-                    ReceiveFrame(pair.Key, pair.Value);
++                    if(queued.Frequency == Frequency && now - queued.Time <= QueuedFrameLifetime)
++                    {
++                        ReceiveFrame(queued.Frame, queued.Sender);
++                        break;
++                    }
+                 }
+             }
+             else
+@@ -443,6 +474,10 @@ private void SendPacket()
+             sysbus.ReadBytes((ulong)(dataAddress + headerLengthInRAM), payloadLength, data, addressLength + headerLengthInAir);
+             this.Log(LogLevel.Noisy, "Data: {0} Maxlen {1} statlen {2}", Misc.PrettyPrintCollectionHex(data), maxPacketLength.Value, staticLength.Value);
+ 
++            if(Environment.GetEnvironmentVariable("RENODE_RADIO_TXLOG") != null)
++            {
++                this.Log(LogLevel.Info, "TXLOG t={3} f={0} mode={1} {2}", Frequency, radioMode.Value, BitConverter.ToString(data, 0, Math.Min(data.Length, addressLength + headerLengthInRAM + payloadLength)).Replace("-", ""), machine.LocalTimeSource.ElapsedVirtualTime.TotalMicroseconds);
++            }
+             FrameSent?.Invoke(this, data);
+ 
+             var crcLen = 4;
+@@ -465,7 +500,7 @@ private void ScheduleRadioEvents(uint packetLen)
+             var bcMatchTimeStamp = new TimeStamp(bcMatchTime, timeSource.Domain);
+ 
+             // End event
+-            var endTime = now + TimeInterval.FromMicroseconds((uint)(packetLen) * 8);
++            var endTime = now + TimeInterval.FromMicroseconds((uint)(packetLen) * MicrosecondsPerByte());
+             var endTimeStamp = new TimeStamp(endTime, timeSource.Domain);
+ 
+             var disableTime = endTime + TimeInterval.FromMicroseconds(10);
+@@ -515,6 +550,53 @@ private void ScheduleRadioEvents(uint packetLen)
+             }, disableTimeStamp);
+         }
+ 
++        private void DeviceAddressMatch(byte[] frame, int addressLength, int headerLengthInAir, int payloadLength)
++        {
++            var enabled = (uint)deviceAddressMatchEnable.Value;
++            if(enabled == 0 || payloadLength < 6)
++            {
++                return;
++            }
++            var txAdd = (frame[addressLength] >> 6) & 1;
++            var a = addressLength + headerLengthInAir;
++            var low = BitConverter.ToUInt32(frame, a);
++            var high = (uint)(frame[a + 4] | frame[a + 5] << 8);
++            for(var i = 0; i < 8; i++)
++            {
++                if((enabled & (1u << i)) == 0) continue;
++                if(((deviceAddressMatchTxAdd.Value >> i) & 1) != (ulong)txAdd) continue;
++                if(deviceAddressBase[i].Value == low && deviceAddressPrefix[i].Value == high)
++                {
++                    deviceAddressMatchIndex.Value = (ulong)i;
++                    SetEvent(Events.DeviceAddressMatch);
++                    return;
++                }
++            }
++            SetEvent(Events.DeviceAddressMiss);
++        }
++
++        private readonly IValueRegisterField[] deviceAddressBase = new IValueRegisterField[8];
++        private readonly IValueRegisterField[] deviceAddressPrefix = new IValueRegisterField[8];
++        private IValueRegisterField deviceAddressMatchEnable;
++        private IValueRegisterField deviceAddressMatchTxAdd;
++        private IValueRegisterField deviceAddressMatchIndex;
++
++        // On-air time per byte for MODE: Nrf_2Mbit/Ble_2Mbit 4 us, Ble_LR125Kbit 64,
++        // Ble_LR500Kbit 16, IEEE 802.15.4 32, everything else (1 Mbit) 8.
++        private uint MicrosecondsPerByte()
++        {
++            switch(radioMode.Value)
++            {
++            case 1: case 4: return 4;
++            case 5: return 64;
++            case 6: return 16;
++            case 15: return 32;
++            default: return 8;
++            }
++        }
++
++        private IValueRegisterField radioMode;
++
+         private void FillCurrentAddress(byte[] data, int startIndex, uint logicalAddress)
+         {
+             // based on 6.20.2 Address configuration
+@@ -566,7 +648,21 @@ private void FillCurrentAddress(byte[] data, int startIndex, uint logicalAddress
+         private readonly IFlagRegisterField[] events;
+         private readonly InterruptManager<Events> interruptManager;
+ 
+-        private readonly ConcurrentQueue<KeyValuePair<byte[], IRadio>> rxBuffer;
++        private readonly ConcurrentQueue<QueuedFrame> rxBuffer;
++
++        // A frame that arrives while the radio is not listening is only kept for the
++        // quantum skew around T_IFS; a real radio would simply miss it. Delivering it
++        // at some later RX start (and possibly on another channel) makes peers answer
++        // packets that are long gone (seen: a CONNECT_IND sent 65 ms after its ADV_IND).
++        private struct QueuedFrame
++        {
++            public byte[] Frame;
++            public IRadio Sender;
++            public uint Frequency;
++            public TimeInterval Time;
++        }
++
++        private static readonly TimeInterval QueuedFrameLifetime = TimeInterval.FromMicroseconds(200);
+ 
+         private readonly Dictionary<uint, int> bluetoothLEChannelMap = new Dictionary<uint, int>()
+         {
+diff --git a/src/Emulator/Peripherals/Peripherals/Wireless/SX1262.cs b/src/Emulator/Peripherals/Peripherals/Wireless/SX1262.cs
+new file mode 100644
+index 000000000..069f2786d
+--- /dev/null
++++ b/src/Emulator/Peripherals/Peripherals/Wireless/SX1262.cs
+@@ -0,0 +1,254 @@
++//
++// Semtech SX1262 (LoRa mode) behavioural model for firmware emulation.
++//
++// - SPI command framing follows NSS (GPIO input 0); RESET is GPIO input 1.
++// - BUSY is never asserted (commands complete instantly), so it need not be wired.
++// - IRQ output = DIO1 (IrqStatus & DIO1 mask).
++// - Every SX1262 in the process shares one "air": a TX is delivered, after its
++//   time on air, to every other instance in RX on the same frequency/SF/BW.
++//
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++
++using Antmicro.Renode.Core;
++using Antmicro.Renode.Logging;
++using Antmicro.Renode.Peripherals.SPI;
++using Antmicro.Renode.Time;
++
++namespace Antmicro.Renode.Peripherals.Wireless
++{
++    public sealed class SX1262 : ISPIPeripheral, IGPIOReceiver
++    {
++        public SX1262(IMachine machine)
++        {
++            this.machine = machine;
++            IRQ = new GPIO();
++            lock(Air) { Air.Add(this); }
++            Reset();
++        }
++
++        public GPIO IRQ { get; }
++
++        // Received-signal figures reported for every delivered packet.
++        public int RssiDbm { get; set; } = -60;
++        public int SnrDb { get; set; } = 10;
++
++        public void Reset()
++        {
++            regs = new byte[0x1000];
++            var version = Encoding.ASCII.GetBytes("SX1261 V2D 2D02\0");
++            Array.Copy(version, 0, regs, 0x320, version.Length);
++            regs[0x740] = 0x14; regs[0x741] = 0x24;   // LoRa sync word (private)
++            regs[0x8E7] = 0x18;                       // OCP
++            buffer = new byte[256];
++            cmd.Clear();
++            irq = 0; dio1Mask = 0;
++            mode = Mode.StandbyRc;
++            UpdateIrq();
++        }
++
++        public void OnGPIO(int number, bool value)
++        {
++            if(number == 0)
++            {
++                if(value && !nss) { /* deselected */ Execute(); }
++                if(!value) { cmd.Clear(); }
++                nss = value;
++            }
++            else if(number == 1 && value && !resetLine)
++            {
++                Reset();
++            }
++            if(number == 1) resetLine = value;
++        }
++
++        public byte Transmit(byte data)
++        {
++            var idx = cmd.Count;
++            cmd.Add(data);
++            return Respond(idx);
++        }
++
++        public void FinishTransmission()
++        {
++            // Framing is done on NSS; nothing to do per DMA transfer.
++        }
++
++        private byte Status => (byte)(((int)mode << 4) | (0x2 << 1));
++
++        private byte Respond(int idx)
++        {
++            if(idx == 0) return Status;
++            var op = cmd[0];
++            switch(op)
++            {
++            case 0xC0: return Status;                                    // GetStatus
++            case 0x11: return idx == 1 ? Status : (byte)packetType;      // GetPacketType
++            case 0x12:                                                   // GetIrqStatus
++                if(idx == 1) return Status;
++                return idx == 2 ? (byte)(irq >> 8) : (byte)irq;
++            case 0x13:                                                   // GetRxBufferStatus
++                if(idx == 1) return Status;
++                return idx == 2 ? rxLength : rxStart;
++            case 0x14:                                                   // GetPacketStatus
++                if(idx == 1) return Status;
++                if(idx == 2) return (byte)(-RssiDbm * 2);
++                if(idx == 3) return (byte)(sbyte)(SnrDb * 4);
++                return (byte)(-RssiDbm * 2);
++            case 0x15:                                                   // GetRssiInst
++                return idx == 1 ? Status : (byte)240;                    // -120 dBm
++            case 0x10:                                                   // GetStats
++            case 0x17:                                                   // GetDeviceErrors
++                return idx == 1 ? Status : (byte)0;
++            case 0x1D:                                                   // ReadRegister A1 A0 NOP data...
++                if(idx < 4) return Status;
++                return regs[(RegAddr() + idx - 4) & 0xFFF];
++            case 0x1E:                                                   // ReadBuffer offset NOP data...
++                if(idx < 3) return Status;
++                return buffer[(cmd[1] + idx - 3) & 0xFF];
++            default:
++                return Status;
++            }
++        }
++
++        private int RegAddr() => (cmd[1] << 8) | cmd[2];
++
++        private void Execute()
++        {
++            if(cmd.Count == 0) return;
++            var op = cmd[0];
++            var p = cmd.Skip(1).ToArray();
++            switch(op)
++            {
++            case 0x80: mode = p.Length > 0 && p[0] == 1 ? Mode.StandbyXosc : Mode.StandbyRc; break;   // SetStandby
++            case 0x84: mode = Mode.StandbyRc; break;                                                   // SetSleep
++            case 0xC1: mode = Mode.Fs; break;                                                          // SetFs
++            case 0x8A: if(p.Length > 0) packetType = p[0]; break;                                      // SetPacketType
++            case 0x86: if(p.Length >= 4) frequency = (uint)(p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]); break;
++            case 0x8B: if(p.Length >= 4) { sf = p[0]; bw = p[1]; cr = p[2]; ldro = p[3]; } break;     // SetModulationParams
++            case 0x8C: if(p.Length >= 6) { preamble = p[0] << 8 | p[1]; implicitHeader = p[2] == 1; payloadLength = p[3]; } break;
++            case 0x8F: if(p.Length >= 2) { txBase = p[0]; rxBase = p[1]; } break;                   // SetBufferBaseAddress
++            case 0x08: if(p.Length >= 4) { dio1Mask = (ushort)(p[2] << 8 | p[3]); UpdateIrq(); } break; // SetDioIrqParams
++            case 0x02: if(p.Length >= 2) { irq &= (ushort)~(p[0] << 8 | p[1]); UpdateIrq(); } break; // ClearIrqStatus
++            case 0x0D:                                                                                 // WriteRegister
++                for(var i = 2; i < p.Length; i++) regs[(RegAddr() + i - 2) & 0xFFF] = p[i];
++                break;
++            case 0x0E:                                                                                 // WriteBuffer
++                for(var i = 1; i < p.Length; i++) buffer[(p[0] + i - 1) & 0xFF] = p[i];
++                break;
++            case 0x83: StartTx(); break;                                                               // SetTx
++            case 0x82:                                                                                 // SetRx
++                mode = Mode.Rx;
++                rxSingle = p.Length >= 3 && (p[0] << 16 | p[1] << 8 | p[2]) != 0xFFFFFF;
++                break;
++            case 0xC5:                                                                                 // SetCAD
++                mode = Mode.Rx;
++                machine.ScheduleAction(TimeInterval.FromMicroseconds((ulong)(SymbolMs() * 4000)), _ =>
++                {
++                    mode = Mode.StandbyRc;
++                    Raise(IrqCadDone);
++                });
++                break;
++            default:
++                break;
++            }
++            cmd.Clear();
++        }
++
++        private void StartTx()
++        {
++            mode = Mode.Tx;
++            var len = payloadLength;
++            var frame = new byte[len];
++            for(var i = 0; i < len; i++) frame[i] = buffer[(txBase + i) & 0xFF];
++            var toa = TimeOnAirMs(len);
++            this.Log(LogLevel.Info, "LoRa TX {0} bytes f={1} sf={2} bw={3} toa={4:F1}ms", len, frequency, sf, bw, toa);
++            var key = (frequency, sf, bw);
++            machine.ScheduleAction(TimeInterval.FromMicroseconds((ulong)(toa * 1000)), _ =>
++            {
++                mode = Mode.StandbyRc;
++                Raise(IrqTxDone);
++                List<SX1262> peers;
++                lock(Air) { peers = Air.Where(r => r != this).ToList(); }
++                foreach(var r in peers)
++                {
++                    r.machine.LocalTimeSource.ExecuteInNearestSyncedState(__ => r.Deliver(key, frame));
++                }
++            });
++        }
++
++        private void Deliver((uint, byte, byte) key, byte[] frame)
++        {
++            if(mode != Mode.Rx || (frequency, sf, bw) != key)
++            {
++                return;
++            }
++            for(var i = 0; i < frame.Length; i++) buffer[(rxBase + i) & 0xFF] = frame[i];
++            rxStart = rxBase;
++            rxLength = (byte)frame.Length;
++            if(rxSingle) mode = Mode.StandbyRc;
++            this.Log(LogLevel.Info, "LoRa RX {0} bytes", frame.Length);
++            Raise(IrqPreamble | IrqHeaderValid | IrqRxDone);
++        }
++
++        private void Raise(ushort bits)
++        {
++            irq |= bits;
++            UpdateIrq();
++        }
++
++        private void UpdateIrq() => IRQ.Set((irq & dio1Mask) != 0);
++
++
++        private double BandwidthKhz()
++        {
++            switch(bw)
++            {
++            case 0x00: return 7.81; case 0x08: return 10.42; case 0x01: return 15.63; case 0x09: return 20.83;
++            case 0x02: return 31.25; case 0x0A: return 41.67; case 0x03: return 62.5; case 0x04: return 125;
++            case 0x05: return 250; case 0x06: return 500; default: return 125;
++            }
++        }
++
++        private double SymbolMs() => Math.Pow(2, Math.Max((int)sf, 5)) / BandwidthKhz();
++
++        private double TimeOnAirMs(int len)
++        {
++            var s = Math.Max((int)sf, 5);
++            var de = ldro != 0 ? 1 : 0;
++            var ih = implicitHeader ? 1 : 0;
++            var c = Math.Max((int)cr, 1);
++            var n = 8 + Math.Max(Math.Ceiling((8.0 * len - 4 * s + 28 + 16 - 20 * ih) / (4.0 * (s - 2 * de))) * (c + 4), 0);
++            return (preamble + 4.25 + n) * SymbolMs();
++        }
++
++        private enum Mode { StandbyRc = 2, StandbyXosc = 3, Fs = 4, Rx = 5, Tx = 6 }
++
++        private const ushort IrqTxDone = 1 << 0;
++        private const ushort IrqRxDone = 1 << 1;
++        private const ushort IrqPreamble = 1 << 2;
++        private const ushort IrqHeaderValid = 1 << 4;
++        private const ushort IrqCadDone = 1 << 7;
++
++        private static readonly List<SX1262> Air = new List<SX1262>();
++
++        private readonly IMachine machine;
++        private readonly List<byte> cmd = new List<byte>();
++        private byte[] regs;
++        private byte[] buffer;
++        private Mode mode;
++        private bool nss = true;
++        private bool resetLine = true;
++        private ushort irq, dio1Mask;
++        private byte packetType = 1;
++        private uint frequency;
++        private byte sf = 7, bw = 4, cr = 1, ldro;
++        private int preamble = 8;
++        private bool implicitHeader;
++        private byte payloadLength = 255;
++        private byte txBase, rxBase, rxStart, rxLength;
++        private bool rxSingle;
++    }
++}

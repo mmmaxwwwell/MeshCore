@@ -1,0 +1,18 @@
+using "__ROOT__/emu/nrf52840-local.repl"
+
+spi3: SPI.NRF52840_SPI @ sysbus 0x4002F000
+    easyDMA: true
+    -> nvic@47
+
+qspi: Miscellaneous.NRF52840_QSPI @ sysbus 0x40029000
+    -> nvic@41
+
+lora: Wireless.SX1262 @ spi3
+    -> gpio0@7
+
+gpio1:
+    14 -> lora@0
+    7 -> lora@1
+
+saadc: Analog.NRF52840_SAADC @ sysbus 0x40007000
+    -> nvic@7
