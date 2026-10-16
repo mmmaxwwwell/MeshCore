@@ -118,6 +118,30 @@ MyMesh the_mesh(radio_driver, fast_rng, rtc_clock, tables, store);
 
 /* END GLOBAL OBJECTS */
 
+#ifdef SAFE_BOOT
+  #include <helpers/nrf52/SafeBoot.h>
+#endif
+#ifdef QSPI_POWERSAVE
+  #include <helpers/nrf52/QSPIPowerSave.h>
+#endif
+#ifdef LOOP_TASK_BLOCKING
+  // The loop task used to sleep in sd_app_evt_wait() while staying runnable, so FreeRTOS never
+  // reached tickless idle and its 1024 Hz tick woke the CPU for a full loop pass every ~1 ms.
+  // Now it blocks: the LoRa IRQ wakes it at once, everything else within LOOP_MAX_SLEEP_MS
+  // (BLE/USB data sit in driver buffers; a LoRa packet at our settings is >50 ms on air).
+  #ifndef LOOP_MAX_SLEEP_MS
+    #define LOOP_MAX_SLEEP_MS  10
+  #endif
+  static TaskHandle_t loop_task = NULL;
+  extern "C" void loopWakeFromISR() {
+    if (loop_task) {
+      BaseType_t woken = pdFALSE;
+      vTaskNotifyGiveFromISR(loop_task, &woken);
+      portYIELD_FROM_ISR(woken);
+    }
+  }
+#endif
+
 void halt() {
   while (1) ;
 }
@@ -133,6 +157,9 @@ void halt() {
 #endif
 
 void setup() {
+#ifdef SAFE_BOOT
+  SafeBoot::begin();   // first: a crash anywhere below must count
+#endif
   Serial.begin(115200);
   board.begin();
 
@@ -165,6 +192,9 @@ void setup() {
       MESH_DEBUG_PRINTLN("CustomLFS_QSPIFlash: failed to initialize");
     } else {
       MESH_DEBUG_PRINTLN("CustomLFS_QSPIFlash: initialized successfully");
+    #ifdef QSPI_POWERSAVE
+      QSPIPowerSave::install(QSPIFlash);
+    #endif
     }
   #else
   #if defined(EXTRAFS)
@@ -172,6 +202,24 @@ void setup() {
   #endif
   #endif
   store.begin();
+#ifdef CONTACTS_SELFTEST
+  {
+    unsigned long t = millis(); while (!Serial && millis() - t < 15000) delay(10);
+    store.setContactDirPrefix('t');
+    store.removeContactFiles();
+    bool ok = the_mesh.contactStoreSelfTest(&store, Serial);
+    store.removeContactFiles();
+    store.setContactDirPrefix('c');
+    Serial.println(ok ? "ST RESULT PASS" : "ST RESULT FAIL");
+    for (;;) {   // test build: never touch the real contacts. USB stays up for the 1200-baud touch.
+  #ifdef SAFE_BOOT
+      SafeBoot::feed();
+  #endif
+      delay(1000);
+      Serial.println(ok ? "ST RESULT PASS" : "ST RESULT FAIL");
+    }
+  }
+#endif
   the_mesh.begin();
 #elif defined(RP2040_PLATFORM)
   LittleFS.begin();
@@ -290,6 +338,9 @@ void setup() {
 }
 
 void loop() {
+#ifdef SAFE_BOOT
+  SafeBoot::loop();
+#endif
   the_mesh.loop();
   interface_manager.loop();
   sensors.loop();
@@ -302,8 +353,15 @@ void loop() {
   external_watchdog.loop();
 #endif
 
+#ifdef QSPI_POWERSAVE
+  QSPIPowerSave::loop();
+#endif
+
   if (!the_mesh.hasPendingWork()) {
-#if defined(NRF52_PLATFORM)
+#if defined(NRF52_PLATFORM) && defined(LOOP_TASK_BLOCKING)
+    if (loop_task == NULL) loop_task = xTaskGetCurrentTaskHandle();
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(LOOP_MAX_SLEEP_MS));   // idle task -> tickless sleep
+#elif defined(NRF52_PLATFORM)
     board.sleep(0); // nrf ignores seconds param, sleeps whenever possible
 #endif
   }

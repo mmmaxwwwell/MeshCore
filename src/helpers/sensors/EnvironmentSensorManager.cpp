@@ -747,8 +747,38 @@ bool EnvironmentSensorManager::setSettingValue(const char* name, const char* val
 }
 
 #if ENV_INCLUDE_GPS
+#ifndef GPS_DUTY_MIN_INTERVAL_SEC
+  #define GPS_DUTY_MIN_INTERVAL_SEC  300
+#endif
+#ifndef GPS_DUTY_MAX_ON_MS
+  #define GPS_DUTY_MAX_ON_MS         120000
+#endif
+#ifdef NRF52_PLATFORM
+// Uart::end() spins until the stop events arrive, which never happens on a port that
+// was not begun: only ever end an open one.
+static bool gps_uart_open = false;
+static void gpsUartOpen() {
+  if (gps_uart_open) return;
+  Serial1.setPins(PIN_GPS_TX, PIN_GPS_RX);
+  #ifdef GPS_BAUD_RATE
+  Serial1.begin(GPS_BAUD_RATE);
+  #else
+  Serial1.begin(9600);
+  #endif
+  gps_uart_open = true;
+}
+static void gpsUartClose() {   // an enabled UARTE keeps the HF clock + RX running: ~0.5-0.9 mA
+  if (!gps_uart_open) return;
+  Serial1.end();
+  gps_uart_open = false;
+}
+#endif
+
 void EnvironmentSensorManager::initBasicGPS() {
 
+#ifdef NRF52_PLATFORM
+  gpsUartOpen();
+#else
   Serial1.setPins(PIN_GPS_TX, PIN_GPS_RX);
 
   #ifdef GPS_BAUD_RATE
@@ -756,6 +786,7 @@ void EnvironmentSensorManager::initBasicGPS() {
   #else
   Serial1.begin(9600);
   #endif
+#endif
 
   // Try to detect if GPS is physically connected to determine if we should expose the setting
   _location->begin();
@@ -790,6 +821,9 @@ void EnvironmentSensorManager::initBasicGPS() {
   }
   _location->stop();
   gps_active = false; //Set GPS visibility off until setting is changed
+#ifdef NRF52_PLATFORM
+  gpsUartClose();
+#endif
 }
 
 // gps code for rak might be moved to MicroNMEALoactionProvider
@@ -897,6 +931,9 @@ void EnvironmentSensorManager::start_gps() {
     return;
   #endif
 
+#ifdef NRF52_PLATFORM
+  gpsUartOpen();   // closed by stop_gps() / initBasicGPS()
+#endif
   _location->begin();
   _location->reset();
 
@@ -916,6 +953,9 @@ void EnvironmentSensorManager::stop_gps() {
   #endif
 
   _location->stop();
+#ifdef NRF52_PLATFORM
+  gpsUartClose();
+#endif
 
   #ifndef PIN_GPS_EN
   MESH_DEBUG_PRINTLN("Stop GPS is N/A on this board. Actual GPS state unchanged");
@@ -928,6 +968,45 @@ void EnvironmentSensorManager::loop() {
 
   #if ENV_INCLUDE_GPS
   static unsigned long next_gps_update = 0;
+  #if defined(GPS_DUTY_CYCLE) && defined(NRF52_PLATFORM) && !defined(RAK_WISBLOCK_GPS)
+  // Long update interval: run the receiver only until a fresh fix, then power it (and its UART)
+  // down until the next interval. Tracking continuously costs ~40 mA, several times the rest
+  // of the board. Shorter intervals keep the receiver on, as before.
+  static uint8_t duty = 0;            // 0 = (re)start, 1 = on waiting for a fix, 2 = off
+  static unsigned long duty_mark = 0;  // on: when it woke; off: when to wake
+  if (gps_active && gps_update_interval_sec >= GPS_DUTY_MIN_INTERVAL_SEC) {
+    unsigned long now = millis();
+    if (duty == 0) { duty = 1; duty_mark = now; }
+    if (duty == 2 && (long)(now - duty_mark) >= 0) {
+      gpsUartOpen();
+      _location->begin();
+      _location->reset();
+      _location->syncTime();   // clears the old fix: wait for a new one
+      duty = 1;
+      duty_mark = now;
+    } else if (duty == 1) {
+      _location->loop();
+      bool fix = _location->isValid() && now - duty_mark > 2000;
+      if (fix || now - duty_mark > GPS_DUTY_MAX_ON_MS) {
+        if (fix) {
+          node_lat = ((double)_location->getLatitude())/1000000.;
+          node_lon = ((double)_location->getLongitude())/1000000.;
+          node_altitude = ((double)_location->getAltitude()) / 1000.0;
+        }
+        _location->stop();
+        gpsUartClose();
+        duty = 2;
+        duty_mark = now + gps_update_interval_sec * 1000UL;
+      }
+    }
+  } else {
+    if (duty == 2 && gps_active) {   // interval shortened while the receiver was off
+      gpsUartOpen();
+      _location->begin();
+      _location->reset();
+    }
+    duty = 0;
+  #endif
   if (gps_active) {
     _location->loop();
   }
@@ -954,6 +1033,9 @@ void EnvironmentSensorManager::loop() {
     }
     next_gps_update = millis() + (gps_update_interval_sec * 1000);
   }
+  #if defined(GPS_DUTY_CYCLE) && defined(NRF52_PLATFORM) && !defined(RAK_WISBLOCK_GPS)
+  }
+  #endif
   #endif
   #if ENV_INCLUDE_BME680_BSEC
   if (bsec_active && bsec_iaq.run()) {

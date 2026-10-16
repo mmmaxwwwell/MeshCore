@@ -16,7 +16,13 @@
 
 // Advertising parameters
 #define BLE_ADV_INTERVAL_MIN       32     // 20ms (units: 0.625ms)
-#define BLE_ADV_INTERVAL_MAX       244    // 152.5ms (units: 0.625ms)
+#ifdef BLE_SLOW_ADV
+  // after the fast phase nobody is actively connecting: 1022.5 ms (an Apple-listed interval)
+  // costs a phone up to ~1 s to reconnect and saves the radio ~6x the advertising events
+  #define BLE_ADV_INTERVAL_MAX     1636   // 1022.5ms (units: 0.625ms)
+#else
+  #define BLE_ADV_INTERVAL_MAX     244    // 152.5ms (units: 0.625ms)
+#endif
 #define BLE_ADV_FAST_TIMEOUT       30     // seconds
 
 // RX drain buffer size for overflow protection

@@ -13,6 +13,10 @@
 
 static volatile uint8_t state = STATE_IDLE;
 
+#ifdef LOOP_TASK_BLOCKING
+extern "C" void loopWakeFromISR();   // main.cpp: unblocks the loop task
+#endif
+
 // this function is called when a complete packet
 // is transmitted by the module
 static
@@ -22,6 +26,9 @@ static
 void setFlag(void) {
   // we sent a packet, set the flag
   state |= STATE_INT_READY;
+#ifdef LOOP_TASK_BLOCKING
+  loopWakeFromISR();
+#endif
 }
 
 void RadioLibWrapper::begin() {
