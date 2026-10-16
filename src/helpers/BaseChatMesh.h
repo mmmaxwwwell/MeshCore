@@ -61,6 +61,10 @@ public:
   virtual bool writeContactRec(uint8_t bucket, uint8_t slot, const uint8_t rec[CONTACT_REC_SIZE]) = 0;
   // calls cb for every slot in the bucket file (free slots have rec[64] (type) == 0)
   virtual void scanBucket(uint8_t bucket, void (*cb)(void* ctx, uint8_t slot, const uint8_t* rec), void* ctx) = 0;
+  // every bucket that has a file (default: probe all 256; a store can list its directory instead)
+  virtual void scanAllBuckets(void (*cb)(void* ctx, uint8_t slot, const uint8_t* rec), void* ctx) {
+    for (int b = 0; b < 256; b++) scanBucket(b, cb, ctx);
+  }
 };
 
 struct ContactIndexEntry {
@@ -122,7 +126,6 @@ class BaseChatMesh : public mesh::Mesh {
   void cacheWriteBack(ContactCacheSlot& cs);
   void cacheSyncMeta(ContactCacheSlot& cs);
   void freeRecord(int idx);
-  void commitNewContact();
   static void onIndexRec(void* ctx, uint8_t slot, const uint8_t* rec);
 #else
   ContactInfo contacts[MAX_CONTACTS+MAX_ANON_CONTACTS];
@@ -186,6 +189,7 @@ protected:
 #endif
   void populateContactFromAdvert(ContactInfo& ci, const mesh::Identity& id, const AdvertDataParser& parser, uint32_t timestamp);
   ContactInfo* allocateContactSlot(bool transient_only=false); // helper to find slot for new contact
+  void commitNewContact();   // paged store: stores the contact allocateContactSlot() handed out (no-op otherwise)
   int  findContactIdx(const uint8_t* pub_key, int prefix_len);
 
   // 'UI' concepts, for sub-classes to implement

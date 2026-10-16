@@ -111,6 +111,9 @@ public:
   MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMeshTables &tables, DataStore& store);
 
   void begin();
+#ifdef CONTACTS_PAGED
+  void loadContactsDeferred();
+#endif
   void startInterface(BaseSerialInterface &serial);
   void setListener(Listener* listener) { _listener = listener; }
 

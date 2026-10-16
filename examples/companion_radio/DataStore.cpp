@@ -1,3 +1,4 @@
+#include <helpers/nrf52/RamTrace.h>
 #include <Arduino.h>
 #include "DataStore.h"
 
@@ -293,7 +294,19 @@ static void bucketPath(char* path, char prefix, uint8_t bucket) {
   sprintf(path, "/%c%02X", prefix, bucket);
 }
 
+// The last bucket read stays open: an open costs a directory lookup (~60 ms over QSPI), a read
+// of an open file ~6 ms, and the app's contact sync walks one bucket at a time.
+static File* rd_file = NULL;
+static int rd_bucket = -1;
+static char rd_prefix = 0;
+
+static void closeReadCache() {
+  if (rd_file) { rd_file->close(); delete rd_file; rd_file = NULL; }
+  rd_bucket = -1;
+}
+
 void DataStore::removeContactFiles() {
+  closeReadCache();
   FILESYSTEM* fs = _getContactsChannelsFS();
   char path[12];
   for (int b = 0; b < 256; b++) {
@@ -306,16 +319,23 @@ void DataStore::removeContactFiles() {
 }
 
 bool DataStore::readContactRec(uint8_t bucket, uint8_t slot, uint8_t rec[CONTACT_REC_SIZE]) {
-  char path[12];
-  bucketPath(path, _cprefix, bucket);
-  File f = openRead(_getContactsChannelsFS(), path);
-  if (!f) return false;
-  bool ok = f.seek((uint32_t)slot * CONTACT_REC_SIZE) && f.read(rec, CONTACT_REC_SIZE) == CONTACT_REC_SIZE;
-  f.close();
+  if (rd_file == NULL || rd_bucket != bucket || rd_prefix != _cprefix) {
+    closeReadCache();
+    char path[12];
+    bucketPath(path, _cprefix, bucket);
+    File f = openRead(_getContactsChannelsFS(), path);
+    if (!f) return false;
+    rd_file = new File(f);
+    rd_bucket = bucket;
+    rd_prefix = _cprefix;
+  }
+  bool ok = rd_file->seek((uint32_t)slot * CONTACT_REC_SIZE) && rd_file->read(rec, CONTACT_REC_SIZE) == CONTACT_REC_SIZE;
+  if (!ok) closeReadCache();
   return ok;
 }
 
 bool DataStore::writeContactRec(uint8_t bucket, uint8_t slot, const uint8_t rec[CONTACT_REC_SIZE]) {
+  closeReadCache();   // never read a bucket through a handle opened before its last write
   FILESYSTEM* fs = _getContactsChannelsFS();
   char path[12];
   bucketPath(path, _cprefix, bucket);
@@ -351,6 +371,38 @@ void DataStore::scanBucket(uint8_t bucket, void (*cb)(void* ctx, uint8_t slot, c
   f.close();
 }
 
+void DataStore::scanAllBuckets(void (*cb)(void* ctx, uint8_t slot, const uint8_t* rec), void* ctx) {
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  // one directory pass, then open only the buckets that exist: each open of a missing name
+  // costs a full directory scan (~30 ms over QSPI)
+  static uint8_t present[32];
+  memset(present, 0, sizeof(present));
+  lfs_t* lfs = _getContactsChannelsFS()->_getFS();
+  lfs_dir_t dir;
+  struct lfs_info info;
+  int de = lfs_dir_open(lfs, &dir, "/");
+#ifdef RAM_TRACE
+  { char m[40]; snprintf(m, sizeof m, "dir_open=%d", de); RTRACE(m); }
+#endif
+  if (de != 0) { ContactPageStore::scanAllBuckets(cb, ctx); return; }
+  while (lfs_dir_read(lfs, &dir, &info) > 0) {
+    if (info.type != LFS_TYPE_REG || info.name[0] != _cprefix || strlen(info.name) != 3) continue;
+    char* end; long b = strtol(&info.name[1], &end, 16);
+    if (*end == 0 && b >= 0 && b < 256) present[b >> 3] |= 1 << (b & 7);
+  }
+  lfs_dir_close(lfs, &dir);
+#ifdef RAM_TRACE
+  { int nb = 0; for (int i = 0; i < 256; i++) if (present[i >> 3] & (1 << (i & 7))) nb++;
+    char m[40]; snprintf(m, sizeof m, "bucket files=%d", nb); RTRACE(m); }
+#endif
+  for (int b = 0; b < 256; b++) {
+    if (present[b >> 3] & (1 << (b & 7))) scanBucket(b, cb, ctx);
+  }
+#else
+  ContactPageStore::scanAllBuckets(cb, ctx);
+#endif
+}
+
 void DataStore::migrateContactsToPaged() {
   FILESYSTEM* fs = _getContactsChannelsFS();
   if (fs->exists("/cver")) return;   // done before
@@ -361,6 +413,9 @@ void DataStore::migrateContactsToPaged() {
     uint8_t rec[CONTACT_REC_SIZE];
     while (file.read(rec, CONTACT_REC_SIZE) == CONTACT_REC_SIZE) {
       if (rec[64] == 0 || next_slot[rec[0]] == 255) continue;   // anon / bucket full
+#ifdef BOOT_TRACE
+      { static int n = 0; Serial.printf("DBG migrate rec %d -> %02X slot %d\n", n++, rec[0], next_slot[rec[0]]); }
+#endif
       writeContactRec(rec[0], next_slot[rec[0]]++, rec);
 #ifdef NRF52_PLATFORM
       NRF_WDT->RR[0] = WDT_RR_RR_Reload;   // SAFE_BOOT watchdog: this loop can take a while once

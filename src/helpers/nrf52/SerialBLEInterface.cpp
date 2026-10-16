@@ -1,3 +1,4 @@
+#include <helpers/nrf52/RamTrace.h>
 #include "SerialBLEInterface.h"
 #include <stdio.h>
 #include <string.h>
@@ -142,7 +143,9 @@ void SerialBLEInterface::begin(const char* prefix, char* name, uint32_t pin_code
   #endif
   
   Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
+  RTRACE("ble: Bluefruit.begin");
   Bluefruit.begin();
+  RTRACE("ble: Bluefruit.begin done");
  
   char dev_name[32+16];
   if (strcmp(name, "@@MAC") == 0) {
@@ -172,7 +175,9 @@ void SerialBLEInterface::begin(const char* prefix, char* name, uint32_t pin_code
     BLE_DEBUG_PRINTLN("Failed to set PPCP: %lu", err_code);
   }
   
+  RTRACE("ble: setTxPower");
   Bluefruit.setTxPower(BLE_TX_POWER);
+  RTRACE("ble: setTxPower done");
   Bluefruit.setName(dev_name);
 
   Bluefruit.Security.setMITM(true);
@@ -188,7 +193,9 @@ void SerialBLEInterface::begin(const char* prefix, char* name, uint32_t pin_code
   Bluefruit.setEventCallback(onBLEEvent);
 
   bleuart.setPermission(SECMODE_ENC_WITH_MITM, SECMODE_ENC_WITH_MITM);
+  RTRACE("ble: bleuart.begin");
   bleuart.begin();
+  RTRACE("ble: bleuart.begin done");
   bleuart.setRxCallback(onBleUartRX);
 
 

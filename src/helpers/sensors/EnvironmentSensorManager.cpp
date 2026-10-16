@@ -753,7 +753,7 @@ bool EnvironmentSensorManager::setSettingValue(const char* name, const char* val
 #ifndef GPS_DUTY_MAX_ON_MS
   #define GPS_DUTY_MAX_ON_MS         120000
 #endif
-#ifdef NRF52_PLATFORM
+#if defined(NRF52_PLATFORM) && defined(GPS_UART_OFF)
 // Uart::end() spins until the stop events arrive, which never happens on a port that
 // was not begun: only ever end an open one.
 static bool gps_uart_open = false;
@@ -776,7 +776,7 @@ static void gpsUartClose() {   // an enabled UARTE keeps the HF clock + RX runni
 
 void EnvironmentSensorManager::initBasicGPS() {
 
-#ifdef NRF52_PLATFORM
+#if defined(NRF52_PLATFORM) && defined(GPS_UART_OFF)
   gpsUartOpen();
 #else
   Serial1.setPins(PIN_GPS_TX, PIN_GPS_RX);
@@ -821,7 +821,7 @@ void EnvironmentSensorManager::initBasicGPS() {
   }
   _location->stop();
   gps_active = false; //Set GPS visibility off until setting is changed
-#ifdef NRF52_PLATFORM
+#if defined(NRF52_PLATFORM) && defined(GPS_UART_OFF)
   gpsUartClose();
 #endif
 }
@@ -931,7 +931,7 @@ void EnvironmentSensorManager::start_gps() {
     return;
   #endif
 
-#ifdef NRF52_PLATFORM
+#if defined(NRF52_PLATFORM) && defined(GPS_UART_OFF)
   gpsUartOpen();   // closed by stop_gps() / initBasicGPS()
 #endif
   _location->begin();
@@ -953,7 +953,7 @@ void EnvironmentSensorManager::stop_gps() {
   #endif
 
   _location->stop();
-#ifdef NRF52_PLATFORM
+#if defined(NRF52_PLATFORM) && defined(GPS_UART_OFF)
   gpsUartClose();
 #endif
 
@@ -968,7 +968,7 @@ void EnvironmentSensorManager::loop() {
 
   #if ENV_INCLUDE_GPS
   static unsigned long next_gps_update = 0;
-  #if defined(GPS_DUTY_CYCLE) && defined(NRF52_PLATFORM) && !defined(RAK_WISBLOCK_GPS)
+  #if defined(GPS_DUTY_CYCLE) && defined(GPS_UART_OFF) && defined(NRF52_PLATFORM) && !defined(RAK_WISBLOCK_GPS)
   // Long update interval: run the receiver only until a fresh fix, then power it (and its UART)
   // down until the next interval. Tracking continuously costs ~40 mA, several times the rest
   // of the board. Shorter intervals keep the receiver on, as before.
@@ -1033,7 +1033,7 @@ void EnvironmentSensorManager::loop() {
     }
     next_gps_update = millis() + (gps_update_interval_sec * 1000);
   }
-  #if defined(GPS_DUTY_CYCLE) && defined(NRF52_PLATFORM) && !defined(RAK_WISBLOCK_GPS)
+  #if defined(GPS_DUTY_CYCLE) && defined(GPS_UART_OFF) && defined(NRF52_PLATFORM) && !defined(RAK_WISBLOCK_GPS)
   }
   #endif
   #endif

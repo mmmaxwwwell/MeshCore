@@ -1,3 +1,4 @@
+#include <helpers/nrf52/RamTrace.h>
 #include "MyMesh.h"
 
 #include <Arduino.h> // needed for PlatformIO
@@ -945,6 +946,10 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
 void MyMesh::begin() {
   BaseChatMesh::begin();
 
+#ifdef BOOT_TRACE
+  Serial.println("DBG mesh: identity");
+#endif
+  RTRACE("mesh: identity");
   if (!_store->loadMainIdentity(self_id)) {
     self_id = radio_new_identity(); // create new random identity
     int count = 0;
@@ -976,6 +981,10 @@ void MyMesh::begin() {
   }
 #endif
 
+#ifdef BOOT_TRACE
+  Serial.println("DBG mesh: prefs");
+#endif
+  RTRACE("mesh: prefs");
   // load persisted prefs
   _store->loadPrefs(_prefs);
   sensors.node_lat = _prefs.node_lat;
@@ -998,14 +1007,16 @@ void MyMesh::begin() {
 
   resetContacts();
 #ifdef CONTACTS_PAGED
-  setContactPageStore(_store);
-  _store->migrateContactsToPaged();
-  loadContactIndex();
+  setContactPageStore(_store);   // the store is loaded by loadContactsDeferred(), after BLE is up
 #else
   _store->loadContacts(this);
-#endif
   bootstrapRTCfromContacts();
+#endif
   addChannel("Public", PUBLIC_GROUP_PSK); // pre-configure public channel
+#ifdef BOOT_TRACE
+  Serial.println("DBG mesh: channels");
+#endif
+  RTRACE("mesh: channels");
   _store->loadChannels(this);
 
   radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
@@ -1017,6 +1028,22 @@ void MyMesh::begin() {
   MESH_DEBUG_PRINTLN("RX Boosted Gain Mode: %s",
                      radio_driver.getRxBoostedGainMode() ? "Enabled" : "Disabled");
 }
+
+#ifdef CONTACTS_PAGED
+// Migration (first boot) and the index load take seconds. setup() calls this AFTER BLE is up:
+// enabling the SoftDevice late in boot hung Bluefruit.begin() whenever the USB host had
+// autosuspended the (unopened) CDC port, about 2 s after enumeration.
+void MyMesh::loadContactsDeferred() {
+  RTRACE("mesh: migrate");
+  _store->migrateContactsToPaged();
+  RTRACE("mesh: load index");
+  loadContactIndex();
+  bootstrapRTCfromContacts();
+#ifdef BOOT_TRACE
+  Serial.printf("DBG mesh: %d contacts\n", getNumContacts());
+#endif
+}
+#endif
 
 const char *MyMesh::getNodeName() {
   return _prefs.node_name;
@@ -1254,6 +1281,9 @@ void MyMesh::handleCmdFrame(size_t len) {
       uint8_t reply[5];
       reply[0] = RESP_CODE_CONTACTS_START;
       uint32_t count = getNumContacts(); // total, NOT filtered count
+#ifdef RAM_TRACE
+      { char m[48]; snprintf(m, sizeof m, "CMD_GET_CONTACTS count=%lu", (unsigned long)count); RTRACE(m); }
+#endif
       memcpy(&reply[1], &count, 4);
       _serial->writeFrame(reply, 5);
 
@@ -2412,7 +2442,13 @@ void MyMesh::checkSerialInterface() {
              && !_serial->isWriteBusy() // don't spam the Serial Interface too quickly!
   ) {
     ContactInfo contact;
+#ifdef RAM_TRACE
+    static int st_n = 0; uint32_t st_t = millis();
+#endif
     if (_iter.hasNext(this, contact, _iter_filter_since)) {
+#ifdef RAM_TRACE
+      if (st_n++ < 4) { char m[56]; snprintf(m, sizeof m, "iter contact %d (%lums) since=%lu", st_n, (unsigned long)(millis() - st_t), (unsigned long)_iter_filter_since); RTRACE(m); }
+#endif
       if (contact.lastmod > _iter_filter_since) { // apply the 'since' filter
         writeContactRespFrame(RESP_CODE_CONTACT, contact);
         if (contact.lastmod > _most_recent_lastmod) {
@@ -2420,6 +2456,9 @@ void MyMesh::checkSerialInterface() {
         }
       }
     } else { // EOF
+#ifdef RAM_TRACE
+      { char m[48]; snprintf(m, sizeof m, "iter END after %d (%lums)", st_n, (unsigned long)(millis() - st_t)); RTRACE(m); st_n = 0; }
+#endif
       out_frame[0] = RESP_CODE_END_OF_CONTACTS;
       memcpy(&out_frame[1], &_most_recent_lastmod,
              4); // include the most recent lastmod, so app can update their 'since'
@@ -2469,5 +2508,6 @@ bool MyMesh::advert() {
 
 // To check if there is pending work
 bool MyMesh::hasPendingWork() const {
-  return _mgr->getOutboundTotal() > 0 || dirty_contacts_expiry != 0;
+  // _iter_started: a contact sync streams one contact per loop pass; don't sleep between them
+  return _mgr->getOutboundTotal() > 0 || dirty_contacts_expiry != 0 || _iter_started;
 }

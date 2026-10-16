@@ -1,3 +1,4 @@
+#include <helpers/nrf52/RamTrace.h>
 #include <Arduino.h>   // needed for PlatformIO
 #include <Mesh.h>
 #include "MyMesh.h"
@@ -121,6 +122,9 @@ MyMesh the_mesh(radio_driver, fast_rng, rtc_clock, tables, store);
 #ifdef SAFE_BOOT
   #include <helpers/nrf52/SafeBoot.h>
 #endif
+#ifdef USB_CDC_GUARD
+  #include <helpers/nrf52/CdcGuard.h>
+#endif
 #if defined(QSPI_POWERSAVE) || defined(QSPI_RELEASE_DPD_AT_BOOT)
   #include <helpers/nrf52/QSPIPowerSave.h>
 #endif
@@ -161,7 +165,14 @@ void setup() {
   SafeBoot::begin();   // first: a crash anywhere below must count
 #endif
   Serial.begin(115200);
-#ifdef CONTACTS_SELFTEST
+#ifdef USB_CDC_GUARD
+  CdcGuard::begin();   // before the first print that could block
+#endif
+#ifdef RAM_TRACE
+  RamTrace::begin();
+  RTRACE("setup");
+#endif
+#if defined(CONTACTS_SELFTEST) || (defined(BOOT_TRACE) && !defined(BOOT_TRACE_NOWAIT))
   { unsigned long t = millis(); while (!Serial && millis() - t < 15000) delay(10); delay(300); }
   Serial.println("DBG boot");
 #endif
@@ -184,21 +195,28 @@ void setup() {
   }
 #endif
 
-  if (!radio_init()) { halt(); }
+  RTRACE("radio_init");
+  if (!radio_init()) { RTRACE("radio_init FAILED"); halt(); }
+  RTRACE("radio ok");
 
   fast_rng.begin(radio_driver.getRngSeed());
 
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
   InternalFS.begin();
   #if defined(QSPIFLASH)
+  RTRACE("qspi release");
   #if defined(QSPI_POWERSAVE) || defined(QSPI_RELEASE_DPD_AT_BOOT)
     qspiReleaseDeepPowerDown();
   #endif
+    RTRACE("qspi begin");
     if (!QSPIFlash.begin()) {
       // debug output might not be available at this point, might be too early. maybe should fall back to InternalFS here?
       MESH_DEBUG_PRINTLN("CustomLFS_QSPIFlash: failed to initialize");
     } else {
       MESH_DEBUG_PRINTLN("CustomLFS_QSPIFlash: initialized successfully");
+    #ifdef BOOT_TRACE
+      Serial.println("DBG qspi up");
+    #endif
     #ifdef QSPI_POWERSAVE
       QSPIPowerSave::install(QSPIFlash);
     #endif
@@ -214,7 +232,15 @@ void setup() {
       ExtraFS.begin();
   #endif
   #endif
+#ifdef BOOT_TRACE
+  Serial.println("DBG store.begin");
+#endif
+  RTRACE("store.begin");
   store.begin();
+#ifdef BOOT_TRACE
+  Serial.println("DBG store.begin done");
+#endif
+  RTRACE("store.begin done");
 #ifdef CONTACTS_SELFTEST
   {
     unsigned long t = millis(); while (!Serial && millis() - t < 15000) delay(10);
@@ -281,10 +307,18 @@ void setup() {
   the_mesh.setBLEPin(0);
 #endif
 
+#ifdef BOOT_TRACE
+  Serial.println("DBG mesh begun, starting BLE");
+#endif
+  RTRACE("mesh begun, starting BLE");
 // add bluetooth interface
 #if defined(BLE_PIN_CODE)
   bluetooth_interface.begin(BLE_NAME_PREFIX, the_mesh.getNodePrefs()->node_name, the_mesh.getBLEPin());
+  RTRACE("ble begun");
   interface_manager.addInterface(InterfaceType::Bluetooth, &bluetooth_interface);
+#endif
+#ifdef CONTACTS_PAGED
+  the_mesh.loadContactsDeferred();   // after BLE: see MyMesh::loadContactsDeferred()
 #endif
 
 // add wifi interface
@@ -367,14 +401,36 @@ void setup() {
 }
 
 void loop() {
+#ifdef RAM_TRACE
+  { static int k = 0; if (k < 3) { char m[40]; snprintf(m, sizeof m, "loop %d contacts=%d", k++, the_mesh.getNumContacts()); RTRACE(m); } }
+#endif
 #ifdef SAFE_BOOT
   SafeBoot::loop();
 #endif
+#ifdef BOOT_TRACE
+  { static int k = 0; if (k++ < 15) Serial.println("DBG L mesh"); }
+#endif
+#ifdef BOOT_TRACE
+  { static unsigned long n = 0, last = 0; n++;
+    if (millis() - last > 5000 || n < 15) { last = millis(); Serial.printf("DBG loop alive passes=%lu ms=%lu\n", n, millis()); } }
+#endif
   the_mesh.loop();
+#ifdef BOOT_TRACE
+  { static int k = 0; if (k++ < 15) Serial.println("DBG L ifaces"); }
+#endif
   interface_manager.loop();
+#ifdef BOOT_TRACE
+  { static int k = 0; if (k++ < 15) Serial.println("DBG L sensors"); }
+#endif
   sensors.loop();
+#ifdef BOOT_TRACE
+  { static int k = 0; if (k++ < 15) Serial.println("DBG L ui/board"); }
+#endif
 #ifdef DISPLAY_CLASS
   ui_task.loop();
+#endif
+#ifdef RAM_TRACE
+  { static int k = 0; if (k++ < 4) RTRACE("loop: rtc/board"); }
 #endif
   rtc_clock.tick();
   board.loop();
@@ -383,13 +439,22 @@ void loop() {
 #endif
 
 #ifdef QSPI_POWERSAVE
+  #ifdef BOOT_TRACE
+  { static int k = 0; if (k++ < 15) Serial.println("DBG qspi loop"); }
+  #endif
   QSPIPowerSave::loop();
 #endif
 
   if (!the_mesh.hasPendingWork()) {
 #if defined(NRF52_PLATFORM) && defined(LOOP_TASK_BLOCKING)
     if (loop_task == NULL) loop_task = xTaskGetCurrentTaskHandle();
+  #ifdef BOOT_TRACE
+    { static int k = 0; if (k < 15) Serial.printf("DBG block %d\n", k); }
+  #endif
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(LOOP_MAX_SLEEP_MS));   // idle task -> tickless sleep
+  #ifdef BOOT_TRACE
+    { static int k = 0; if (k++ < 15) Serial.printf("DBG unblock %d\n", k); }
+  #endif
 #elif defined(NRF52_PLATFORM)
     board.sleep(0); // nrf ignores seconds param, sleeps whenever possible
 #endif

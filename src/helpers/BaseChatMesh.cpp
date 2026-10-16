@@ -1,3 +1,4 @@
+#include <helpers/nrf52/RamTrace.h>
 #include <helpers/BaseChatMesh.h>
 #include <Utils.h>
 
@@ -1054,7 +1055,17 @@ void BaseChatMesh::onIndexRec(void* ctx, uint8_t slot, const uint8_t* rec) {
 
 void BaseChatMesh::loadContactIndex() {
   if (_cstore == NULL) return;
-  for (int b = 0; b < 256; b++) _cstore->scanBucket(b, onIndexRec, this);
+#ifdef EXP_SKIP_INDEX
+  return;
+#endif
+#ifdef EXP_DELAY_INSTEAD
+  delay(17000);
+  return;
+#endif
+  _cstore->scanAllBuckets(onIndexRec, this);
+#ifdef RAM_TRACE
+  { char m[48]; snprintf(m, sizeof m, "index loaded n=%d", num_contacts - MAX_ANON_CONTACTS); RTRACE(m); }
+#endif
 }
 
 uint32_t BaseChatMesh::contactLastmod(int idx) const {

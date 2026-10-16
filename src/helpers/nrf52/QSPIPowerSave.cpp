@@ -67,7 +67,29 @@ static void sleep() {
 }
 
 static int w_read(const struct lfs_config* c, lfs_block_t b, lfs_off_t o, void* buf, lfs_size_t n) {
-  wake(); int r = orig_read(c, b, o, buf, n); last_access = millis(); return r;
+  wake();
+  int r;
+#ifdef QSPI_FAST_READ
+  // CustomLFS's read waits with delay(1) after every transfer: a full RTOS tick (~1 ms) for a
+  // 256-byte read that takes ~30 us, and one directory lookup is dozens of reads. Here: start
+  // the transfer with the IRQ masked, spin on READY, then unmask -- the pending IRQ runs nrfx's
+  // handler, which clears the driver's busy state (and harmlessly marks CustomLFS's op done).
+  uint32_t addr = b * c->block_size + o;
+  if (((uintptr_t)buf & 3) == 0 && (n & 3) == 0 && (addr & 3) == 0 && nrfx_is_in_ram(buf)) {
+    NVIC_DisableIRQ(QSPI_IRQn);
+    NRF_QSPI->EVENTS_READY = 0;
+    nrfx_err_t e = nrfx_qspi_read(buf, n, addr);
+    if (e == NRFX_SUCCESS) {
+      uint32_t t = micros();
+      while (!NRF_QSPI->EVENTS_READY && micros() - t < 20000) ;
+    }
+    NVIC_EnableIRQ(QSPI_IRQn);
+    r = (e == NRFX_SUCCESS) ? 0 : orig_read(c, b, o, buf, n);
+  } else
+#endif
+  r = orig_read(c, b, o, buf, n);
+  last_access = millis();
+  return r;
 }
 static int w_prog(const struct lfs_config* c, lfs_block_t b, lfs_off_t o, const void* buf, lfs_size_t n) {
   wake(); int r = orig_prog(c, b, o, buf, n); last_access = millis(); return r;
