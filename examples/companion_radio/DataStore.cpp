@@ -288,8 +288,9 @@ File file = openRead(_getContactsChannelsFS(), "/contacts3");
 }
 
 #ifdef CONTACTS_PAGED
+// flat names at the root: mkdir fails on the QSPI CustomLFS (seen on the Wio Tracker L1)
 static void bucketPath(char* path, char prefix, uint8_t bucket) {
-  sprintf(path, "/%c%X/%02X", prefix, bucket >> 4, bucket);
+  sprintf(path, "/%c%02X", prefix, bucket);
 }
 
 void DataStore::removeContactFiles() {
@@ -298,10 +299,6 @@ void DataStore::removeContactFiles() {
   for (int b = 0; b < 256; b++) {
     bucketPath(path, _cprefix, b);
     fs->remove(path);
-    if ((b & 15) == 15) {
-      sprintf(path, "/%c%X", _cprefix, b >> 4);
-      fs->rmdir(path);
-    }
   }
 }
 
@@ -318,18 +315,24 @@ bool DataStore::readContactRec(uint8_t bucket, uint8_t slot, uint8_t rec[CONTACT
 bool DataStore::writeContactRec(uint8_t bucket, uint8_t slot, const uint8_t rec[CONTACT_REC_SIZE]) {
   FILESYSTEM* fs = _getContactsChannelsFS();
   char path[12];
-  sprintf(path, "/%c%X", _cprefix, bucket >> 4);
-  if (!fs->exists(path)) fs->mkdir(path);
   bucketPath(path, _cprefix, bucket);
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
   File f = fs->open(path, FILE_O_WRITE);   // read-write, NOT truncated (openWrite() removes the file)
 #else
   File f = fs->open(path, fs->exists(path) ? "r+" : "w+");
 #endif
-  if (!f) return false;
+  if (!f) {
+#ifdef CONTACTS_SELFTEST
+    Serial.printf("DBG open-for-write failed %s\n", path);
+#endif
+    return false;
+  }
   // slots are taken lowest-free-first, so this never seeks more than one slot past the end
-  bool ok = f.seek((uint32_t)slot * CONTACT_REC_SIZE) && f.write(rec, CONTACT_REC_SIZE) == CONTACT_REC_SIZE;
+  bool sk = f.seek((uint32_t)slot * CONTACT_REC_SIZE);
+  int wr = f.write(rec, CONTACT_REC_SIZE);
+  bool ok = sk && wr == CONTACT_REC_SIZE;
   f.close();
+
   return ok;
 }
 

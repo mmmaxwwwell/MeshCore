@@ -149,6 +149,7 @@ void BaseChatMesh::commitNewContact() {
   cidx[idx].slot = slot;
   cs.crc = 0;          // force the write
   cacheWriteBack(cs);
+
 }
 #else
 void BaseChatMesh::commitNewContact() { }
@@ -287,7 +288,8 @@ int BaseChatMesh::searchPeersByHash(const uint8_t* hash) {
   int n = 0;
   for (int i = 0; i < num_contacts && n < MAX_SEARCH_RESULTS; i++) {
 #ifdef CONTACTS_PAGED
-    bool match = i < MAX_ANON_CONTACTS ? anon[i].id.isHashMatch(hash)
+    static const uint8_t zero_key[4] = {0, 0, 0, 0};   // an unused anon slot: not a peer
+    bool match = i < MAX_ANON_CONTACTS ? (anon[i].id.isHashMatch(hash) && memcmp(anon[i].id.pub_key, zero_key, 4) != 0)
                : (PATH_HASH_SIZE <= 4 && memcmp(cidx[i].key, hash, PATH_HASH_SIZE) == 0);
     if (match) {
 #else
@@ -1159,6 +1161,7 @@ void BaseChatMesh::freeRecord(int idx) {
 struct StModel { uint8_t key[32]; uint32_t tag; uint32_t lastmod; bool live; };
 static StModel st_m[ST_MAX];
 static uint32_t st_rng = 0x1234567;
+const char* st_summary = "";
 static uint32_t stRand() { st_rng ^= st_rng << 13; st_rng ^= st_rng >> 17; st_rng ^= st_rng << 5; return st_rng; }
 
 bool BaseChatMesh::contactStoreSelfTest(ContactPageStore* store, Print& out) {
@@ -1169,7 +1172,10 @@ bool BaseChatMesh::contactStoreSelfTest(ContactPageStore* store, Print& out) {
   int live = 0, errors = 0, ops = 0;
   uint32_t t0 = millis(), max_op = 0;
 
-  #define ST_FAIL(...) do { errors++; out.printf("ST FAIL op%d: ", ops); out.printf(__VA_ARGS__); out.println(); } while (0)
+  static char st_log[2048]; st_log[0] = 0;
+  #define ST_FAIL(...) do { errors++; int L = strlen(st_log); \
+    if (L < (int)sizeof(st_log) - 120) { L += snprintf(st_log + L, sizeof(st_log) - L, "ST FAIL op%d: ", ops); \
+      L += snprintf(st_log + L, sizeof(st_log) - L, __VA_ARGS__); snprintf(st_log + L, sizeof(st_log) - L, "\n"); } } while (0)
 
   auto check_one = [&](int m) {
     ContactInfo* c = lookupContactByPubKey(st_m[m].key, PUB_KEY_SIZE);
@@ -1192,7 +1198,8 @@ bool BaseChatMesh::contactStoreSelfTest(ContactPageStore* store, Print& out) {
       if (tag != st_m[found].tag || c.lastmod != st_m[found].lastmod) ST_FAIL("%s: stale m=%d", when, found);
     }
     if (n != live || getNumContacts() != live) ST_FAIL("%s: count iter=%d table=%d model=%d", when, n, getNumContacts(), live);
-    out.printf("ST %s ok-so-far errors=%d live=%d\n", when, errors, live);
+    int L = strlen(st_log);
+    snprintf(st_log + L, sizeof(st_log) - L, "ST %s errors=%d live=%d ops=%d\n", when, errors, live, ops);
   };
   auto reboot = [&]() {
     flushContacts();
@@ -1204,9 +1211,12 @@ bool BaseChatMesh::contactStoreSelfTest(ContactPageStore* store, Print& out) {
     if (stRand() % 4) k[0] = stRand() % 6;   // pile most into 6 buckets: big buckets, slot reuse
   };
 
+  static const char* tname[] = {"add", "modify", "remove", "lookup", "reboot", "idle"};
+  uint32_t tmax[6] = {0}, tsum[6] = {0}, tcnt[6] = {0};
   for (int round = 0; round < 2200; round++, ops++) {
     c_epoch++;   // as loop() does
     uint32_t r = stRand() % 100;
+    int ty = r < 40 ? 0 : r < 70 ? 1 : r < 82 ? 2 : r < 95 ? 3 : r < 97 ? 4 : 5;
     uint32_t ts = millis();
     if (r < 40 && live < ST_MAX - 10) {                 // add
       int m = 0; while (st_m[m].live) m++;
@@ -1246,6 +1256,8 @@ bool BaseChatMesh::contactStoreSelfTest(ContactPageStore* store, Print& out) {
     }
     uint32_t dt = millis() - ts;
     if (dt > max_op) max_op = dt;
+    if (dt > tmax[ty]) tmax[ty] = dt;
+    tsum[ty] += dt; tcnt[ty]++;
 #ifdef QSPI_POWERSAVE
     if (ops % 7 == 0) { delay(QSPI_IDLE_MS + 5); QSPIPowerSave::loop(); }   // real sleep/wake cycles
 #endif
@@ -1277,11 +1289,19 @@ bool BaseChatMesh::contactStoreSelfTest(ContactPageStore* store, Print& out) {
   reboot();
   check_all("overwrite");
 
-  out.printf("ST DONE errors=%d ops=%d live=%d secs=%lu max_op_ms=%lu\n", errors, ops, live,
-             (unsigned long)((millis() - t0) / 1000), (unsigned long)max_op);
+  { int L = strlen(st_log);
+    snprintf(st_log + L, sizeof(st_log) - L, "ST DONE errors=%d ops=%d live=%d secs=%lu max_op_ms=%lu\n", errors, ops, live,
+             (unsigned long)((millis() - t0) / 1000), (unsigned long)max_op); }
 #ifdef QSPI_POWERSAVE
-  out.printf("ST qspi sleeps=%lu\n", (unsigned long)QSPIPowerSave::sleeps());
+  { int L = strlen(st_log);
+    snprintf(st_log + L, sizeof(st_log) - L, "ST qspi sleeps=%lu\n", (unsigned long)QSPIPowerSave::sleeps()); }
 #endif
+  for (int k = 0; k < 6; k++) {
+    int L = strlen(st_log);
+    snprintf(st_log + L, sizeof(st_log) - L, "ST time %s n=%lu avg=%lums max=%lums\n", tname[k], (unsigned long)tcnt[k],
+             (unsigned long)(tcnt[k] ? tsum[k] / tcnt[k] : 0), (unsigned long)tmax[k]);
+  }
+  st_summary = st_log;
   resetContacts();
   _cstore = saved;
   return errors == 0;

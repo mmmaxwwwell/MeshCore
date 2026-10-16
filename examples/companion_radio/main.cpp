@@ -121,7 +121,7 @@ MyMesh the_mesh(radio_driver, fast_rng, rtc_clock, tables, store);
 #ifdef SAFE_BOOT
   #include <helpers/nrf52/SafeBoot.h>
 #endif
-#ifdef QSPI_POWERSAVE
+#if defined(QSPI_POWERSAVE) || defined(QSPI_RELEASE_DPD_AT_BOOT)
   #include <helpers/nrf52/QSPIPowerSave.h>
 #endif
 #ifdef LOOP_TASK_BLOCKING
@@ -161,6 +161,10 @@ void setup() {
   SafeBoot::begin();   // first: a crash anywhere below must count
 #endif
   Serial.begin(115200);
+#ifdef CONTACTS_SELFTEST
+  { unsigned long t = millis(); while (!Serial && millis() - t < 15000) delay(10); delay(300); }
+  Serial.println("DBG boot");
+#endif
   board.begin();
 
 #ifdef HAS_EXTERNAL_WATCHDOG
@@ -187,6 +191,9 @@ void setup() {
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
   InternalFS.begin();
   #if defined(QSPIFLASH)
+  #if defined(QSPI_POWERSAVE) || defined(QSPI_RELEASE_DPD_AT_BOOT)
+    qspiReleaseDeepPowerDown();
+  #endif
     if (!QSPIFlash.begin()) {
       // debug output might not be available at this point, might be too early. maybe should fall back to InternalFS here?
       MESH_DEBUG_PRINTLN("CustomLFS_QSPIFlash: failed to initialize");
@@ -194,6 +201,12 @@ void setup() {
       MESH_DEBUG_PRINTLN("CustomLFS_QSPIFlash: initialized successfully");
     #ifdef QSPI_POWERSAVE
       QSPIPowerSave::install(QSPIFlash);
+    #endif
+    #ifdef QSPI_LFS_LOOKAHEAD
+      // littlefs v1 traverses the WHOLE filesystem every time its lookahead window of free
+      // blocks runs out; CustomLFS sets 32 blocks but allocates a 32-byte (256-bit) buffer.
+      // lfs_alloc() reads cfg->lookahead at each refill, so widening it after mount is safe.
+      ((struct lfs_config*) QSPIFlash._getFS()->cfg)->lookahead = QSPI_LFS_LOOKAHEAD;
     #endif
     }
   #else
@@ -205,6 +218,18 @@ void setup() {
 #ifdef CONTACTS_SELFTEST
   {
     unsigned long t = millis(); while (!Serial && millis() - t < 15000) delay(10);
+    {
+      FILESYSTEM* fs = store.getSecondaryFS() ? store.getSecondaryFS() : store.getPrimaryFS();
+      Serial.printf("DBG fs=%s used=%lu/%lu KB contacts3=%d adv_blobs=%d cver=%d\n",
+        store.getSecondaryFS() ? "qspi" : "internal", (unsigned long)store.getStorageUsedKb(),
+        (unsigned long)store.getStorageTotalKb(), fs->exists("/contacts3"), fs->exists("/adv_blobs"), fs->exists("/cver"));
+      fs->remove("/tst");
+      File f = fs->open("/tst", FILE_O_WRITE);
+      Serial.printf("DBG open /tst write: %d\n", (bool)f);
+      if (f) { Serial.printf("DBG wrote %d\n", (int)f.write((const uint8_t *)"hello", 5)); f.close(); }
+      Serial.printf("DBG /tst exists=%d\n", fs->exists("/tst"));
+      fs->remove("/tst");
+    }
     store.setContactDirPrefix('t');
     store.removeContactFiles();
     bool ok = the_mesh.contactStoreSelfTest(&store, Serial);
@@ -213,9 +238,11 @@ void setup() {
     Serial.println(ok ? "ST RESULT PASS" : "ST RESULT FAIL");
     for (;;) {   // test build: never touch the real contacts. USB stays up for the 1200-baud touch.
   #ifdef SAFE_BOOT
-      SafeBoot::feed();
+      SafeBoot::loop();   // feeds, and marks the boot healthy after 30 s
   #endif
-      delay(1000);
+      delay(3000);
+      extern const char* st_summary;
+      Serial.print(st_summary);
       Serial.println(ok ? "ST RESULT PASS" : "ST RESULT FAIL");
     }
   }

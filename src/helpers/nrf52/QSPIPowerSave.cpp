@@ -1,4 +1,29 @@
 #include "QSPIPowerSave.h"
+#if defined(NRF52_PLATFORM) && (defined(QSPI_POWERSAVE) || defined(QSPI_RELEASE_DPD_AT_BOOT))
+void qspiReleaseDeepPowerDown() {
+  pinMode(PIN_QSPI_IO2, OUTPUT); digitalWrite(PIN_QSPI_IO2, HIGH);   // /WP
+  pinMode(PIN_QSPI_IO3, OUTPUT); digitalWrite(PIN_QSPI_IO3, HIGH);   // /HOLD (low would pause it)
+  pinMode(PIN_QSPI_CS, OUTPUT);  digitalWrite(PIN_QSPI_CS, HIGH);
+  pinMode(PIN_QSPI_SCK, OUTPUT); digitalWrite(PIN_QSPI_SCK, LOW);    // SPI mode 0
+  pinMode(PIN_QSPI_IO0, OUTPUT);
+  delayMicroseconds(10);
+  digitalWrite(PIN_QSPI_CS, LOW);
+  for (int bit = 7; bit >= 0; bit--) {
+    digitalWrite(PIN_QSPI_IO0, (0xAB >> bit) & 1);
+    delayMicroseconds(1);
+    digitalWrite(PIN_QSPI_SCK, HIGH);
+    delayMicroseconds(1);
+    digitalWrite(PIN_QSPI_SCK, LOW);
+  }
+  digitalWrite(PIN_QSPI_CS, HIGH);
+  delayMicroseconds(50);   // tRES1
+  // hand the pins back as inputs; nrfx_qspi_init() configures them
+  pinMode(PIN_QSPI_SCK, INPUT); pinMode(PIN_QSPI_IO0, INPUT);
+  pinMode(PIN_QSPI_IO2, INPUT); pinMode(PIN_QSPI_IO3, INPUT);
+  pinMode(PIN_QSPI_CS, INPUT_PULLUP);
+}
+#endif
+
 #if defined(NRF52_PLATFORM) && defined(QSPI_POWERSAVE)
 #include <nrfx_qspi.h>
 
@@ -13,8 +38,6 @@ static bool installed = false;
 static uint32_t last_access = 0;
 static uint32_t n_sleeps = 0;
 
-#define CMD_DEEP_POWER_DOWN   0xB9
-#define CMD_RELEASE_DPD       0xAB
 
 static void wake() {
   if (awake) return;
@@ -26,16 +49,14 @@ static void wake() {
   while (!NRF_QSPI->EVENTS_READY && micros() - t < 10000) ;
   NRF_QSPI->EVENTS_READY = 0;
   NRF_QSPI->INTENSET = inten;
-  nrf_qspi_cinstr_conf_t c = NRFX_QSPI_DEFAULT_CINSTR(CMD_RELEASE_DPD, NRF_QSPI_CINSTR_LEN_1B);
-  nrfx_qspi_cinstr_xfer(&c, NULL, NULL);
-  delayMicroseconds(50);                     // tRES1 (P25Q16H: 8 us; margin for other parts)
   awake = true;
 }
 
 static void sleep() {
   if (!awake) return;
-  nrf_qspi_cinstr_conf_t c = NRFX_QSPI_DEFAULT_CINSTR(CMD_DEEP_POWER_DOWN, NRF_QSPI_CINSTR_LEN_1B);
-  nrfx_qspi_cinstr_xfer(&c, NULL, NULL);
+  // The chip is NOT put in deep power-down: QSPI activation polls its status register, and a
+  // chip in deep power-down never answers it (activation times out; seen on a Wio Tracker L1).
+  // The milliamps are in the peripheral; the chip's standby is ~10-25 uA.
   NRF_QSPI->EVENTS_READY = 0;
   NRF_QSPI->TASKS_DEACTIVATE = 1;
   // anomaly 122: "QSPI uses current after being disabled" (as nrfx 2.x qspi_deactivate())
