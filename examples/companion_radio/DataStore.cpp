@@ -299,6 +299,9 @@ void DataStore::removeContactFiles() {
   for (int b = 0; b < 256; b++) {
     bucketPath(path, _cprefix, b);
     fs->remove(path);
+#ifdef NRF52_PLATFORM
+    NRF_WDT->RR[0] = WDT_RR_RR_Reload;
+#endif
   }
 }
 

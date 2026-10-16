@@ -231,7 +231,9 @@ void setup() {
       fs->remove("/tst");
     }
     store.setContactDirPrefix('t');
+    Serial.printf("DBG cleanup start %lu\n", millis()); Serial.flush();
     store.removeContactFiles();
+    Serial.printf("DBG cleanup done %lu\n", millis()); Serial.flush();
     bool ok = the_mesh.contactStoreSelfTest(&store, Serial);
     store.removeContactFiles();
     store.setContactDirPrefix('c');

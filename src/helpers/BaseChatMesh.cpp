@@ -1198,8 +1198,10 @@ bool BaseChatMesh::contactStoreSelfTest(ContactPageStore* store, Print& out) {
       if (tag != st_m[found].tag || c.lastmod != st_m[found].lastmod) ST_FAIL("%s: stale m=%d", when, found);
     }
     if (n != live || getNumContacts() != live) ST_FAIL("%s: count iter=%d table=%d model=%d", when, n, getNumContacts(), live);
-    int L = strlen(st_log);
-    snprintf(st_log + L, sizeof(st_log) - L, "ST %s errors=%d live=%d ops=%d\n", when, errors, live, ops);
+    if (strcmp(when, "reboot") != 0) {   // keep the summary short: only final/overwrite checkpoints
+      int L = strlen(st_log);
+      snprintf(st_log + L, sizeof(st_log) - L, "ST %s errors=%d live=%d ops=%d\n", when, errors, live, ops);
+    }
   };
   auto reboot = [&]() {
     flushContacts();
@@ -1258,6 +1260,14 @@ bool BaseChatMesh::contactStoreSelfTest(ContactPageStore* store, Print& out) {
     if (dt > max_op) max_op = dt;
     if (dt > tmax[ty]) tmax[ty] = dt;
     tsum[ty] += dt; tcnt[ty]++;
+    static uint32_t win_max = 0;
+    if (dt > win_max) win_max = dt;
+    if (ops % 50 == 0) {
+      out.printf("ST progress ops=%d live=%d errors=%d elapsed=%lus window_max=%lums\n", ops, live, errors,
+                 (unsigned long)((millis() - t0) / 1000), (unsigned long)win_max);
+      win_max = 0;
+      Serial.flush();
+    }
 #ifdef QSPI_POWERSAVE
     if (ops % 7 == 0) { delay(QSPI_IDLE_MS + 5); QSPIPowerSave::loop(); }   // real sleep/wake cycles
 #endif
