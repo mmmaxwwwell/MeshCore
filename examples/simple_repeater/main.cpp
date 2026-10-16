@@ -105,6 +105,9 @@ void setup() {
   sensors.begin();
 
   the_mesh.begin(fs);
+#if defined(ESP32)
+  board.setOTAPassword(the_mesh.getNodePrefs()->password);   // WPA2 OTA AP keyed with the admin password
+#endif
 
 #ifdef DISPLAY_CLASS
   ui_task.begin(the_mesh.getNodePrefs(), FIRMWARE_BUILD_DATE, FIRMWARE_VERSION);
@@ -186,6 +189,9 @@ void loop() {
 #endif
 
   the_mesh.loop();
+#if defined(ESP32)
+  board.otaLoop();   // closes an idle `start ota` window after 10 min
+#endif
   sensors.loop();
 #ifdef DISPLAY_CLASS
   ui_task.loop();
