@@ -86,6 +86,8 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   FILESYSTEM* _fs;
   uint32_t last_millis;
   uint64_t uptime_millis;
+  uint32_t _num_sleeps;      // powersaving: how often / how long it actually slept
+  uint64_t _slept_millis;
   unsigned long next_local_advert, next_flood_advert;
   bool _logging;
   NodePrefs _prefs;
@@ -252,6 +254,7 @@ public:
 
   // To check if there is pending work
   bool hasPendingWork() const;
+  void noteSleep(unsigned long slept_millis) { _num_sleeps++; _slept_millis += slept_millis; }
 
   bool setRxBoostedGain(bool enable) override;
 

@@ -875,6 +875,8 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
 {
   last_millis = 0;
   uptime_millis = 0;
+  _num_sleeps = 0;
+  _slept_millis = 0;
   next_local_advert = next_flood_advert = 0;
   dirty_contacts_expiry = 0;
   set_radio_at = revert_radio_at = 0;
@@ -1279,6 +1281,10 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
       sendNodeDiscoverReq();
       strcpy(reply, "OK - Discover sent");
     }
+  } else if (strcmp(command, "powersaving") == 0) {   // state + how much it actually sleeps
+    uint32_t pct = uptime_millis ? (uint32_t)(_slept_millis * 100 / uptime_millis) : 0;
+    sprintf(reply, "%s - slept %lu times, %lu%% of uptime", _prefs.powersaving_enabled ? "on" : "off",
+            (unsigned long)_num_sleeps, (unsigned long)pct);
   } else{
     _cli.handleCommand(sender_timestamp, command, reply);  // common CLI commands
   }
@@ -1334,5 +1340,8 @@ bool MyMesh::hasPendingWork() const {
 #if defined(WITH_BRIDGE)
   if (bridge.isRunning()) return true;  // bridge needs WiFi radio, can't sleep
 #endif
+  // light sleep only delays millis() deadlines (a 30 s timer wakes it), but a
+  // pending temp radio change or lazy ACL write should not wait that long
+  if (set_radio_at || dirty_contacts_expiry) return true;
   return _mgr->getOutboundTotal() > 0;
 }

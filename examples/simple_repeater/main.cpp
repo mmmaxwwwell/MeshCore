@@ -30,6 +30,27 @@ static char ethernet_command[160];
 // For power saving
 unsigned long POWERSAVING_FIRSTSLEEP_SECS = 120; // The first sleep (if enabled) from boot
 
+#if defined(ESP32)
+#include <driver/uart.h>
+// Awake this long after the user button is pressed or a serial byte arrives,
+// so the CLI is usable on a node with powersaving on.
+#define POWERSAVING_AWAKE_MILLIS  (120 * 1000UL)
+static unsigned long stay_awake_until = 0;
+
+#if ARDUINO_USB_MODE && ARDUINO_USB_CDC_ON_BOOT
+  // Native USB-Serial/JTAG (Heltec V4): light sleep kills the port and a
+  // sleeping S3 cannot answer enumeration, so never sleep with a host attached.
+  static bool usbHostConnected() { return HWCDC::isConnected(); }
+  #define POWERSAVING_UART_WAKE 0
+#else
+  // USB-UART bridge (Heltec V3's CP2102): the port survives sleep, but bytes
+  // sent while asleep are lost. UART0 RX wakes it (the waking chars are
+  // dropped): press Enter a couple of times, then the CLI stays up.
+  static bool usbHostConnected() { return false; }
+  #define POWERSAVING_UART_WAKE 1
+#endif
+#endif
+
 #if defined(PIN_USER_BTN) && defined(_SEEED_SENSECAP_SOLAR_H_)
 static unsigned long userBtnDownAt = 0;
 #define USER_BTN_HOLD_OFF_MILLIS 1500
@@ -40,6 +61,15 @@ void setup() {
   delay(1000);
 
   board.begin();
+#if defined(ESP32)
+#ifdef PIN_USER_BTN
+  pinMode(PIN_USER_BTN, INPUT_PULLUP);   // powersaving stay-awake button
+#endif
+#if POWERSAVING_UART_WAKE
+  uart_set_wakeup_threshold(UART_NUM_0, 3);   // RX edges; the minimum
+  esp_sleep_enable_uart_wakeup(UART_NUM_0);
+#endif
+#endif
 
 #ifdef HAS_EXTERNAL_WATCHDOG
   external_watchdog.begin();
@@ -128,6 +158,9 @@ void setup() {
 void loop() {
   // Handle Serial CLI
   int len = strlen(command);
+#if defined(ESP32)
+  if (Serial.available()) stay_awake_until = millis() + POWERSAVING_AWAKE_MILLIS;
+#endif
   while (Serial.available() && len < sizeof(command)-1) {
     char c = Serial.read();
     if (c != '\n') {
@@ -201,6 +234,33 @@ void loop() {
 #ifdef HAS_EXTERNAL_WATCHDOG
   external_watchdog.loop();
 #endif
+#if defined(ESP32)
+#ifdef PIN_USER_BTN
+  if (digitalRead(PIN_USER_BTN) == LOW) {   // button held (active low)
+    stay_awake_until = millis() + POWERSAVING_AWAKE_MILLIS;
+  }
+#endif
+  if (the_mesh.getNodePrefs()->powersaving_enabled && !usbHostConnected()
+      && the_mesh.millisHasNowPassed(POWERSAVING_FIRSTSLEEP_SECS * 1000)
+      && (stay_awake_until == 0 || the_mesh.millisHasNowPassed(stay_awake_until))
+      && !the_mesh.hasPendingWork()) {
+#ifdef PIN_USER_BTN
+    gpio_wakeup_enable((gpio_num_t)PIN_USER_BTN, GPIO_INTR_LOW_LEVEL);   // button also wakes it
+#endif
+    unsigned long t0 = millis();
+    board.sleep(30);   // wakes on a LoRa packet (DIO1), the button, serial RX, or after 30 s
+    the_mesh.noteSleep(millis() - t0);
+#if POWERSAVING_UART_WAKE
+    // the bytes that woke it are dropped, so Serial.available() cannot keep it up
+    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_UART) {
+      stay_awake_until = millis() + POWERSAVING_AWAKE_MILLIS;
+    }
+#endif
+#ifdef PIN_USER_BTN
+    gpio_wakeup_disable((gpio_num_t)PIN_USER_BTN);
+#endif
+  }
+#else
   if (the_mesh.getNodePrefs()->powersaving_enabled && !the_mesh.hasPendingWork()) {
 #if defined(NRF52_PLATFORM)
     board.sleep(0); // nrf ignores seconds param, sleeps whenever possible
@@ -210,4 +270,5 @@ void loop() {
     }
 #endif
   }
+#endif
 }
