@@ -309,6 +309,7 @@ void setup() {
 
 #ifdef BOOT_TRACE
   Serial.println("DBG mesh begun, starting BLE");
+  Serial.printf("DBG ble pin %06lu\n", (unsigned long)the_mesh.getBLEPin());  // the OLED that shows it is not emulated
 #endif
   RTRACE("mesh begun, starting BLE");
 // add bluetooth interface

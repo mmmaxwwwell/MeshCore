@@ -1,4 +1,7 @@
 #include <helpers/nrf52/RamTrace.h>
+#if defined(EMU_SEED_CONTACTS) && defined(SAFE_BOOT)
+  #include <helpers/nrf52/SafeBoot.h>
+#endif
 #include "MyMesh.h"
 
 #include <Arduino.h> // needed for PlatformIO
@@ -1038,6 +1041,31 @@ void MyMesh::loadContactsDeferred() {
   _store->migrateContactsToPaged();
   RTRACE("mesh: load index");
   loadContactIndex();
+#ifdef EMU_SEED_CONTACTS
+  // Emulation builds only: fill an empty store with synthetic chat contacts through the
+  // normal paged-store path, so large-store sync can be tested without real adverts.
+  if (getNumContacts() < EMU_SEED_CONTACTS) {   // resumes after a reset part-way through
+    unsigned long t0 = millis();
+    ContactInfo c;
+    for (int i = getNumContacts(); i < EMU_SEED_CONTACTS; i++) {
+  #ifdef SAFE_BOOT
+      SafeBoot::feed();
+  #endif
+      memset(&c, 0, sizeof(c));
+      uint32_t x = 0x9E3779B9u * (uint32_t)(i + 1);
+      for (int k = 0; k < PUB_KEY_SIZE; k++) { x ^= x << 13; x ^= x >> 17; x ^= x << 5; c.id.pub_key[k] = (uint8_t)x; }
+      snprintf(c.name, sizeof(c.name), "Seed %04d", i);
+      c.type = ADV_TYPE_CHAT;
+      c.out_path_len = OUT_PATH_UNKNOWN;
+      c.last_advert_timestamp = 1760000000u + i;
+      c.lastmod = c.last_advert_timestamp;
+      if (!addContact(c)) break;
+      if ((i & 255) == 255) flushContacts();
+    }
+    flushContacts();
+    Serial.printf("DBG seeded %d contacts in %lu ms\n", getNumContacts(), millis() - t0);
+  }
+#endif
   bootstrapRTCfromContacts();
 #ifdef BOOT_TRACE
   Serial.printf("DBG mesh: %d contacts\n", getNumContacts());
