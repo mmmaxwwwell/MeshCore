@@ -280,7 +280,7 @@ private:
   struct AckTableEntry {
     unsigned long msg_sent;
     uint32_t ack;
-    ContactInfo* contact;
+    uint8_t contact_key[8];   // not a pointer: contacts move (removal shifts, the paged store evicts)
   };
   #define EXPECTED_ACK_TABLE_SIZE 8
   AckTableEntry expected_ack_table[EXPECTED_ACK_TABLE_SIZE]; // circular table

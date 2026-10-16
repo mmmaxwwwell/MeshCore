@@ -26,6 +26,37 @@ struct ContactInfo {
     return shared_secret;
   }
 
+  // fixed 152-byte storage record (the companion's '/contacts3' layout)
+  #define CONTACT_REC_SIZE  152
+  void writeRecord(uint8_t rec[CONTACT_REC_SIZE]) const {
+    memset(rec, 0, CONTACT_REC_SIZE);
+    memcpy(&rec[0], id.pub_key, 32);
+    memcpy(&rec[32], name, 32);
+    rec[64] = type;
+    rec[65] = flags;
+    memcpy(&rec[67], &sync_since, 4);
+    rec[71] = out_path_len;
+    memcpy(&rec[72], &last_advert_timestamp, 4);
+    memcpy(&rec[76], out_path, 64);
+    memcpy(&rec[140], &lastmod, 4);
+    memcpy(&rec[144], &gps_lat, 4);
+    memcpy(&rec[148], &gps_lon, 4);
+  }
+  void readRecord(const uint8_t rec[CONTACT_REC_SIZE]) {
+    id = mesh::Identity(&rec[0]);
+    memcpy(name, &rec[32], 32);
+    type = rec[64];
+    flags = rec[65];
+    memcpy(&sync_since, &rec[67], 4);
+    out_path_len = rec[71];
+    memcpy(&last_advert_timestamp, &rec[72], 4);
+    memcpy(out_path, &rec[76], 64);
+    memcpy(&lastmod, &rec[140], 4);
+    memcpy(&gps_lat, &rec[144], 4);
+    memcpy(&gps_lon, &rec[148], 4);
+    shared_secret_valid = false;
+  }
+
   bool isFav() const { return flags & 0x01; }
   bool isTelemBaseAllowed() const { return flags & 0x02; }
   bool isTelemLocAllowed() const { return flags & 0x04; }

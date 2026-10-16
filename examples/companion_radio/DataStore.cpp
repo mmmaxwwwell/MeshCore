@@ -287,6 +287,88 @@ File file = openRead(_getContactsChannelsFS(), "/contacts3");
     }
 }
 
+#ifdef CONTACTS_PAGED
+static void bucketPath(char* path, char prefix, uint8_t bucket) {
+  sprintf(path, "/%c%X/%02X", prefix, bucket >> 4, bucket);
+}
+
+void DataStore::removeContactFiles() {
+  FILESYSTEM* fs = _getContactsChannelsFS();
+  char path[12];
+  for (int b = 0; b < 256; b++) {
+    bucketPath(path, _cprefix, b);
+    fs->remove(path);
+    if ((b & 15) == 15) {
+      sprintf(path, "/%c%X", _cprefix, b >> 4);
+      fs->rmdir(path);
+    }
+  }
+}
+
+bool DataStore::readContactRec(uint8_t bucket, uint8_t slot, uint8_t rec[CONTACT_REC_SIZE]) {
+  char path[12];
+  bucketPath(path, _cprefix, bucket);
+  File f = openRead(_getContactsChannelsFS(), path);
+  if (!f) return false;
+  bool ok = f.seek((uint32_t)slot * CONTACT_REC_SIZE) && f.read(rec, CONTACT_REC_SIZE) == CONTACT_REC_SIZE;
+  f.close();
+  return ok;
+}
+
+bool DataStore::writeContactRec(uint8_t bucket, uint8_t slot, const uint8_t rec[CONTACT_REC_SIZE]) {
+  FILESYSTEM* fs = _getContactsChannelsFS();
+  char path[12];
+  sprintf(path, "/%c%X", _cprefix, bucket >> 4);
+  if (!fs->exists(path)) fs->mkdir(path);
+  bucketPath(path, _cprefix, bucket);
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  File f = fs->open(path, FILE_O_WRITE);   // read-write, NOT truncated (openWrite() removes the file)
+#else
+  File f = fs->open(path, fs->exists(path) ? "r+" : "w+");
+#endif
+  if (!f) return false;
+  // slots are taken lowest-free-first, so this never seeks more than one slot past the end
+  bool ok = f.seek((uint32_t)slot * CONTACT_REC_SIZE) && f.write(rec, CONTACT_REC_SIZE) == CONTACT_REC_SIZE;
+  f.close();
+  return ok;
+}
+
+void DataStore::scanBucket(uint8_t bucket, void (*cb)(void* ctx, uint8_t slot, const uint8_t* rec), void* ctx) {
+  char path[12];
+  bucketPath(path, _cprefix, bucket);
+  File f = openRead(_getContactsChannelsFS(), path);
+  if (!f) return;
+  uint8_t rec[CONTACT_REC_SIZE];
+  for (int slot = 0; slot < 255 && f.read(rec, CONTACT_REC_SIZE) == CONTACT_REC_SIZE; slot++) {
+    cb(ctx, slot, rec);
+  }
+  f.close();
+}
+
+void DataStore::migrateContactsToPaged() {
+  FILESYSTEM* fs = _getContactsChannelsFS();
+  if (fs->exists("/cver")) return;   // done before
+  File file = openRead(fs, "/contacts3");
+  if (file) {
+    static uint8_t next_slot[256];   // records written per bucket
+    memset(next_slot, 0, sizeof(next_slot));
+    uint8_t rec[CONTACT_REC_SIZE];
+    while (file.read(rec, CONTACT_REC_SIZE) == CONTACT_REC_SIZE) {
+      if (rec[64] == 0 || next_slot[rec[0]] == 255) continue;   // anon / bucket full
+      writeContactRec(rec[0], next_slot[rec[0]]++, rec);
+#ifdef NRF52_PLATFORM
+      NRF_WDT->RR[0] = WDT_RR_RR_Reload;   // SAFE_BOOT watchdog: this loop can take a while once
+#endif
+    }
+    file.close();
+    fs->remove("/contacts3.bak");
+    fs->rename("/contacts3", "/contacts3.bak");   // kept: a stock firmware can still read it
+  }
+  File v = openWrite(fs, "/cver");
+  if (v) { v.write((const uint8_t *)"1", 1); v.close(); }
+}
+#endif
+
 void DataStore::saveContacts(DataStoreHost* host, bool (*filter)(const ContactInfo& c)) {
   File file = openWrite(_getContactsChannelsFS(), "/contacts3");
   if (file) {

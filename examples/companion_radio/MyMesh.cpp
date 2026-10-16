@@ -431,7 +431,7 @@ ContactInfo*  MyMesh::processAck(const uint8_t *data) {
 
       // NOTE: the same ACK can be received multiple times!
       expected_ack_table[i].ack = 0; // clear expected hash, now that we have received ACK
-      return expected_ack_table[i].contact;
+      return lookupContactByPubKey(expected_ack_table[i].contact_key, sizeof(expected_ack_table[i].contact_key));
     }
   }
   return checkConnectionsAck(data);
@@ -997,7 +997,13 @@ void MyMesh::begin() {
   _active_ble_pin = _prefs.ble_pin;
 
   resetContacts();
+#ifdef CONTACTS_PAGED
+  setContactPageStore(_store);
+  _store->migrateContactsToPaged();
+  loadContactIndex();
+#else
   _store->loadContacts(this);
+#endif
   bootstrapRTCfromContacts();
   addChannel("Public", PUBLIC_GROUP_PSK); // pre-configure public channel
   _store->loadChannels(this);
@@ -1059,7 +1065,7 @@ void MyMesh::handleCmdFrame(size_t len) {
     int i = 0;
     out_frame[i++] = RESP_CODE_DEVICE_INFO;
     out_frame[i++] = FIRMWARE_VER_CODE;
-    out_frame[i++] = MAX_CONTACTS / 2;   // v3+
+    out_frame[i++] = MAX_CONTACTS / 2 > 255 ? 255 : MAX_CONTACTS / 2;   // v3+ (one byte: caps at 510)
     out_frame[i++] = MAX_GROUP_CHANNELS; // v3+
     memcpy(&out_frame[i], &_prefs.ble_pin, 4);
     i += 4;
@@ -1160,7 +1166,7 @@ void MyMesh::handleCmdFrame(size_t len) {
         if (expected_ack) {
           expected_ack_table[next_ack_idx].msg_sent = _ms->getMillis(); // add to circular table
           expected_ack_table[next_ack_idx].ack = expected_ack;
-          expected_ack_table[next_ack_idx].contact = recipient;
+          memcpy(expected_ack_table[next_ack_idx].contact_key, recipient->id.pub_key, sizeof(expected_ack_table[next_ack_idx].contact_key));
           next_ack_idx = (next_ack_idx + 1) % EXPECTED_ACK_TABLE_SIZE;
         }
 
@@ -1546,7 +1552,11 @@ void MyMesh::handleCmdFrame(size_t len) {
           writeOKFrame();
           // re-load contacts, to invalidate ecdh shared_secrets
           resetContacts();
+#ifdef CONTACTS_PAGED
+          loadContactIndex();
+#else
           _store->loadContacts(this);
+#endif
         } else {
           writeErrFrame(ERR_CODE_FILE_IO_ERROR);
         }
@@ -2067,7 +2077,11 @@ static bool save_filter(const ContactInfo& c) {
 }
 
 void MyMesh::saveContacts() {
+#ifdef CONTACTS_PAGED
+  flushContacts();   // only changed cached records; adds/removes were written when they happened
+#else
   _store->saveContacts(this, save_filter);
+#endif
 }
 
 void MyMesh::enterCLIRescue() {
@@ -2244,7 +2258,12 @@ void MyMesh::checkCLIRescueCmd() {
       if (success) {
         _store->saveMainIdentity(self_id);
         savePrefs();
+#ifdef CONTACTS_PAGED
+        resetContacts();   // contact records lived on the erased storage; only RAM-cached ones could be rewritten
+        Serial.println("  > contacts are not kept by rebuild in this build");
+#else
         saveContacts();
+#endif
         saveChannels();
         Serial.println("  > erase and rebuild done");
       } else {
@@ -2393,7 +2412,7 @@ void MyMesh::checkSerialInterface() {
              && !_serial->isWriteBusy() // don't spam the Serial Interface too quickly!
   ) {
     ContactInfo contact;
-    if (_iter.hasNext(this, contact)) {
+    if (_iter.hasNext(this, contact, _iter_filter_since)) {
       if (contact.lastmod > _iter_filter_since) { // apply the 'since' filter
         writeContactRespFrame(RESP_CODE_CONTACT, contact);
         if (contact.lastmod > _most_recent_lastmod) {

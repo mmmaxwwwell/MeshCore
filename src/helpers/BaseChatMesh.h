@@ -9,7 +9,9 @@
 
 #include "ContactInfo.h"
 
-#define MAX_SEARCH_RESULTS   24
+#ifndef MAX_SEARCH_RESULTS
+  #define MAX_SEARCH_RESULTS   24
+#endif
 
 #define MSG_SEND_FAILED       0
 #define MSG_SEND_SENT_FLOOD   1
@@ -29,10 +31,55 @@ class BaseChatMesh;
 
 class ContactsIterator {
   int next_idx;
+#ifdef CONTACTS_PAGED
+  int bucket;   // paged store: walk one key[0] bucket at a time, so each bucket file is read in a burst
+#endif
 public:
-  ContactsIterator(int start) { next_idx = start; }
-  bool hasNext(const BaseChatMesh* mesh, ContactInfo& dest);
+  ContactsIterator(int start) {
+    next_idx = start;
+#ifdef CONTACTS_PAGED
+    bucket = 0;
+#endif
+  }
+  // since: skip contacts whose lastmod <= since (cheap in the paged store: decided from the RAM index)
+  bool hasNext(const BaseChatMesh* mesh, ContactInfo& dest, uint32_t since = 0);
 };
+
+#ifdef CONTACTS_PAGED
+/*
+ * Paged contact store: full ContactInfo records live in storage, one small file per
+ * first public-key byte (the byte a packet names its sender by), at fixed slots.
+ * RAM holds a 12-byte index entry per contact plus a small cache of full records.
+ */
+#ifndef CONTACT_CACHE_SIZE
+  #define CONTACT_CACHE_SIZE  48
+#endif
+
+class ContactPageStore {
+public:
+  virtual bool readContactRec(uint8_t bucket, uint8_t slot, uint8_t rec[CONTACT_REC_SIZE]) = 0;
+  virtual bool writeContactRec(uint8_t bucket, uint8_t slot, const uint8_t rec[CONTACT_REC_SIZE]) = 0;
+  // calls cb for every slot in the bucket file (free slots have rec[64] (type) == 0)
+  virtual void scanBucket(uint8_t bucket, void (*cb)(void* ctx, uint8_t slot, const uint8_t* rec), void* ctx) = 0;
+};
+
+struct ContactIndexEntry {
+  uint32_t lastmod;
+  uint8_t key[4];   // first bytes of the public key; key[0] = bucket
+  uint8_t type;
+  uint8_t flags;
+  uint8_t slot;     // record slot in the bucket file, 0xFF = not yet stored
+  int8_t cslot;     // cache slot, -1 = not cached
+};
+
+struct ContactCacheSlot {
+  ContactInfo c;
+  int idx;          // index entry, -1 = free
+  uint32_t used;    // LRU tick
+  uint32_t epoch;   // loop() epoch of the last use: never evicted in the same epoch
+  uint32_t crc;     // of the record as last read/written: write back only on change
+};
+#endif
 
 #ifndef MAX_CONTACTS
   #define MAX_CONTACTS  32
@@ -61,9 +108,27 @@ class BaseChatMesh : public mesh::Mesh {
 
   friend class ContactsIterator;
 
+#ifdef CONTACTS_PAGED
+  ContactInfo anon[MAX_ANON_CONTACTS];
+  ContactIndexEntry cidx[MAX_CONTACTS+MAX_ANON_CONTACTS];
+  ContactCacheSlot ccache[CONTACT_CACHE_SIZE];
+  uint32_t c_tick, c_epoch;
+  int c_pending;    // index allocated by allocateContactSlot(), stored by commitNewContact()
+  int c_capacity;   // MAX_ANON_CONTACTS+MAX_CONTACTS; lowered only by the self-test
+  bool c_force_overwrite;
+  ContactPageStore* _cstore;
+
+  int  cacheLoad(int idx);
+  void cacheWriteBack(ContactCacheSlot& cs);
+  void cacheSyncMeta(ContactCacheSlot& cs);
+  void freeRecord(int idx);
+  void commitNewContact();
+  static void onIndexRec(void* ctx, uint8_t slot, const uint8_t* rec);
+#else
   ContactInfo contacts[MAX_CONTACTS+MAX_ANON_CONTACTS];
-  int num_contacts;
   int sort_array[MAX_CONTACTS+MAX_ANON_CONTACTS];
+#endif
+  int num_contacts;
   int matching_peer_indexes[MAX_SEARCH_RESULTS];
   unsigned long txt_send_timeout;
 #ifdef MAX_GROUP_CHANNELS
@@ -81,6 +146,9 @@ protected:
   BaseChatMesh(mesh::Radio& radio, mesh::MillisecondClock& ms, mesh::RNG& rng, mesh::RTCClock& rtc, mesh::PacketManager& mgr, mesh::MeshTables& tables)
       : mesh::Mesh(radio, ms, rng, rtc, mgr, tables)
   {
+  #ifdef CONTACTS_PAGED
+    _cstore = NULL;
+  #endif
     resetContacts();
 
   #ifdef MAX_GROUP_CHANNELS
@@ -94,12 +162,31 @@ protected:
 
   void bootstrapRTCfromContacts();
 
+#ifdef CONTACTS_PAGED
+  void resetContacts();
+  ContactInfo* contactAt(int idx);    // valid until the next loop(): evicting it needs a later epoch
+  bool readContact(int idx, ContactInfo& dest) const;
+  uint32_t contactLastmod(int idx) const;
+public:
+  void setContactPageStore(ContactPageStore* store) { _cstore = store; }
+  void loadContactIndex();            // rebuild the RAM index from storage (resetContacts() first)
+#ifdef CONTACTS_SELFTEST
+  bool contactStoreSelfTest(ContactPageStore* store, Print& out);   // leaves the contact table reset
+#endif
+  void flushContacts();               // write back every changed cached record
+protected:
+#else
   void resetContacts() {
     memset(contacts, 0, sizeof(contacts[0])*MAX_ANON_CONTACTS);   // set all to have type = ADV_TYPE_NONE(0)
     num_contacts = MAX_ANON_CONTACTS;  // seed the first contacts for anon requests
   }
+  ContactInfo* contactAt(int idx) { return &contacts[idx]; }
+  bool readContact(int idx, ContactInfo& dest) const { dest = contacts[idx]; return true; }
+  uint32_t contactLastmod(int idx) const { return contacts[idx].lastmod; }
+#endif
   void populateContactFromAdvert(ContactInfo& ci, const mesh::Identity& id, const AdvertDataParser& parser, uint32_t timestamp);
   ContactInfo* allocateContactSlot(bool transient_only=false); // helper to find slot for new contact
+  int  findContactIdx(const uint8_t* pub_key, int prefix_len);
 
   // 'UI' concepts, for sub-classes to implement
   virtual bool isAutoAddEnabled() const { return true; }

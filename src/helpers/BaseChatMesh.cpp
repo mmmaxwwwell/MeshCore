@@ -60,14 +60,98 @@ void BaseChatMesh::sendAckTo(const ContactInfo& dest, const uint8_t* ack_hash, u
 void BaseChatMesh::bootstrapRTCfromContacts() {
   uint32_t latest = 0;
   for (int i = 0; i < num_contacts; i++) {
-    if (contacts[i].lastmod > latest) {
-      latest = contacts[i].lastmod;
+    if (contactLastmod(i) > latest) {
+      latest = contactLastmod(i);
     }
   }
   if (latest != 0) {
     getRTCClock()->setCurrentTime(latest + 1);
   }
 }
+
+#ifdef CONTACTS_PAGED
+ContactInfo* BaseChatMesh::allocateContactSlot(bool transient_only) {
+  int oldest_idx = -1;
+  uint32_t oldest_lastmod = 0xFFFFFFFF;
+  if (transient_only) {
+    for (int i = 0; i < MAX_ANON_CONTACTS; i++) {
+      if (anon[i].type == ADV_TYPE_NONE && anon[i].lastmod < oldest_lastmod) {
+        oldest_lastmod = anon[i].lastmod;
+        oldest_idx = i;
+      }
+    }
+    return oldest_idx >= 0 ? &anon[oldest_idx] : NULL;   // NOTE: do NOT call onContactOverwrite()
+  }
+
+  int idx = -1;
+  if (num_contacts < c_capacity) {
+    idx = num_contacts++;
+  } else if (shouldOverwriteWhenFull() || c_force_overwrite) {
+    for (int i = 0; i < CONTACT_CACHE_SIZE; i++) {
+      if (ccache[i].idx >= 0) cacheSyncMeta(ccache[i]);   // index lastmod/flags current before choosing
+    }
+    for (int i = MAX_ANON_CONTACTS; i < num_contacts; i++) {
+      bool is_favourite = (cidx[i].flags & 0x01) != 0;
+      if (!is_favourite && cidx[i].lastmod < oldest_lastmod) {
+        oldest_lastmod = cidx[i].lastmod;
+        oldest_idx = i;
+      }
+    }
+    if (oldest_idx < 0) return NULL;
+    ContactInfo* old = contactAt(oldest_idx);
+    if (old == NULL) return NULL;
+    onContactOverwrite(old->id.pub_key);
+    freeRecord(oldest_idx);   // the new contact goes to its own bucket
+    if (cidx[oldest_idx].cslot >= 0) ccache[cidx[oldest_idx].cslot].idx = -1;   // drop, no write-back
+    idx = oldest_idx;
+  } else {
+    return NULL;
+  }
+
+  memset(&cidx[idx], 0, sizeof(cidx[idx]));
+  cidx[idx].slot = 0xFF;
+  cidx[idx].cslot = -1;
+  int cs = cacheLoad(idx);   // a cache slot without a record: slot == 0xFF
+  if (cs < 0) {
+    if (idx == num_contacts - 1) num_contacts--;
+    return NULL;
+  }
+  memset(&ccache[cs].c, 0, sizeof(ccache[cs].c));
+  c_pending = idx;
+  return &ccache[cs].c;
+}
+
+// stores the contact allocateContactSlot() handed out, once the caller has filled it in
+void BaseChatMesh::commitNewContact() {
+  int idx = c_pending;
+  c_pending = -1;
+  if (idx < MAX_ANON_CONTACTS || idx >= num_contacts || cidx[idx].cslot < 0) return;
+  ContactCacheSlot& cs = ccache[cidx[idx].cslot];
+  memcpy(cidx[idx].key, cs.c.id.pub_key, 4);
+
+  // first free slot in this bucket's file
+  uint8_t used[32];
+  memset(used, 0, sizeof(used));
+  for (int i = MAX_ANON_CONTACTS; i < num_contacts; i++) {
+    if (i != idx && cidx[i].key[0] == cidx[idx].key[0] && cidx[i].slot != 0xFF) {
+      used[cidx[i].slot >> 3] |= 1 << (cidx[i].slot & 7);
+    }
+  }
+  int slot = 0;
+  while (slot < 255 && (used[slot >> 3] & (1 << (slot & 7)))) slot++;
+  if (slot >= 255) {   // bucket full (255 contacts sharing one key byte): drop it
+    cs.idx = -1;
+    num_contacts--;
+    memmove(&cidx[idx], &cidx[idx + 1], (num_contacts - idx) * sizeof(cidx[0]));
+    for (int i = 0; i < CONTACT_CACHE_SIZE; i++) if (ccache[i].idx > idx) ccache[i].idx--;
+    return;
+  }
+  cidx[idx].slot = slot;
+  cs.crc = 0;          // force the write
+  cacheWriteBack(cs);
+}
+#else
+void BaseChatMesh::commitNewContact() { }
 
 ContactInfo* BaseChatMesh::allocateContactSlot(bool transient_only) {
   int oldest_idx = -1;
@@ -104,6 +188,7 @@ ContactInfo* BaseChatMesh::allocateContactSlot(bool transient_only) {
   }
   return NULL; // no space, no overwrite or all contacts are all favourites
 }
+#endif
 
 void BaseChatMesh::populateContactFromAdvert(ContactInfo& ci, const mesh::Identity& id, const AdvertDataParser& parser, uint32_t timestamp) {
   memset(&ci, 0, sizeof(ci));
@@ -127,14 +212,11 @@ void BaseChatMesh::onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, 
   }
 
   ContactInfo* from = NULL;
-  for (int i = 0; i < num_contacts; i++) {
-    if (id.matches(contacts[i].id)) {  // is from one of our contacts
-      from = &contacts[i];
-      if (timestamp <= from->last_advert_timestamp) {  // check for replay attacks!!
-        MESH_DEBUG_PRINTLN("onAdvertRecv: Possible replay attack, name: %s", from->name);
-        return;
-      }
-      break;
+  int fi = findContactIdx(id.pub_key, PUB_KEY_SIZE);
+  if (fi >= 0 && (from = contactAt(fi)) != NULL) {  // is from one of our contacts
+    if (timestamp <= from->last_advert_timestamp) {  // check for replay attacks!!
+      MESH_DEBUG_PRINTLN("onAdvertRecv: Possible replay attack, name: %s", from->name);
+      return;
     }
   }
 
@@ -196,6 +278,7 @@ void BaseChatMesh::onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, 
   }
   from->last_advert_timestamp = timestamp;
   from->lastmod = getRTCClock()->getCurrentTime();
+  commitNewContact();   // paged store: a newly allocated contact gets its storage slot now
 
   onDiscoveredContact(*from, is_new, packet->path_len, packet->path);       // let UI know
 }
@@ -203,7 +286,13 @@ void BaseChatMesh::onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, 
 int BaseChatMesh::searchPeersByHash(const uint8_t* hash) {
   int n = 0;
   for (int i = 0; i < num_contacts && n < MAX_SEARCH_RESULTS; i++) {
+#ifdef CONTACTS_PAGED
+    bool match = i < MAX_ANON_CONTACTS ? anon[i].id.isHashMatch(hash)
+               : (PATH_HASH_SIZE <= 4 && memcmp(cidx[i].key, hash, PATH_HASH_SIZE) == 0);
+    if (match) {
+#else
     if (contacts[i].id.isHashMatch(hash)) {
+#endif
       matching_peer_indexes[n++] = i;  // store the INDEXES of matching contacts (for subsequent 'peer' methods)
     }
   }
@@ -213,7 +302,16 @@ int BaseChatMesh::searchPeersByHash(const uint8_t* hash) {
 void BaseChatMesh::getPeerSharedSecret(uint8_t* dest_secret, int peer_idx) {
   int i = matching_peer_indexes[peer_idx];
   if (i >= 0 && i < num_contacts) {
-    memcpy(dest_secret, contacts[i].getSharedSecret(self_id), PUB_KEY_SIZE);
+#ifdef CONTACTS_PAGED
+    if (i >= MAX_ANON_CONTACTS && cidx[i].cslot < 0) {
+      // a candidate for a MAC check: don't push the cache around for it
+      ContactInfo tmp;
+      if (readContact(i, tmp)) memcpy(dest_secret, tmp.getSharedSecret(self_id), PUB_KEY_SIZE);
+      else memset(dest_secret, 0, PUB_KEY_SIZE);
+      return;
+    }
+#endif
+    memcpy(dest_secret, contactAt(i)->getSharedSecret(self_id), PUB_KEY_SIZE);
   } else {
     MESH_DEBUG_PRINTLN("getPeerSharedSecret: Invalid peer idx: %d", i);
   }
@@ -226,7 +324,9 @@ void BaseChatMesh::onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender
     return;
   }
 
-  ContactInfo& from = contacts[i];
+  ContactInfo* fromp = contactAt(i);
+  if (fromp == NULL) return;
+  ContactInfo& from = *fromp;
 
   if (type == PAYLOAD_TYPE_TXT_MSG && len > 5) {
     uint32_t sender_timestamp;
@@ -345,7 +445,9 @@ bool BaseChatMesh::onPeerPathRecv(mesh::Packet* packet, int sender_idx, const ui
     return false;
   }
 
-  ContactInfo& from = contacts[i];
+  ContactInfo* fromp = contactAt(i);
+  if (fromp == NULL) return false;
+  ContactInfo& from = *fromp;
 
   return onContactPathRecv(from, packet->path, packet->path_len, path, path_len, extra_type, extra, extra_len);
 }
@@ -835,6 +937,364 @@ void BaseChatMesh::resetPathTo(ContactInfo& recipient) {
   recipient.out_path_len = OUT_PATH_UNKNOWN;
 }
 
+#ifdef CONTACTS_PAGED
+void BaseChatMesh::scanRecentContacts(int last_n, ContactVisitor* visitor) {
+  // no sort array in the paged store: select newest-first by the index lastmod
+  if (last_n == 0 || last_n > num_contacts) last_n = num_contacts;
+  uint32_t below = 0xFFFFFFFF;
+  int below_idx = num_contacts;
+  ContactInfo c;
+  for (int n = 0; n < last_n; n++) {
+    int best = -1;
+    for (int i = 0; i < num_contacts; i++) {
+      uint32_t t = contactLastmod(i);
+      bool under = t < below || (t == below && i > below_idx);
+      if (under && (best < 0 || t > contactLastmod(best))) best = i;
+    }
+    if (best < 0) break;
+    below = contactLastmod(best);
+    below_idx = best;
+    if (readContact(best, c)) visitor->onContactVisit(c);
+  }
+}
+
+ContactInfo* BaseChatMesh::searchContactsByPrefix(const char* name_prefix) {
+  int len = strlen(name_prefix);
+  ContactInfo c;
+  for (int i = 0; i < num_contacts; i++) {
+    if (readContact(i, c) && memcmp(c.name, name_prefix, len) == 0) return contactAt(i);
+  }
+  return NULL;  // not found
+}
+
+int BaseChatMesh::findContactIdx(const uint8_t* pub_key, int prefix_len) {
+  for (int i = 0; i < MAX_ANON_CONTACTS; i++) {
+    if (memcmp(anon[i].id.pub_key, pub_key, prefix_len) == 0) return i;
+  }
+  int klen = prefix_len < 4 ? prefix_len : 4;
+  ContactInfo c;
+  for (int i = MAX_ANON_CONTACTS; i < num_contacts; i++) {
+    if (memcmp(cidx[i].key, pub_key, klen) != 0) continue;
+    if (prefix_len <= 4) return i;
+    if (cidx[i].cslot >= 0) {
+      if (memcmp(ccache[cidx[i].cslot].c.id.pub_key, pub_key, prefix_len) == 0) return i;
+    } else if (readContact(i, c) && memcmp(c.id.pub_key, pub_key, prefix_len) == 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+ContactInfo* BaseChatMesh::lookupContactByPubKey(const uint8_t* pub_key, int prefix_len) {
+  int i = findContactIdx(pub_key, prefix_len);
+  return i >= 0 ? contactAt(i) : NULL;
+}
+
+bool BaseChatMesh::addContact(const ContactInfo& contact) {
+  ContactInfo* dest = allocateContactSlot(contact.type == ADV_TYPE_NONE);
+  if (dest) {
+    *dest = contact;
+    dest->shared_secret_valid = false; // mark shared_secret as needing calculation
+    if (contact.type != ADV_TYPE_NONE) commitNewContact();
+    return true;  // success
+  }
+  return false;
+}
+
+bool BaseChatMesh::removeContact(ContactInfo& contact) {
+  int idx = findContactIdx(contact.id.pub_key, PUB_KEY_SIZE);
+  if (idx < 0) return false;   // not found
+  if (idx < MAX_ANON_CONTACTS) {
+    memset(&anon[idx], 0, sizeof(anon[idx]));
+    return true;
+  }
+  freeRecord(idx);
+  if (cidx[idx].cslot >= 0) ccache[cidx[idx].cslot].idx = -1;   // drop, no write-back
+  num_contacts--;
+  memmove(&cidx[idx], &cidx[idx + 1], (num_contacts - idx) * sizeof(cidx[0]));
+  for (int i = 0; i < CONTACT_CACHE_SIZE; i++) {
+    if (ccache[i].idx > idx) ccache[i].idx--;
+  }
+  return true;  // Success
+}
+
+// ---- paged store internals ----
+
+static uint32_t recCrc(const uint8_t* rec) {   // FNV-1a: only detects change
+  uint32_t h = 2166136261u;
+  for (int i = 0; i < CONTACT_REC_SIZE; i++) { h ^= rec[i]; h *= 16777619u; }
+  return h;
+}
+
+void BaseChatMesh::resetContacts() {
+  memset(anon, 0, sizeof(anon));
+  memset(cidx, 0, sizeof(cidx[0]) * MAX_ANON_CONTACTS);
+  for (int i = 0; i < CONTACT_CACHE_SIZE; i++) ccache[i].idx = -1;
+  c_tick = c_epoch = 0;
+  c_pending = -1;
+  c_capacity = MAX_ANON_CONTACTS+MAX_CONTACTS;
+  c_force_overwrite = false;
+  num_contacts = MAX_ANON_CONTACTS;
+}
+
+void BaseChatMesh::onIndexRec(void* ctx, uint8_t slot, const uint8_t* rec) {
+  BaseChatMesh* self = (BaseChatMesh *) ctx;
+  if (rec[64] == ADV_TYPE_NONE) return;   // free slot
+  if (self->num_contacts >= self->c_capacity) return;   // over capacity: never overwrite at load
+  ContactIndexEntry& e = self->cidx[self->num_contacts++];
+  memcpy(e.key, rec, 4);
+  e.type = rec[64];
+  e.flags = rec[65];
+  memcpy(&e.lastmod, &rec[140], 4);
+  e.slot = slot;
+  e.cslot = -1;
+}
+
+void BaseChatMesh::loadContactIndex() {
+  if (_cstore == NULL) return;
+  for (int b = 0; b < 256; b++) _cstore->scanBucket(b, onIndexRec, this);
+}
+
+uint32_t BaseChatMesh::contactLastmod(int idx) const {
+  if (idx < MAX_ANON_CONTACTS) return anon[idx].lastmod;
+  if (cidx[idx].cslot >= 0) return ccache[cidx[idx].cslot].c.lastmod;
+  return cidx[idx].lastmod;
+}
+
+bool BaseChatMesh::readContact(int idx, ContactInfo& dest) const {
+  if (idx < 0 || idx >= num_contacts) return false;
+  if (idx < MAX_ANON_CONTACTS) { dest = anon[idx]; return true; }
+  if (cidx[idx].cslot >= 0) { dest = ccache[cidx[idx].cslot].c; return true; }
+  uint8_t rec[CONTACT_REC_SIZE];
+  if (_cstore == NULL || cidx[idx].slot == 0xFF
+      || !_cstore->readContactRec(cidx[idx].key[0], cidx[idx].slot, rec)) return false;
+  dest.readRecord(rec);
+  return true;
+}
+
+ContactInfo* BaseChatMesh::contactAt(int idx) {
+  if (idx < 0 || idx >= num_contacts) return NULL;
+  if (idx < MAX_ANON_CONTACTS) return &anon[idx];
+  int cs = cidx[idx].cslot >= 0 ? cidx[idx].cslot : cacheLoad(idx);
+  if (cs < 0) return NULL;
+  ccache[cs].used = ++c_tick;
+  ccache[cs].epoch = c_epoch;
+  return &ccache[cs].c;
+}
+
+void BaseChatMesh::cacheSyncMeta(ContactCacheSlot& cs) {
+  ContactIndexEntry& e = cidx[cs.idx];
+  e.lastmod = cs.c.lastmod;
+  e.type = cs.c.type;
+  e.flags = cs.c.flags;
+}
+
+void BaseChatMesh::cacheWriteBack(ContactCacheSlot& cs) {
+  if (cs.idx < 0) return;
+  cacheSyncMeta(cs);
+  ContactIndexEntry& e = cidx[cs.idx];
+  if (e.slot == 0xFF || _cstore == NULL) return;   // not committed yet
+  uint8_t rec[CONTACT_REC_SIZE];
+  cs.c.writeRecord(rec);
+  uint32_t crc = recCrc(rec);
+  if (crc != cs.crc && _cstore->writeContactRec(e.key[0], e.slot, rec)) cs.crc = crc;
+}
+
+// loads index entry idx into a cache slot (evicting the least recently used); -1 on failure
+int BaseChatMesh::cacheLoad(int idx) {
+  int victim = -1;
+  for (int i = 0; i < CONTACT_CACHE_SIZE; i++) {
+    if (ccache[i].idx < 0) { victim = i; break; }
+  }
+  if (victim < 0) {
+    // LRU, but never one used in this loop() pass: callers may still hold its pointer
+    for (int pass = 0; pass < 2 && victim < 0; pass++) {
+      uint32_t oldest = 0xFFFFFFFF;
+      for (int i = 0; i < CONTACT_CACHE_SIZE; i++) {
+        if (pass == 0 && ccache[i].epoch == c_epoch) continue;
+        if (ccache[i].used < oldest) { oldest = ccache[i].used; victim = i; }
+      }
+    }
+    if (victim < 0) return -1;
+    cacheWriteBack(ccache[victim]);
+    cidx[ccache[victim].idx].cslot = -1;
+  }
+  ContactCacheSlot& cs = ccache[victim];
+  cs.crc = 0;
+  if (cidx[idx].slot != 0xFF) {
+    uint8_t rec[CONTACT_REC_SIZE];
+    if (_cstore == NULL || !_cstore->readContactRec(cidx[idx].key[0], cidx[idx].slot, rec)) {
+      cs.idx = -1;
+      return -1;
+    }
+    cs.c.readRecord(rec);
+    cs.crc = recCrc(rec);
+  }
+  cs.idx = idx;
+  cs.used = ++c_tick;
+  cs.epoch = c_epoch;
+  cidx[idx].cslot = victim;
+  return victim;
+}
+
+// clears the contact's storage record (its slot becomes free)
+void BaseChatMesh::freeRecord(int idx) {
+  ContactIndexEntry& e = cidx[idx];
+  if (e.slot != 0xFF && _cstore) {
+    uint8_t rec[CONTACT_REC_SIZE];
+    memset(rec, 0, sizeof(rec));
+    _cstore->writeContactRec(e.key[0], e.slot, rec);
+  }
+  e.slot = 0xFF;
+  if (e.cslot >= 0) ccache[e.cslot].crc = 0;
+}
+
+#ifdef CONTACTS_SELFTEST
+#ifdef QSPI_POWERSAVE
+  #include <helpers/nrf52/QSPIPowerSave.h>
+#endif
+// Randomised check of the paged store against a plain model, on the real storage.
+// Model holds key, name tag and lastmod per live contact.
+#define ST_MAX 700
+struct StModel { uint8_t key[32]; uint32_t tag; uint32_t lastmod; bool live; };
+static StModel st_m[ST_MAX];
+static uint32_t st_rng = 0x1234567;
+static uint32_t stRand() { st_rng ^= st_rng << 13; st_rng ^= st_rng >> 17; st_rng ^= st_rng << 5; return st_rng; }
+
+bool BaseChatMesh::contactStoreSelfTest(ContactPageStore* store, Print& out) {
+  ContactPageStore* saved = _cstore;
+  _cstore = store;
+  resetContacts();
+  memset(st_m, 0, sizeof(st_m));
+  int live = 0, errors = 0, ops = 0;
+  uint32_t t0 = millis(), max_op = 0;
+
+  #define ST_FAIL(...) do { errors++; out.printf("ST FAIL op%d: ", ops); out.printf(__VA_ARGS__); out.println(); } while (0)
+
+  auto check_one = [&](int m) {
+    ContactInfo* c = lookupContactByPubKey(st_m[m].key, PUB_KEY_SIZE);
+    if (!c) { ST_FAIL("missing m=%d", m); return; }
+    uint32_t tag; memcpy(&tag, c->name, 4);
+    if (tag != st_m[m].tag || c->lastmod != st_m[m].lastmod || c->type != ADV_TYPE_CHAT)
+      ST_FAIL("mismatch m=%d tag %lu/%lu lm %lu/%lu", m, (unsigned long)tag, (unsigned long)st_m[m].tag,
+              (unsigned long)c->lastmod, (unsigned long)st_m[m].lastmod);
+  };
+  auto check_all = [&](const char* when) {
+    int n = 0;
+    ContactsIterator it = startContactsIterator();
+    ContactInfo c;
+    while (it.hasNext(this, c)) {
+      n++;
+      int found = -1;
+      for (int m = 0; m < ST_MAX; m++) if (st_m[m].live && memcmp(st_m[m].key, c.id.pub_key, 32) == 0) { found = m; break; }
+      if (found < 0) { ST_FAIL("%s: unexpected contact %02x%02x", when, c.id.pub_key[0], c.id.pub_key[1]); continue; }
+      uint32_t tag; memcpy(&tag, c.name, 4);
+      if (tag != st_m[found].tag || c.lastmod != st_m[found].lastmod) ST_FAIL("%s: stale m=%d", when, found);
+    }
+    if (n != live || getNumContacts() != live) ST_FAIL("%s: count iter=%d table=%d model=%d", when, n, getNumContacts(), live);
+    out.printf("ST %s ok-so-far errors=%d live=%d\n", when, errors, live);
+  };
+  auto reboot = [&]() {
+    flushContacts();
+    resetContacts();
+    loadContactIndex();
+  };
+  auto new_key = [&](uint8_t* k) {
+    for (int i = 0; i < 32; i++) k[i] = stRand();
+    if (stRand() % 4) k[0] = stRand() % 6;   // pile most into 6 buckets: big buckets, slot reuse
+  };
+
+  for (int round = 0; round < 2200; round++, ops++) {
+    c_epoch++;   // as loop() does
+    uint32_t r = stRand() % 100;
+    uint32_t ts = millis();
+    if (r < 40 && live < ST_MAX - 10) {                 // add
+      int m = 0; while (st_m[m].live) m++;
+      new_key(st_m[m].key);
+      ContactInfo c; memset(&c, 0, sizeof(c));
+      c.id = mesh::Identity(st_m[m].key);
+      c.type = ADV_TYPE_CHAT;
+      st_m[m].tag = stRand(); memcpy(c.name, &st_m[m].tag, 4);
+      st_m[m].lastmod = c.lastmod = 1000000 + ops;
+      c.out_path_len = OUT_PATH_UNKNOWN;
+      if (!addContact(c)) { ST_FAIL("add failed live=%d", live); continue; }
+      st_m[m].live = true; live++;
+    } else if (r < 70 && live) {                        // modify (as path/advert updates do)
+      int m; do m = stRand() % ST_MAX; while (!st_m[m].live);
+      ContactInfo* c = lookupContactByPubKey(st_m[m].key, PUB_KEY_SIZE);
+      if (!c) { ST_FAIL("modify: missing"); continue; }
+      st_m[m].tag = stRand(); memcpy(c->name, &st_m[m].tag, 4);
+      st_m[m].lastmod = c->lastmod = 2000000 + ops;
+      if (stRand() % 3 == 0) flushContacts();
+    } else if (r < 82 && live) {                        // remove
+      int m; do m = stRand() % ST_MAX; while (!st_m[m].live);
+      ContactInfo* c = lookupContactByPubKey(st_m[m].key, PUB_KEY_SIZE);
+      if (!c || !removeContact(*c)) { ST_FAIL("remove failed"); continue; }
+      st_m[m].live = false; live--;
+    } else if (r < 95 && live) {                        // lookups + hash search
+      int m; do m = stRand() % ST_MAX; while (!st_m[m].live);
+      check_one(m);
+      int expect = 0;
+      for (int k = 0; k < ST_MAX; k++) if (st_m[k].live && st_m[k].key[0] == st_m[m].key[0]) expect++;
+      int got = searchPeersByHash(st_m[m].key);
+      if (got != (expect < MAX_SEARCH_RESULTS ? expect : MAX_SEARCH_RESULTS)) ST_FAIL("hash search %d/%d", got, expect);
+      uint8_t absent[32]; new_key(absent); absent[1] ^= 0x5a;
+      if (lookupContactByPubKey(absent, PUB_KEY_SIZE)) ST_FAIL("found absent key");
+    } else if (r < 97) {
+      reboot();
+      check_all("reboot");
+    }
+    uint32_t dt = millis() - ts;
+    if (dt > max_op) max_op = dt;
+#ifdef QSPI_POWERSAVE
+    if (ops % 7 == 0) { delay(QSPI_IDLE_MS + 5); QSPIPowerSave::loop(); }   // real sleep/wake cycles
+#endif
+#ifdef NRF52_PLATFORM
+    NRF_WDT->RR[0] = WDT_RR_RR_Reload;
+#endif
+    if (errors > 20) break;
+  }
+  reboot();
+  check_all("final");
+
+  // overwrite-oldest when full: capacity = current size, add 5 more
+  c_capacity = num_contacts;
+  c_force_overwrite = true;
+  for (int i = 0; i < 5 && errors <= 20; i++, ops++) {
+    c_epoch++;
+    int oldest = -1;
+    for (int m = 0; m < ST_MAX; m++) if (st_m[m].live && (oldest < 0 || st_m[m].lastmod < st_m[oldest].lastmod)) oldest = m;
+    int m = 0; while (st_m[m].live) m++;
+    new_key(st_m[m].key);
+    ContactInfo c; memset(&c, 0, sizeof(c));
+    c.id = mesh::Identity(st_m[m].key); c.type = ADV_TYPE_CHAT;
+    st_m[m].tag = stRand(); memcpy(c.name, &st_m[m].tag, 4);
+    st_m[m].lastmod = c.lastmod = 3000000 + ops;
+    if (!addContact(c)) { ST_FAIL("overwrite add failed"); continue; }
+    st_m[m].live = true;
+    st_m[oldest].live = false;   // live count unchanged
+  }
+  reboot();
+  check_all("overwrite");
+
+  out.printf("ST DONE errors=%d ops=%d live=%d secs=%lu max_op_ms=%lu\n", errors, ops, live,
+             (unsigned long)((millis() - t0) / 1000), (unsigned long)max_op);
+#ifdef QSPI_POWERSAVE
+  out.printf("ST qspi sleeps=%lu\n", (unsigned long)QSPIPowerSave::sleeps());
+#endif
+  resetContacts();
+  _cstore = saved;
+  return errors == 0;
+}
+#endif
+
+void BaseChatMesh::flushContacts() {
+  for (int i = 0; i < CONTACT_CACHE_SIZE; i++) {
+    if (ccache[i].idx >= 0) cacheWriteBack(ccache[i]);
+  }
+}
+
+#else
 static ContactInfo* table;  // pass via global :-(
 
 static int cmp_adv_timestamp(const void *a, const void *b) {
@@ -871,6 +1331,13 @@ ContactInfo* BaseChatMesh::searchContactsByPrefix(const char* name_prefix) {
   return NULL;  // not found
 }
 
+int BaseChatMesh::findContactIdx(const uint8_t* pub_key, int prefix_len) {
+  for (int i = 0; i < num_contacts; i++) {
+    if (memcmp(contacts[i].id.pub_key, pub_key, prefix_len) == 0) return i;
+  }
+  return -1;
+}
+
 ContactInfo* BaseChatMesh::lookupContactByPubKey(const uint8_t* pub_key, int prefix_len) {
   for (int i = 0; i < num_contacts; i++) {
     auto c = &contacts[i];
@@ -904,6 +1371,8 @@ bool BaseChatMesh::removeContact(ContactInfo& contact) {
   }
   return true;  // Success
 }
+
+#endif
 
 #ifdef MAX_GROUP_CHANNELS
 #include <base64.hpp>
@@ -968,22 +1437,41 @@ int BaseChatMesh::findChannelIdx(const mesh::GroupChannel& ch) {
 bool BaseChatMesh::getContactByIdx(uint32_t idx, ContactInfo& contact) {
   if (idx >= num_contacts) return false;
 
-  contact = contacts[idx];
-  return true;
+  return readContact(idx, contact);
 }
 
 ContactsIterator BaseChatMesh::startContactsIterator() {
   return ContactsIterator(MAX_ANON_CONTACTS);   // start at offset, skip the anon entries
 }
 
-bool ContactsIterator::hasNext(const BaseChatMesh* mesh, ContactInfo& dest) {
-  if (next_idx >= mesh->getTotalContactSlots()) return false;
-
-  dest = mesh->contacts[next_idx++];
-  return true;
+#ifdef CONTACTS_PAGED
+bool ContactsIterator::hasNext(const BaseChatMesh* mesh, ContactInfo& dest, uint32_t since) {
+  while (bucket < 256) {
+    while (next_idx < mesh->num_contacts) {
+      int i = next_idx++;
+      if (mesh->cidx[i].key[0] != bucket) continue;
+      if (since && mesh->contactLastmod(i) <= since) continue;
+      if (mesh->readContact(i, dest)) return true;
+    }
+    bucket++;
+    next_idx = MAX_ANON_CONTACTS;
+  }
+  return false;
 }
+#else
+bool ContactsIterator::hasNext(const BaseChatMesh* mesh, ContactInfo& dest, uint32_t since) {
+  while (next_idx < mesh->getTotalContactSlots()) {
+    dest = mesh->contacts[next_idx++];
+    if (since == 0 || dest.lastmod > since) return true;
+  }
+  return false;
+}
+#endif
 
 void BaseChatMesh::loop() {
+#ifdef CONTACTS_PAGED
+  c_epoch++;   // contacts used in earlier passes may be evicted from the cache now
+#endif
   Mesh::loop();
 
   if (txt_send_timeout && millisHasNowPassed(txt_send_timeout)) {
