@@ -28,6 +28,22 @@ void genericBuzzer::play(const char *melody) {
 //    Serial.println(isQuiet());
 }
 
+void genericBuzzer::playForced(const char *melody) {
+    if (isPlaying()) rtttl::stop();
+#ifdef PIN_BUZZER_EN
+    digitalWrite(PIN_BUZZER_EN, HIGH);
+#endif
+    rtttl::begin(PIN_BUZZER, melody);
+}
+
+void genericBuzzer::stop() {
+    if (isPlaying()) rtttl::stop();
+    digitalWrite(PIN_BUZZER, LOW);
+#ifdef PIN_BUZZER_EN
+    if (_is_quiet) digitalWrite(PIN_BUZZER_EN, LOW);
+#endif
+}
+
 bool genericBuzzer::isPlaying() {
     return rtttl::isPlaying();
 }

@@ -46,7 +46,17 @@ struct DiscoveredNode {
 };
 #endif
 
+#ifdef FINDHUB_BEACON
+  #include <helpers/nrf52/FindHubService.h>
+  // Loud, repeating, distinct from message tones. Replayed until the beacon stops.
+  #define FINDHUB_RING_MELODY "find:d=8,o=7,b=180:c,e,g,4c8,p,c,e,g,4c8,4p"
+#endif
+
 class UITask : public AbstractUITask {
+#ifdef FINDHUB_BEACON
+  static volatile bool _findhub_ringing;
+  static void onFindHubRing(bool on);
+#endif
   DisplayDriver* _display;
   SensorManager* _sensors;
 #ifdef PIN_BUZZER

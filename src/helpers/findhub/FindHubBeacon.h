@@ -94,6 +94,7 @@ public:
   // Returns an ATT status. On ATT_OK, `rsp` holds the notification to send BEFORE
   // the write response (spec: table 6 note), rsp_len its length (0 = none).
   uint8_t onWrite(uint8_t conn, const uint8_t* buf, size_t len, uint8_t rsp[MAX_NOTIFY_LEN], size_t* rsp_len);
+  uint8_t dispatch(uint8_t conn, const uint8_t* buf, size_t len, uint8_t* rsp, size_t* rsp_len);
   void onDisconnect(uint8_t conn);
 
   // Ringing.
@@ -104,6 +105,10 @@ public:
   uint16_t ringRemainingDs();
 
   bool utpMode() const { return _utp; }
+
+  // Diagnostics (companion status): last Beacon Actions write and its outcome.
+  uint8_t lastOp() const { return _last_op; }
+  uint8_t lastStatus() const { return _last_status; }
 
 private:
   struct Conn {
@@ -130,6 +135,9 @@ private:
   bool _ring_has_conn;
   uint8_t _ring_conn;
   uint8_t _ring_nonce[NONCE_LEN];
+
+  uint8_t _last_op;
+  uint8_t _last_status;
 
   // unwanted tracking protection
   bool _utp;

@@ -41,6 +41,8 @@ FindHubBeacon::FindHubBeacon(FindHubPlatform& platform) : _p(platform) {
   memset(_ring_nonce, 0, sizeof(_ring_nonce));
   _utp = false;
   _utp_skip_ring_auth = false;
+  _last_op = 0xFF;
+  _last_status = 0xFF;
 }
 
 void FindHubBeacon::load(const Provisioning* p) {
@@ -138,6 +140,12 @@ void FindHubBeacon::onDisconnect(uint8_t conn) {
 }
 
 uint8_t FindHubBeacon::onWrite(uint8_t conn, const uint8_t* buf, size_t len, uint8_t rsp[MAX_NOTIFY_LEN], size_t* rsp_len) {
+  _last_op = len ? buf[0] : 0xFE;
+  _last_status = dispatch(conn, buf, len, rsp, rsp_len);
+  return _last_status;
+}
+
+uint8_t FindHubBeacon::dispatch(uint8_t conn, const uint8_t* buf, size_t len, uint8_t* rsp, size_t* rsp_len) {
   *rsp_len = 0;
   if (conn >= MAX_CONN) return ATT_INVALID_VALUE;
   Conn& c = _conns[conn];

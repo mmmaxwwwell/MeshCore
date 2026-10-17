@@ -36,6 +36,11 @@ MultiSerialInterface interface_manager;
 #endif
 
 // include wifi interface
+#ifdef FINDHUB_BEACON
+  #include <helpers/nrf52/FindHubService.h>
+  FindHubService findhub_svc;
+#endif
+
 #ifdef ENABLE_WIFI_INTERFACE
   #ifndef WIFI_SSID
     #define WIFI_SSID ""
@@ -204,6 +209,10 @@ void setup() {
   the_mesh.setBLEPin(0);
 #endif
 
+#ifdef FINDHUB_BEACON
+  findhub_svc.begin(&rtc_clock, &board);     // before BLE: the GATT service registers in begin()
+#endif
+
 // add bluetooth interface
 #if defined(BLE_PIN_CODE)
   bluetooth_interface.begin(BLE_NAME_PREFIX, the_mesh.getNodePrefs()->node_name, the_mesh.getBLEPin());
@@ -291,6 +300,9 @@ void setup() {
 
 void loop() {
   the_mesh.loop();
+#ifdef FINDHUB_BEACON
+  findhub_svc.loop();
+#endif
   interface_manager.loop();
   sensors.loop();
 #ifdef DISPLAY_CLASS

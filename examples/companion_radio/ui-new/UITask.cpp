@@ -33,6 +33,10 @@
 
 #include "icons.h"
 
+#ifdef FINDHUB_BEACON
+static UITask* ui_task_instance = nullptr;
+#endif
+
 class SplashScreen : public UIScreen {
   UITask* _task;
   unsigned long dismiss_after;
@@ -740,6 +744,10 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
     _display->turnOn();
   }
 
+#ifdef FINDHUB_BEACON
+  ui_task_instance = this;
+  if (findhub_service) findhub_service->setRingCallback(onFindHubRing);
+#endif
 #ifdef PIN_BUZZER
   buzzer.begin();
   buzzer.quiet(_node_prefs->buzzer_quiet);
@@ -920,6 +928,17 @@ bool UITask::isButtonPressed() const {
 #endif
 }
 
+#ifdef FINDHUB_BEACON
+volatile bool UITask::_findhub_ringing = false;
+
+void UITask::onFindHubRing(bool on) {
+  _findhub_ringing = on;
+  #ifdef PIN_BUZZER
+  if (!on && ui_task_instance) ui_task_instance->buzzer.stop();
+  #endif
+}
+#endif
+
 void UITask::loop() {
   char c = 0;
 #if UI_HAS_JOYSTICK
@@ -1006,6 +1025,13 @@ void UITask::loop() {
   }
 #endif
 
+#ifdef FINDHUB_BEACON
+  if (c != 0 && findhub_service && findhub_service->beacon().isRinging()) {
+    findhub_service->beacon().buttonPressed();   // any key silences a find request
+    c = 0;
+  }
+#endif
+
   if (c != 0 && curr) {
     curr->handleInput(c);
     _auto_off = millis() + AUTO_OFF_MILLIS;   // extend auto-off timer
@@ -1015,6 +1041,9 @@ void UITask::loop() {
   userLedHandler();
 
 #ifdef PIN_BUZZER
+  #ifdef FINDHUB_BEACON
+  if (_findhub_ringing && !buzzer.isPlaying()) buzzer.playForced(FINDHUB_RING_MELODY);
+  #endif
   if (buzzer.isPlaying())  buzzer.loop();
 #endif
 

@@ -21,6 +21,8 @@ class genericBuzzer
     public:
         void begin();  // set up buzzer port
         void play(const char *melody); // Generic play function
+        void playForced(const char *melody);  // plays even when quiet (Find Hub ring)
+        void stop();
         void loop();  // loop driven-nonblocking
         void startup();  // play startup sound
         void shutdown();  // play shutdown sound

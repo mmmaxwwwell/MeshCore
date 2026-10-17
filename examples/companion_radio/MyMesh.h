@@ -121,6 +121,9 @@ public:
 
   void loop();
   void handleCmdFrame(size_t len);
+#ifdef FINDHUB_BEACON
+  void handleFindHubCmd(size_t len);
+#endif
   bool advert();
   void enterCLIRescue();
 
