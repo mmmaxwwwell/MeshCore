@@ -11,6 +11,7 @@
 #include <bluefruit.h>
 #include <MeshCore.h>
 #include <helpers/findhub/FindHubBeacon.h>
+#include <helpers/SensorManager.h>
 
 class FindHubService : public findhub::FindHubPlatform {
 public:
@@ -25,6 +26,15 @@ public:
   void loop();
 
   void setRingCallback(RingCallback cb) { _ring_cb = cb; }
+
+  // GPS time sync: while provisioned, power the GPS up at boot and once a day
+  // just long enough for a time fix (the location provider sets the RTC), then
+  // power it down again. Left alone when the user has GPS on (*user_gps != 0):
+  // the provider already re-syncs the clock every 30 min then.
+  void setGps(SensorManager* sensors, const uint8_t* user_gps) { _sensors = sensors; _user_gps = user_gps; }
+  enum GpsSync : uint8_t { GPS_IDLE = 0, GPS_SYNCING = 1, GPS_NO_GPS = 2 };
+  GpsSync gpsState() const { return _gps_state; }
+  uint32_t gpsLastSyncAgeS() const { return _gps_last_ok ? (::millis() - _gps_last_ok_ms) / 1000 : 0xFFFFFFFF; }
   void onDisconnect(uint16_t conn_hdl);
 
   findhub::FindHubBeacon& beacon() { return _beacon; }
@@ -72,6 +82,16 @@ private:
 
   uint32_t _last_clock_save;
   Stats _stats;
+
+  SensorManager* _sensors = nullptr;
+  const uint8_t* _user_gps = nullptr;
+  GpsSync _gps_state = GPS_IDLE;
+  bool _gps_last_ok = false;
+  bool _gps_we_powered = false;
+  uint32_t _gps_started_ms = 0;
+  uint32_t _gps_last_ok_ms = 0;
+  uint32_t _gps_next_try_ms = 0;     // 0 = as soon as provisioned (boot)
+  void gpsLoop();
 
   bool push(ReqType type, uint16_t conn, const uint8_t* data, size_t len);
   void handle(const Req& r);

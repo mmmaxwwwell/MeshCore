@@ -289,6 +289,9 @@ void setup() {
 #if ENV_INCLUDE_GPS == 1
   the_mesh.applyGpsPrefs();
 #endif
+#ifdef FINDHUB_BEACON
+  findhub_svc.setGps(&sensors, &the_mesh.getNodePrefs()->gps_enabled);
+#endif
 
 #ifdef DISPLAY_CLASS
   ui_task.begin(disp, &sensors, the_mesh.getNodePrefs());  // still want to pass this in as dependency, as prefs might be moved

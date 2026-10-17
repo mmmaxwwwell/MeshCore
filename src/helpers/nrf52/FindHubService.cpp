@@ -19,6 +19,9 @@ static const uint16_t FAST_PAIR_SERVICE_UUID = 0xFE2C;
 #define CLOCK_FILE     "/findhub_clk"
 #define PROV_MAGIC     0x314E4846UL     // "FHN1"
 #define CLOCK_SAVE_SECS 3600            // spec: persist the clock at least daily
+#define GPS_RESYNC_MS   (24UL * 3600 * 1000)   // daily: the nRF52 RC/crystal drift stays well inside a window
+#define GPS_TIMEOUT_MS  (10UL * 60 * 1000)     // cold start indoors may never fix; give up and retry
+#define GPS_RETRY_MS    (60UL * 60 * 1000)
 
 struct ProvRecord {
   uint32_t magic;
@@ -203,7 +206,43 @@ void FindHubService::loop() {
     _q_tail = (_q_tail + 1) % QUEUE_LEN;
   }
   _beacon.loop();
+  gpsLoop();
   persistClock();
+}
+
+void FindHubService::gpsLoop() {
+  if (!_sensors || !_beacon.isProvisioned()) return;
+  LocationProvider* loc = _sensors->getLocationProvider();
+  if (!loc) { _gps_state = GPS_NO_GPS; return; }
+  uint32_t now = ::millis();
+  bool user_on = _user_gps && *_user_gps;
+
+  if (_gps_state == GPS_IDLE) {
+    if ((int32_t)(now - _gps_next_try_ms) < 0) return;
+    loc->syncTime();                         // set the RTC from the next good fix
+    if (!user_on) {                          // the user's GPS is already running otherwise
+      if (!_sensors->setSettingValue("gps", "1")) { _gps_state = GPS_NO_GPS; return; }
+      _gps_we_powered = true;
+    }
+    _gps_started_ms = now;
+    _gps_state = GPS_SYNCING;
+    return;
+  }
+
+  if (_gps_state != GPS_SYNCING) return;
+  bool done = !loc->waitingTimeSync();
+  bool timed_out = now - _gps_started_ms > GPS_TIMEOUT_MS;
+  if (!done && !timed_out) return;
+
+  if (done) {
+    _gps_last_ok = true;
+    _gps_last_ok_ms = now;
+  }
+  _gps_next_try_ms = now + (done ? GPS_RESYNC_MS : GPS_RETRY_MS);
+  // Power down only what we powered up, and not if the user switched GPS on meanwhile.
+  if (_gps_we_powered && !(_user_gps && *_user_gps)) _sensors->setSettingValue("gps", "0");
+  _gps_we_powered = false;
+  _gps_state = GPS_IDLE;
 }
 
 void FindHubService::randomBytes(uint8_t* dest, size_t len) {

@@ -2105,6 +2105,10 @@ void MyMesh::handleFindHubCmd(size_t len) {
     uint16_t c16[7] = { st.reads, st.writes, st.long_writes, st.queue_full, st.rejected, st.notifies, st.notify_fail };
     memcpy(&out_frame[i], c16, sizeof(c16)); i += sizeof(c16);
     memcpy(&out_frame[i], &st.last_sd_err, 4); i += 4;
+    // gps_state (0 idle, 1 syncing, 2 no gps) | seconds since last GPS time fix (u32 LE, 0xFFFFFFFF = never)
+    out_frame[i++] = findhub_service->gpsState();
+    uint32_t age = findhub_service->gpsLastSyncAgeS();
+    memcpy(&out_frame[i], &age, 4); i += 4;
     _serial->writeFrame(out_frame, i);
   } else if (op == FINDHUB_OP_PROVISION && len >= 2 + findhub::EIK_LEN + findhub::AK_LEN + 4) {
     findhub::Provisioning p;
