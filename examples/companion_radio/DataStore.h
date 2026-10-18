@@ -29,6 +29,7 @@ public:
   DataStore(FILESYSTEM& fs, FILESYSTEM& fsExtra, mesh::RTCClock& clock);
   void begin();
   bool formatFileSystem();
+  bool formatSecondaryFS();   // only the secondary FS (contacts, channels, blobs); false without one
   FILESYSTEM* getPrimaryFS() const { return _fs; }
   FILESYSTEM* getSecondaryFS() const { return _fsExtra; }
   bool loadMainIdentity(mesh::LocalIdentity &identity);

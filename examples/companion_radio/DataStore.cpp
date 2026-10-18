@@ -181,6 +181,14 @@ bool DataStore::formatFileSystem() {
 #endif
 }
 
+bool DataStore::formatSecondaryFS() {
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  return _fsExtra != nullptr && _fsExtra->format();   // unmounts, formats, mounts again
+#else
+  return false;   // a secondary FS exists only on nRF52/STM32 (EXTRAFS/QSPIFLASH)
+#endif
+}
+
 bool DataStore::loadMainIdentity(mesh::LocalIdentity &identity) {
   return identity_store.load("_main", identity);
 }

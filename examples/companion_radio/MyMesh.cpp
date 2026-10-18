@@ -2730,7 +2730,7 @@ void MyMesh::checkCLIRescueCmd() {
     } else if (strcmp(cli_command, "format ExtraFS") == 0) {
       // only the secondary (QSPI) filesystem: contacts, channels, messages. Identity and prefs
       // (internal flash) stay, unlike `erase`.
-      bool success = _store->getSecondaryFS() != nullptr && _store->getSecondaryFS()->format();
+      bool success = _store->formatSecondaryFS();
       Serial.printf("  > %s\n", success ? "ExtraFS formatted, reboot now" : "ERR: no ExtraFS or format failed");
     } else if (strcmp(cli_command, "erase") == 0) {
       bool success = _store->formatFileSystem();
