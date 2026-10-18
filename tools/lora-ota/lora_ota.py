@@ -23,6 +23,8 @@ RADIO_IDLE_SECS = 90   # target drops the fast settings after this long without 
 CONFIRM_SECS = 60   # firmware LORA_OTA_CONFIRM_SECS
 REBOOT_SECS = 6     # firmware LORA_OTA_REBOOT_DELAY_MS
 BITMAP_CHUNKS = 128 * 8
+COMPANION_FRAME = 176   # a stock companion's max command frame (BaseSerialInterface MAX_FRAME_SIZE)
+CHUNK = COMPANION_FRAME - 1 - 32 - 7   # minus CMD_SEND_BINARY_REQ + pubkey, DATA's type + session + index
 STATUS_NAMES = {0: "ok", 1: "bad state", 2: "bad session", 3: "bad signature (or image for another board)",
                 4: "too big", 5: "flash error", 6: "incomplete", 7: "hash mismatch", 8: "no LoRa-OTA marker",
                 9: "activate failed", 10: "running image not confirmed yet ('ota confirm' first)", 11: "bad argument"}
@@ -105,10 +107,11 @@ class OtaSender:
          async request(payload, want_reply, timeout) -> reply body | None
        (None = no reply in time). Transport-agnostic: radio or simulator."""
 
-    def __init__(self, link, image, manifest, log=print, status_timeout=8.0, retries=6, keepalive=None):
+    def __init__(self, link, image, manifest, log=print, status_timeout=8.0, retries=6, keepalive=None, chunk=CHUNK):
         self.link, self.image, self.m, self.log = link, image, manifest, log
         self.keepalive = keepalive   # async callable, run before each round
         self.status_timeout, self.retries = status_timeout, retries
+        self.want_chunk = chunk
         self.session = self.chunk = self.chunks = None
 
     async def ask(self, payload, what):
@@ -120,7 +123,8 @@ class OtaSender:
         raise OtaError(f"{what}: target not answering")
 
     async def begin(self):
-        p = bytes([REQ_BEGIN]) + struct.pack("<I", self.m["size"]) + bytes.fromhex(self.m["sha256"]) + bytes.fromhex(self.m["sig"])
+        p = (bytes([REQ_BEGIN]) + struct.pack("<I", self.m["size"]) + bytes.fromhex(self.m["sha256"]) +
+             bytes.fromhex(self.m["sig"]) + bytes([self.want_chunk]))
         r = await self.ask(p, "BEGIN")
         if r[0] != OK:
             raise OtaError(f"BEGIN refused: {STATUS_NAMES.get(r[0], r[0])}")
@@ -328,15 +332,18 @@ async def cmd_push(a):
         if fast:
             info = mc.self_info
             tun = await mc.commands.get_tuning()
+            # set_radio without the repeat flag switches client repeat OFF (and saves it): keep it as it is
+            dq = await mc.commands.send_device_query()
+            repeat = 1 if (dq.payload or {}).get("repeat") else 0
             req = bytes([REQ_RADIO]) + struct.pack("<IIBBH", int(fast[0] * 1000), int(fast[1] * 1000),
                                                    fast[2], fast[3], RADIO_IDLE_SECS)
             r = await link.request(req, True, 8.0) or await link.request(req, True, 8.0)
             if not r or r[0] != OK:
                 raise OtaError(f"fast radio refused: {STATUS_NAMES.get(r[0], r[0]) if r else 'no reply'}")
             restore = (info["radio_freq"], info["radio_bw"], info["radio_sf"], info["radio_cr"],
-                       tun.payload["rx_delay"], tun.payload["airtime_factor"])
+                       tun.payload["rx_delay"], tun.payload["airtime_factor"], repeat)
             await asyncio.sleep(2.5)   # the target switches 1.5 s after replying
-            await mc.commands.set_radio(*fast)
+            await mc.commands.set_radio(*fast, repeat=0)   # never repeat on the transfer channel
             await mc.commands.set_tuning(0, 0)   # no airtime budget wait between our packets
             await mc.commands.change_contact_path(ct, "")   # zero-hop direct: no repeaters out here
             print(f"moved to {fast[0]} MHz / {fast[1]} kHz / SF{fast[2]}; the target drops back "
@@ -355,8 +362,8 @@ async def cmd_push(a):
         rebooting = time.monotonic()
         print(f"transfer took {rebooting - t0:.0f} s")
         if restore:   # the new image boots on the node's own radio settings
-            await mc.commands.set_radio(*restore[:4])
-            await mc.commands.set_tuning(*restore[4:])
+            await mc.commands.set_radio(*restore[:4], repeat=restore[6])
+            await mc.commands.set_tuning(*restore[4:6])
             restore = None
         if a.no_confirm:
             print(f"not confirming: the node rolls back {CONFIRM_SECS} s after it boots")
@@ -374,8 +381,8 @@ async def cmd_push(a):
                 print(f"(confirmed; follow-up check failed: {e})")
     finally:
         if restore:
-            await mc.commands.set_radio(*restore[:4])
-            await mc.commands.set_tuning(*restore[4:])
+            await mc.commands.set_radio(*restore[:4], repeat=restore[6])
+            await mc.commands.set_tuning(*restore[4:6])
             print(f"companion back on its radio settings; the target drops back within {RADIO_IDLE_SECS} s")
         await mc.disconnect()
 

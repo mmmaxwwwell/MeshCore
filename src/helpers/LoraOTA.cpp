@@ -29,6 +29,7 @@ Receiver::Receiver(Flash& flash, const uint8_t pubkey[32], const char* board) : 
   _state = IDLE;
   _session = _size = 0;
   _chunks = _received = 0;
+  _chunk = LORA_OTA_CHUNK;
   _last_ms = 0;
 }
 
@@ -57,21 +58,24 @@ int Receiver::handle(const uint8_t* req, size_t len, uint8_t* reply, uint32_t no
   return 0;
 }
 
-// BEGIN: size u32, sha256[32], sig[64] -> status, session u32, chunk u8, chunks u16
+// BEGIN: size u32, sha256[32], sig[64] [, chunk u8] -> status, session u32, chunk u8, chunks u16
 int Receiver::begin(const uint8_t* p, size_t len, uint8_t* reply, uint32_t now_ms, uint32_t random32, bool pending) {
   memset(reply, 0, 8);
   if (len < 4 + 32 + 64) { reply[0] = BAD_ARG; return 1; }
   uint32_t size = rd32(p);
   const uint8_t* sha = &p[4];
   const uint8_t* sig = &p[36];
+  uint8_t chunk = len > 100 ? p[100] : LORA_OTA_CHUNK;
+  if (chunk > LORA_OTA_CHUNK) chunk = LORA_OTA_CHUNK;
+  if (chunk < LORA_OTA_CHUNK_MIN) { reply[0] = BAD_ARG; return 1; }
 
-  if (_state != IDLE && size == _size && memcmp(sha, _sha, 32) == 0) {
+  if (_state != IDLE && size == _size && chunk == _chunk && memcmp(sha, _sha, 32) == 0) {
     // a retry (lost reply) or a resume of the same image: same session, keep chunks
     _last_ms = now_ms;
   } else {
     if (pending) { reply[0] = PENDING_VERIFY; return 1; }   // confirm the running image first
     if (_state == DONE) { reply[0] = BAD_STATE; return 1; } // reboot pending into another image
-    if (size == 0 || size > _flash->capacity() || (size + LORA_OTA_CHUNK - 1) / LORA_OTA_CHUNK > LORA_OTA_MAX_CHUNKS) {
+    if (size == 0 || size > _flash->capacity() || (size + chunk - 1) / chunk > LORA_OTA_MAX_CHUNKS) {
       reply[0] = TOO_BIG; return 1;
     }
     uint8_t manifest[LORA_OTA_MANIFEST_LEN];
@@ -82,7 +86,8 @@ int Receiver::begin(const uint8_t* p, size_t len, uint8_t* reply, uint32_t now_m
     if (!_flash->erase(size)) { reply[0] = FLASH_ERROR; return 1; }
     _size = size;
     memcpy(_sha, sha, 32);
-    _chunks = (size + LORA_OTA_CHUNK - 1) / LORA_OTA_CHUNK;
+    _chunk = chunk;
+    _chunks = (size + chunk - 1) / chunk;
     _received = 0;
     memset(_bitmap, 0, sizeof(_bitmap));
     _session = random32 ? random32 : 1;
@@ -91,7 +96,7 @@ int Receiver::begin(const uint8_t* p, size_t len, uint8_t* reply, uint32_t now_m
   }
   reply[0] = OK;
   wr32(&reply[1], _session);
-  reply[5] = LORA_OTA_CHUNK;
+  reply[5] = _chunk;
   wr16(&reply[6], _chunks);
   return 8;
 }
@@ -101,11 +106,11 @@ int Receiver::data(const uint8_t* p, size_t len, uint32_t now_ms) {
   if (_state != RECEIVING || len < 6 || rd32(p) != _session) return 0;
   uint16_t idx = rd16(&p[4]);
   if (idx >= _chunks) return 0;
-  size_t want = (idx == _chunks - 1) ? _size - (size_t)idx * LORA_OTA_CHUNK : LORA_OTA_CHUNK;
+  size_t want = (idx == _chunks - 1) ? _size - (size_t)idx * _chunk : _chunk;
   if (len - 6 != want) return 0;
   _last_ms = now_ms;
   if (hasChunk(idx)) return 0;   // duplicate: flash bits only go 1 -> 0, never rewrite
-  if (!_flash->write((size_t)idx * LORA_OTA_CHUNK, &p[6], want)) return 0;
+  if (!_flash->write((size_t)idx * _chunk, &p[6], want)) return 0;
   _bitmap[idx >> 3] |= 1 << (idx & 7);
   _received++;
   return 0;

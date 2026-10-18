@@ -42,6 +42,8 @@ class SimLink:
         self.cut_after, self.data_sent, self.frames = cut_after, 0, 0
 
     async def request(self, payload, want_reply, timeout):
+        # what a stock companion accepts: CMD_SEND_BINARY_REQ + 32-byte pubkey + payload in one frame
+        assert 1 + 32 + len(payload) <= L.COMPANION_FRAME, f"{len(payload)}-byte request will not fit a companion frame"
         if payload[0] == L.REQ_DATA:
             self.data_sent += 1
             if self.cut_after is not None and self.data_sent > self.cut_after:
@@ -113,6 +115,7 @@ def main():
     frames = link.frames
     check("clean transfer", finished_ok(link, out, err), str(err))
     check("clean transfer is one pass", frames <= s.chunks + 20, f"{frames} frames for {s.chunks} chunks")
+    check("sender's chunk size used", s.chunk == L.CHUNK, f"chunk {s.chunk}")
 
     link, s, out, err = run(sim, tmp, img, m, ["--pubkey", pub, "--drop", "20", "--seed", "3"])
     check("20% packet loss", finished_ok(link, out, err), str(err))

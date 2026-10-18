@@ -72,7 +72,7 @@ int main(int argc, char** argv) {
   srand(seed);
 
   RamFlash flash(capacity);
-  if (corrupt >= 0) flash.corrupt_off = corrupt * LORA_OTA_CHUNK;
+  long corrupt_chunk = corrupt;   // byte offset known once BEGIN fixes the chunk size
   static lora_ota::Receiver rx(flash, pub, board);
 
   uint32_t now = 0;
@@ -90,6 +90,10 @@ int main(int argc, char** argv) {
       n_dropped++;                        // request lost on air
     } else {
       n = rx.handle(req, len, reply, now, (uint32_t)rand() | 1, pending);
+      if (req[0] == LORA_OTA_REQ_BEGIN && n >= 8 && corrupt_chunk >= 0 && flash.corrupt_off < 0) {
+        flash.corrupt_off = corrupt_chunk * reply[5];
+        corrupt_chunk = -1;
+      }
       if (n > 0 && rand() % 100 < drop) { n = 0; n_dropped++; }   // reply lost on air
     }
     uint8_t oh[2] = { (uint8_t)n, (uint8_t)(n >> 8) };

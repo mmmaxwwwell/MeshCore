@@ -21,8 +21,10 @@
 #define LORA_OTA_REQ_RADIO   0x66   // ditto: temporary fast radio settings for the transfer
 
 // a REQ datagram holds 163 bytes after the 4-byte tag; DATA spends 7 on
-// type + session + index
+// type + session + index. The sender picks the chunk size in BEGIN (a stock
+// companion's 176-byte command frame leaves room for 136); this is the cap.
 #define LORA_OTA_CHUNK          156
+#define LORA_OTA_CHUNK_MIN      16
 #define LORA_OTA_MAX_CHUNKS     16384                  // 2.5 MB
 #define LORA_OTA_BITMAP_REPLY   128                    // chunks per STATUS = 1024
 #define LORA_OTA_IDLE_MS        (5 * 60 * 1000UL)      // abandon a silent session
@@ -72,6 +74,7 @@ class Receiver {
   uint32_t _size;
   uint16_t _chunks;
   uint16_t _received;
+  uint8_t _chunk;
   uint8_t _sha[32];
   uint32_t _last_ms;
   uint8_t _bitmap[LORA_OTA_MAX_CHUNKS / 8];
