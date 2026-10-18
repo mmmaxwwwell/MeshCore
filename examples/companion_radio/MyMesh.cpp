@@ -7,6 +7,7 @@
 #include <Mesh.h>
 #ifdef OVERLAY_MESH
 #include <SHA256.h>
+#include <helpers/OverlayPolicy.h>
 #endif
 
 #define CMD_APP_START                 1
@@ -114,7 +115,6 @@
 #define OVERLAY_OP_SET                0x02  // name (bytes to end of frame, "#..."; empty = off)
 #define OVERLAY_FILE                  "/overlay"
 #define OVERLAY_MAGIC                 0x31594C4FUL   // "OLY1"
-#define OVERLAY_MAX_HOPS              8
 
 #define POSREPORT_OP_STATUS           0x01
 #define POSREPORT_OP_SET              0x02  // interval_min(u16 LE) dest_prefix[6]
@@ -513,12 +513,7 @@ bool MyMesh::filterRecvFloodPacket(mesh::Packet* packet) {
 
 bool MyMesh::allowPacketForward(const mesh::Packet* packet) {
 #ifdef OVERLAY_MESH
-  if (!_prefs.isRepeatEn()) return false;
-  if (packet->isRouteFlood()) {
-    // Public floods are not ours to carry: only the overlay region, and bounded.
-    return isOverlayFlood(packet) && packet->getPathHashCount() < OVERLAY_MAX_HOPS;
-  }
-  return true;   // direct: we are on its path (paths are learned from overlay floods)
+  return overlay::allowForward(_prefs.isRepeatEn(), _overlay.name[0] != 0, _overlay_key, packet);
 #else
   return _prefs.isRepeatEn();
 #endif
@@ -539,7 +534,7 @@ void MyMesh::sendFloodScoped(const ContactInfo& recipient, mesh::Packet* pkt, ui
 #ifdef OVERLAY_MESH
   // Traffic between our nodes (DMs, ACKs, path returns, replies all come
   // through here) stays on the overlay: never relayed by public repeaters.
-  if (_overlay.name[0] && (recipient.flags & 1)) {
+  if (overlay::tagForContact(_overlay.name[0] != 0, recipient.flags)) {
     sendFloodScoped(_overlay_key, pkt, delay_millis);
     return;
   }
@@ -556,6 +551,17 @@ void MyMesh::sendFloodScoped(const ContactInfo& recipient, mesh::Packet* pkt, ui
   }
 }
 void MyMesh::sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* pkt, uint32_t delay_millis) {
+#ifdef OVERLAY_MESH
+  // The group's '~' channel hops on the overlay (OverlayPolicy.h).
+  if (_overlay.name[0]) {
+    int idx = findChannelIdx(channel);
+    ChannelDetails ch;
+    if (idx >= 0 && getChannel(idx, ch) && overlay::tagForChannel(true, ch.name)) {
+      sendFloodScoped(_overlay_key, pkt, delay_millis);
+      return;
+    }
+  }
+#endif
   // TODO: have per-channel send_scope
   if (send_unscoped) {
     sendFlood(pkt, delay_millis, _prefs.path_hash_mode + 1);  // app has explicitly requested un-scoped
@@ -2189,8 +2195,7 @@ void MyMesh::overlaySave() {
 }
 
 bool MyMesh::isOverlayFlood(const mesh::Packet* pkt) const {
-  return _overlay.name[0] && pkt->getRouteType() == ROUTE_TYPE_TRANSPORT_FLOOD
-      && pkt->transport_codes[0] == _overlay_key.calcTransportCode(pkt);
+  return overlay::isOverlayFlood(_overlay.name[0] != 0, _overlay_key, pkt);
 }
 
 void MyMesh::handleOverlayCmd(size_t len) {
