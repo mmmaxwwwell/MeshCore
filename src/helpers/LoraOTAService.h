@@ -11,6 +11,14 @@
 
 #include <MeshCore.h>
 
+// -D LORA_OTA_DEBUG: step timings on Serial (BLE builds only: on a USB
+// companion Serial IS the companion link)
+#ifdef LORA_OTA_DEBUG
+  #define LORA_OTA_LOG(...) do { Serial.printf(__VA_ARGS__); Serial.print("\r\n"); } while (0)
+#else
+  #define LORA_OTA_LOG(...) do { } while (0)
+#endif
+
 // a new image that hears no CONFIRM this long after boot rolls back
 #ifndef LORA_OTA_CONFIRM_SECS
   #define LORA_OTA_CONFIRM_SECS  60

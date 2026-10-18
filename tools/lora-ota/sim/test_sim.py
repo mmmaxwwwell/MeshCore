@@ -116,7 +116,7 @@ def main():
     link, s, out, err = run(sim, tmp, img, m, ["--pubkey", pub])
     frames = link.frames
     check("clean transfer", finished_ok(link, out, err), str(err))
-    check("clean transfer is one pass", frames <= s.chunks + 20, f"{frames} frames for {s.chunks} chunks")
+    check("clean transfer is one pass", frames <= s.chunks + 40, f"{frames} frames for {s.chunks} chunks")
     check("sender's chunk size used", s.chunk == L.CHUNK, f"chunk {s.chunk}")
 
     link, s, out, err = run(sim, tmp, img, m, ["--pubkey", pub, "--drop", "20", "--seed", "3"])

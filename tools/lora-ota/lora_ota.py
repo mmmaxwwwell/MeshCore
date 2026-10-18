@@ -27,8 +27,10 @@ COMPANION_FRAME = 176   # a stock companion's max command frame (BaseSerialInter
 CHUNK = COMPANION_FRAME - 1 - 32 - 7   # minus CMD_SEND_BINARY_REQ + pubkey, DATA's type + session + index
 STATUS_NAMES = {0: "ok", 1: "bad state", 2: "bad session", 3: "bad signature (or image for another board)",
                 4: "too big", 5: "flash error", 6: "incomplete", 7: "hash mismatch", 8: "no LoRa-OTA marker",
-                9: "activate failed", 10: "running image not confirmed yet ('ota confirm' first)", 11: "bad argument"}
-OK, INCOMPLETE, HASH_MISMATCH = 0, 6, 7
+                9: "activate failed", 10: "running image not confirmed yet ('ota confirm' first)", 11: "bad argument",
+                12: "working"}
+OK, INCOMPLETE, HASH_MISMATCH, WORKING = 0, 6, 7, 12
+WORK_SECS = 240   # longest a BEGIN (erase/stage) or FINISH (verify) may take on the target
 
 
 class OtaError(Exception):
@@ -122,6 +124,7 @@ class OtaSender:
         self.keepalive = keepalive   # async callable, run before each round
         self.status_timeout, self.retries = status_timeout, retries
         self.want_chunk = chunk
+        self.work_poll = 1.0 if status_timeout else 0
         self.session = self.chunk = self.chunks = None
 
     async def ask(self, payload, what):
@@ -132,10 +135,21 @@ class OtaSender:
             self.log(f"  {what}: no reply (attempt {attempt + 1})")
         raise OtaError(f"{what}: target not answering")
 
+    async def ask_done(self, payload, what):
+        """BEGIN/FINISH answer WORKING while the target prepares/verifies: ask again."""
+        t0 = time.monotonic()
+        while True:
+            r = await self.ask(payload, what)
+            if r[0] != WORKING:
+                return r
+            if time.monotonic() - t0 > WORK_SECS:
+                raise OtaError(f"{what}: target still working after {WORK_SECS} s")
+            await asyncio.sleep(self.work_poll)
+
     async def begin(self):
         p = (bytes([REQ_BEGIN]) + struct.pack("<I", self.m["size"]) + bytes.fromhex(self.m["sha256"]) +
              bytes.fromhex(self.m["sig"]) + bytes([self.want_chunk]))
-        r = await self.ask(p, "BEGIN")
+        r = await self.ask_done(p, "BEGIN")
         if r[0] != OK:
             raise OtaError(f"BEGIN refused: {STATUS_NAMES.get(r[0], r[0])}")
         self.session, self.chunk, self.chunks = struct.unpack("<IBH", r[1:8])
@@ -175,7 +189,7 @@ class OtaSender:
             todo = await self.missing()
             if not todo:
                 self.log(f"node: got all {self.chunks} chunks; checking the SHA-256")
-                r = await self.ask(bytes([REQ_FINISH]) + self.sess, "FINISH")
+                r = await self.ask_done(bytes([REQ_FINISH]) + self.sess, "FINISH")
                 if r[0] == OK:
                     self.log(f"node: checksum good, image set, rebooting in {REBOOT_SECS} s")
                     return

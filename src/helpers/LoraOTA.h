@@ -49,6 +49,7 @@ enum Status : uint8_t {
   ACTIVATE_FAILED = 9,
   PENDING_VERIFY = 10,
   BAD_ARG = 11,
+  WORKING = 12,   // BEGIN/FINISH accepted, the work runs from poll(): ask again
 };
 
 class Flash {
@@ -69,7 +70,12 @@ class Receiver {
   uint8_t _pubkey[32];
   char _board[LORA_OTA_BOARD_LEN + 1];
 
-  enum { IDLE, RECEIVING, DONE } _state;
+  // PREPARING (after BEGIN) and VERIFYING (after FINISH) do their heavy work in
+  // poll(), from the main loop: not inside the radio receive path, whose stack
+  // is small on nRF52 (4 KB) and which must not stall for seconds
+  enum { IDLE, PREPARING, RECEIVING, VERIFYING, DONE } _state;
+  uint8_t _sig[64];
+  Status _result;   // outcome of the last poll() work, reported to the next BEGIN/FINISH
   uint32_t _session;
   uint32_t _size;
   uint16_t _chunks;
@@ -97,7 +103,9 @@ public:
   int handle(const uint8_t* req, size_t len, uint8_t* reply, uint32_t now_ms, uint32_t random32, bool pending_verify);
 
   void loop(uint32_t now_ms);           // drops a session idle for LORA_OTA_IDLE_MS
-  bool receiving() const { return _state == RECEIVING; }
+  void poll(uint32_t now_ms);           // the heavy part of BEGIN/FINISH; call from the main loop
+  bool working() const { return _state == PREPARING || _state == VERIFYING; }
+  bool receiving() const { return _state == RECEIVING || working(); }
   bool activated() const { return _state == DONE; }
   uint16_t received() const { return _received; }
   uint16_t chunks() const { return _chunks; }

@@ -252,7 +252,11 @@ public:
   }
   bool erase(size_t len) override {
     QSPIFlash._lockFS();
-    bool ok = writeFile(NEW_PATH, NULL, len, true) && mapFile(NEW_PATH, len, new_map);
+    LORA_OTA_LOG("ota: staging %lu bytes", (unsigned long)len);
+    bool ok = writeFile(NEW_PATH, NULL, len, true);
+    LORA_OTA_LOG("ota: file %s t=%lu", ok ? "written" : "FAILED", millis());
+    ok = ok && mapFile(NEW_PATH, len, new_map);
+    LORA_OTA_LOG("ota: mapped %s, %u extents t=%lu", ok ? "ok" : "FAILED", new_map.n, millis());
     QSPIFlash._unlockFS();
     return ok;
   }
@@ -334,7 +338,10 @@ public:
     // back up the running image, then copy the staged one in (reverting to the backup if it will not verify)
     QSPIFlash._lockFS();
     uint32_t size = runningImageSize();
+    LORA_OTA_LOG("ota: backing up %lu bytes", (unsigned long)size);
     bool ok = writeFile(OLD_PATH, (const uint8_t*)APP_START, size, false) && mapFile(OLD_PATH, size, old_map);
+    LORA_OTA_LOG("ota: backup %s, %u extents; new image %lu bytes, %u extents", ok ? "ok" : "FAILED", old_map.n,
+                 (unsigned long)new_map.size, new_map.n);
     if (ok) {
       _st.trial = 1;
       _st.boots = 0;

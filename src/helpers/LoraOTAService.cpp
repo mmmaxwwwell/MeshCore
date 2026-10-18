@@ -15,6 +15,7 @@ void LoraOTAService::begin(LoraOTARadio& radio) {
   uint8_t pubkey[32];
   if (!mesh::Utils::fromHex(pubkey, 32, LORA_OTA_PUBKEY)) return;   // bad build flag: feature off
   _pending = _platform->begin();
+  LORA_OTA_LOG("ota: begin pending=%d", (int)_pending);
   if (_pending) _confirm_by = millis() + LORA_OTA_CONFIRM_SECS * 1000UL;
   if (_platform->flash()) _rx = new lora_ota::Receiver(*_platform->flash(), pubkey, LORA_OTA_BOARD);
 }
@@ -57,11 +58,7 @@ int LoraOTAService::handleRequest(const uint8_t* req, size_t len, uint8_t* reply
   }
 
   if (!_rx) { reply[0] = lora_ota::BAD_STATE; return 1; }
-  int n = _rx->handle(req, len, reply, millis(), random32, _pending);
-  if (_rx->activated() && _reboot_at == 0) {
-    _reboot_at = millis() + LORA_OTA_REBOOT_DELAY_MS;
-  }
-  return n;
+  return _rx->handle(req, len, reply, millis(), random32, _pending);
 }
 
 bool LoraOTAService::handleCommand(const char* command, char* reply) {
@@ -113,22 +110,37 @@ void LoraOTAService::loop() {
   }
   _platform->feedWatchdog();
   unsigned long now = millis();
-  if (_rx) _rx->loop(now);
+  if (_rx) {
+    _rx->loop(now);
+    if (_rx->working()) {
+      touchRadio();   // a long erase/verify is OTA activity: keep the transfer channel
+      LORA_OTA_LOG("ota: poll start t=%lu", now);
+      _rx->poll(now);
+      now = millis();
+      LORA_OTA_LOG("ota: poll done t=%lu receiving=%d activated=%d", now, (int)_rx->receiving(), (int)_rx->activated());
+      touchRadio();
+    }
+    if (_rx->activated() && _reboot_at == 0) _reboot_at = now + LORA_OTA_REBOOT_DELAY_MS;
+  }
 
   if (_t_apply_at && (long)(now - _t_apply_at) >= 0) {
     _t_apply_at = 0;
     _radio->otaTempRadio(_t_freq, _t_bw, _t_sf, _t_cr);
+    LORA_OTA_LOG("ota: temp radio %.3f/%.1f/SF%u", _t_freq, _t_bw, _t_sf);
     _t_active = true;
     touchRadio();
   }
   if (_t_active && !_reboot_at && (long)(now - _t_last) >= (long)_t_idle_s * 1000L) {
     _t_active = false;   // the transfer went quiet: back to the mesh, whatever happened
     _radio->otaRestoreRadio();
+    LORA_OTA_LOG("ota: radio restored");
   }
 
   if (_reboot_at && (long)(now - _reboot_at) >= 0) {
     _reboot_at = 0;
+    LORA_OTA_LOG("ota: install t=%lu", now);
     _platform->install();   // does not return on success
+    LORA_OTA_LOG("ota: install FAILED");
   }
   if (_pending && (long)(now - _confirm_by) >= 0) {
     MESH_DEBUG_PRINTLN("lora ota: not confirmed, rolling back");

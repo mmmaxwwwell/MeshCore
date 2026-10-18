@@ -30,6 +30,7 @@ Receiver::Receiver(Flash& flash, const uint8_t pubkey[32], const char* board) : 
   _session = _size = 0;
   _chunks = _received = 0;
   _chunk = LORA_OTA_CHUNK;
+  _result = OK;
   _last_ms = 0;
 }
 
@@ -51,7 +52,7 @@ int Receiver::handle(const uint8_t* req, size_t len, uint8_t* reply, uint32_t no
     case LORA_OTA_REQ_FINISH: return finish(p, len, reply);
     case LORA_OTA_REQ_ABORT:
       if (len < 4 || _state == IDLE || rd32(p) != _session) { reply[0] = BAD_SESSION; return 1; }
-      if (_state == RECEIVING) _state = IDLE;   // an activated image stays activated
+      if (_state == RECEIVING || _state == PREPARING) _state = IDLE;   // an activated image stays activated
       reply[0] = _state == IDLE ? OK : BAD_STATE;
       return 1;
   }
@@ -59,6 +60,8 @@ int Receiver::handle(const uint8_t* req, size_t len, uint8_t* reply, uint32_t no
 }
 
 // BEGIN: size u32, sha256[32], sig[64] [, chunk u8] -> status, session u32, chunk u8, chunks u16
+// A new image answers WORKING; poll() checks the signature and prepares the
+// staging area, and a repeated BEGIN then gets OK + session (or the error).
 int Receiver::begin(const uint8_t* p, size_t len, uint8_t* reply, uint32_t now_ms, uint32_t random32, bool pending) {
   memset(reply, 0, 8);
   if (len < 4 + 32 + 64) { reply[0] = BAD_ARG; return 1; }
@@ -69,30 +72,31 @@ int Receiver::begin(const uint8_t* p, size_t len, uint8_t* reply, uint32_t now_m
   if (chunk > LORA_OTA_CHUNK) chunk = LORA_OTA_CHUNK;
   if (chunk < LORA_OTA_CHUNK_MIN) { reply[0] = BAD_ARG; return 1; }
 
-  if (_state != IDLE && size == _size && chunk == _chunk && memcmp(sha, _sha, 32) == 0) {
+  bool same = size == _size && chunk == _chunk && memcmp(sha, _sha, 32) == 0;
+  if (same && _state == PREPARING) { reply[0] = WORKING; return 1; }
+  if (same && _state == IDLE && _result != OK) {   // the preparation failed: report it once
+    reply[0] = _result;
+    _result = OK;
+    _size = 0;
+    return 1;
+  }
+  if (_state != IDLE && same) {
     // a retry (lost reply) or a resume of the same image: same session, keep chunks
     _last_ms = now_ms;
   } else {
     if (pending) { reply[0] = PENDING_VERIFY; return 1; }   // confirm the running image first
-    if (_state == DONE) { reply[0] = BAD_STATE; return 1; } // reboot pending into another image
-    if (size == 0 || size > _flash->capacity() || (size + chunk - 1) / chunk > LORA_OTA_MAX_CHUNKS) {
-      reply[0] = TOO_BIG; return 1;
-    }
-    uint8_t manifest[LORA_OTA_MANIFEST_LEN];
-    buildManifest(manifest, _board, size, sha);
-    if (!ed25519_verify(sig, manifest, sizeof(manifest), _pubkey)) { reply[0] = BAD_SIGNATURE; return 1; }
-
-    _state = IDLE;
-    if (!_flash->erase(size)) { reply[0] = FLASH_ERROR; return 1; }
+    if (_state == DONE || _state == VERIFYING) { reply[0] = BAD_STATE; return 1; }
+    if (size == 0 || (size + chunk - 1) / chunk > LORA_OTA_MAX_CHUNKS) { reply[0] = TOO_BIG; return 1; }
     _size = size;
-    memcpy(_sha, sha, 32);
     _chunk = chunk;
-    _chunks = (size + chunk - 1) / chunk;
-    _received = 0;
-    memset(_bitmap, 0, sizeof(_bitmap));
+    memcpy(_sha, sha, 32);
+    memcpy(_sig, sig, 64);
     _session = random32 ? random32 : 1;
-    _state = RECEIVING;
+    _result = OK;
+    _state = PREPARING;
     _last_ms = now_ms;
+    reply[0] = WORKING;
+    return 1;
   }
   reply[0] = OK;
   wr32(&reply[1], _session);
@@ -160,22 +164,57 @@ Status Receiver::verifyImage() {
   return OK;
 }
 
-// FINISH: session u32 -> status. OK means the image is the next boot image.
+// FINISH: session u32 -> status. WORKING while poll() checks the image; OK
+// once it is the next boot image.
 int Receiver::finish(const uint8_t* p, size_t len, uint8_t* reply) {
-  if (len < 4 || _state == IDLE || rd32(p) != _session) { reply[0] = BAD_SESSION; return 1; }
+  if (len < 4 || _state == IDLE || _state == PREPARING || rd32(p) != _session) { reply[0] = BAD_SESSION; return 1; }
   if (_state == DONE) { reply[0] = OK; return 1; }   // retry after a lost reply
-  if (_received != _chunks) { reply[0] = INCOMPLETE; return 1; }
-  Status s = verifyImage();
-  if (s == OK && !_flash->activate(_size)) s = ACTIVATE_FAILED;
-  if (s == OK) {
-    _state = DONE;
-  } else if (s == HASH_MISMATCH || s == FLASH_ERROR) {
-    memset(_bitmap, 0, sizeof(_bitmap));   // start over within the same session
-    _received = 0;
-    if (!_flash->erase(_size)) _state = IDLE;
+  if (_state == VERIFYING) { reply[0] = WORKING; return 1; }
+  if (_result != OK) {   // what the last verify found (HASH_MISMATCH: the chunks are being resent)
+    reply[0] = _result;
+    _result = OK;
+    return 1;
   }
-  reply[0] = s;
+  if (_received != _chunks) { reply[0] = INCOMPLETE; return 1; }
+  _state = VERIFYING;
+  reply[0] = WORKING;
   return 1;
+}
+
+void Receiver::poll(uint32_t now_ms) {
+  if (_state == PREPARING) {
+    uint8_t manifest[LORA_OTA_MANIFEST_LEN];
+    buildManifest(manifest, _board, _size, _sha);
+    Status s = OK;
+    if (_size > _flash->capacity()) s = TOO_BIG;
+    else if (!ed25519_verify(_sig, manifest, sizeof(manifest), _pubkey)) s = BAD_SIGNATURE;
+    else if (!_flash->erase(_size)) s = FLASH_ERROR;
+    if (s != OK) {
+      _state = IDLE;   // the next BEGIN with this image reports s
+      _result = s;
+      return;
+    }
+    _chunks = (_size + _chunk - 1) / _chunk;
+    _received = 0;
+    memset(_bitmap, 0, sizeof(_bitmap));
+    _state = RECEIVING;
+    _last_ms = now_ms;
+  } else if (_state == VERIFYING) {
+    Status s = verifyImage();
+    if (s == OK && !_flash->activate(_size)) s = ACTIVATE_FAILED;
+    if (s == OK) {
+      _state = DONE;
+      return;
+    }
+    _result = s;   // the next FINISH reports it
+    _state = RECEIVING;
+    _last_ms = now_ms;
+    if (s == HASH_MISMATCH || s == FLASH_ERROR) {
+      memset(_bitmap, 0, sizeof(_bitmap));   // start over within the same session
+      _received = 0;
+      if (!_flash->erase(_size)) _state = IDLE;
+    }
+  }
 }
 
 void Receiver::loop(uint32_t now_ms) {

@@ -90,12 +90,13 @@ int main(int argc, char** argv) {
       n_dropped++;                        // request lost on air
     } else {
       n = rx.handle(req, len, reply, now, (uint32_t)rand() | 1, pending);
-      if (req[0] == LORA_OTA_REQ_BEGIN && n >= 8 && corrupt_chunk >= 0 && flash.corrupt_off < 0) {
+      if (req[0] == LORA_OTA_REQ_BEGIN && n >= 8 && reply[0] == 0 && corrupt_chunk >= 0 && flash.corrupt_off < 0) {
         flash.corrupt_off = corrupt_chunk * reply[5];
         corrupt_chunk = -1;
       }
       if (n > 0 && rand() % 100 < drop) { n = 0; n_dropped++; }   // reply lost on air
     }
+    rx.poll(now);   // the main loop's turn: BEGIN/FINISH work happens here
     uint8_t oh[2] = { (uint8_t)n, (uint8_t)(n >> 8) };
     fwrite(oh, 1, 2, stdout);
     fwrite(reply, 1, n, stdout);
