@@ -230,8 +230,9 @@ async def confirm_new_image(link, since, log=print, window=REBOOT_SECS + CONFIRM
                 await asyncio.sleep(1)   # still the old image, before its reboot
                 continue
             if up < time.monotonic() - since:
+                # was_pending 0 with the right sha: an earlier CONFIRM landed and its reply was lost
                 log(f"node: new image confirmed ({up} s after boot)" if r[1] else
-                    f"node: new image already confirmed ({up} s after boot)")
+                    f"node: new image confirmed ({up} s after boot; a retry, the first reply was lost)")
                 return True
         else:
             await asyncio.sleep(1)
