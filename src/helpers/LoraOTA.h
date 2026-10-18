@@ -17,6 +17,7 @@
 #define LORA_OTA_REQ_STATUS  0x62
 #define LORA_OTA_REQ_FINISH  0x63
 #define LORA_OTA_REQ_ABORT   0x64
+#define LORA_OTA_REQ_CONFIRM 0x65   // handled by the platform glue, not the Receiver
 
 // a REQ datagram holds 163 bytes after the 4-byte tag; DATA spends 7 on
 // type + session + index
@@ -85,7 +86,7 @@ class Receiver {
 public:
   Receiver(Flash& flash, const uint8_t pubkey[32], const char* board);
 
-  static bool isOtaReq(uint8_t type) { return type >= LORA_OTA_REQ_BEGIN && type <= LORA_OTA_REQ_ABORT; }
+  static bool isOtaReq(uint8_t type) { return type >= LORA_OTA_REQ_BEGIN && type <= LORA_OTA_REQ_CONFIRM; }
 
   // req[0] is the request type. Writes the reply body (no tag) and returns
   // its length; 0 = send nothing (DATA). reply needs 5 + LORA_OTA_BITMAP_REPLY bytes.

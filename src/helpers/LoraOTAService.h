@@ -2,8 +2,8 @@
 
 // ESP32 glue for lora_ota::Receiver: the next OTA partition as its Flash,
 // the bootloader's rollback as its safety net (a new image stays
-// PENDING_VERIFY until an admin sends `ota confirm` over LoRa, else it rolls
-// back), and the `ota ...` CLI.
+// PENDING_VERIFY until an admin's CONFIRM arrives over LoRa within
+// LORA_OTA_CONFIRM_SECS of boot, else it rolls back), and the `ota ...` CLI.
 
 #include "LoraOTA.h"
 
@@ -11,8 +11,9 @@
 
 #include <MeshCore.h>
 
-#ifndef LORA_OTA_CONFIRM_MINS
-  #define LORA_OTA_CONFIRM_MINS  15
+// a new image that hears no CONFIRM from an admin this long after boot rolls back
+#ifndef LORA_OTA_CONFIRM_SECS
+  #define LORA_OTA_CONFIRM_SECS  60
 #endif
 #define LORA_OTA_REBOOT_DELAY_MS 6000   // after FINISH: room for the reply (and a retry of it)
 
@@ -26,6 +27,7 @@ class LoraOTAService {
 public:
   LoraOTAService() : _board(NULL), _rx(NULL), _pending(false), _confirm_by(0), _reboot_at(0) { }
   void begin(mesh::MainBoard& board);
+  bool confirm();   // keep the running image (no-op if it is not pending)
   // reply body for an OTA REQ (no tag); 0 = no reply
   int handleRequest(const uint8_t* req, size_t len, uint8_t* reply, uint32_t random32);
   // `ota ...` (command points past "ota "); false = not ours

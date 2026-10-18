@@ -8,7 +8,7 @@
 #include <esp_partition.h>
 
 // Arduino's initArduino() marks the running image valid unless this says
-// otherwise; we keep a new image PENDING_VERIFY until `ota confirm`.
+// otherwise; we keep a new image PENDING_VERIFY until an admin confirms it.
 extern "C" bool verifyRollbackLater() { return true; }
 
 class EspOtaFlash : public lora_ota::Flash {
@@ -50,13 +50,29 @@ void LoraOTAService::begin(mesh::MainBoard& board) {
   esp_ota_img_states_t st;
   if (esp_ota_get_state_partition(esp_ota_get_running_partition(), &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY) {
     _pending = true;
-    _confirm_by = millis() + LORA_OTA_CONFIRM_MINS * 60 * 1000UL;
+    _confirm_by = millis() + LORA_OTA_CONFIRM_SECS * 1000UL;
     enableLoopWDT();   // a hung new image resets, and the bootloader rolls back
   }
 }
 
+bool LoraOTAService::confirm() {
+  if (!_pending) return true;
+  if (esp_ota_mark_app_valid_cancel_rollback() != ESP_OK) return false;
+  _pending = false;
+  disableLoopWDT();
+  return true;
+}
+
 int LoraOTAService::handleRequest(const uint8_t* req, size_t len, uint8_t* reply, uint32_t random32) {
   if (!_rx) return 0;
+  if (req[0] == LORA_OTA_REQ_CONFIRM) {   // -> status, was_pending, uptime_s u32
+    bool was = _pending;               // uptime lets the sender tell the new image from the old
+    uint32_t up = millis() / 1000;
+    reply[0] = confirm() ? lora_ota::OK : lora_ota::FLASH_ERROR;
+    reply[1] = was;
+    memcpy(&reply[2], &up, 4);
+    return 6;
+  }
   int n = _rx->handle(req, len, reply, millis(), random32, _pending);
   if (_rx->activated() && _reboot_at == 0) {
     _reboot_at = millis() + LORA_OTA_REBOOT_DELAY_MS;
@@ -73,7 +89,7 @@ bool LoraOTAService::handleCommand(const char* command, char* reply) {
     const esp_partition_t* run = esp_ota_get_running_partition();
     if (_pending) {
       long left = (long)(_confirm_by - millis()) / 1000;
-      sprintf(reply, "PENDING VERIFY on %s: 'ota confirm' within %lds or it rolls back", run->label, left > 0 ? left : 0);
+      sprintf(reply, "PENDING VERIFY on %s: confirm within %lds or it rolls back", run->label, left > 0 ? left : 0);
     } else if (_rx->activated()) {
       strcpy(reply, "image activated, rebooting");
     } else if (_rx->receiving()) {
@@ -86,9 +102,7 @@ bool LoraOTAService::handleCommand(const char* command, char* reply) {
   if (strcmp(command, "confirm") == 0) {
     if (!_pending) {
       strcpy(reply, "OK - nothing pending");
-    } else if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
-      _pending = false;
-      disableLoopWDT();
+    } else if (confirm()) {
       strcpy(reply, "OK - image confirmed");
     } else {
       strcpy(reply, "ERR: confirm failed");

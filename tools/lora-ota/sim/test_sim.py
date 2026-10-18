@@ -2,7 +2,7 @@
 """End-to-end test of the LoRa OTA protocol: the real sender (lora_ota.py)
 against the real receiver core (src/helpers/LoraOTA.cpp) built for the host.
 Run from anywhere: python3 tools/lora-ota/sim/test_sim.py"""
-import asyncio, hashlib, os, struct, subprocess, sys, tempfile
+import asyncio, hashlib, os, struct, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "../../.."))
@@ -154,6 +154,23 @@ def main():
     frames = link.frames
     check("resume after a dropped link", finished_ok(link, out, err) and s2.session == session, str(err))
     check("resume sends only what is missing", frames < s2.chunks - 3500, f"{frames} frames")
+
+    # confirm after reboot: only an answer from the REBOOTED image counts
+    class FakeNode:
+        def __init__(self, boots_after, replies=True):
+            self.t0, self.boots_after, self.replies = time.monotonic(), boots_after, replies
+        async def request(self, payload, want_reply, timeout):
+            assert payload == bytes([L.REQ_CONFIRM])
+            await asyncio.sleep(0.01)
+            if not self.replies:
+                return None
+            age = time.monotonic() - self.t0
+            up = int(age - self.boots_after) if age >= self.boots_after else 3600   # old image: long uptime
+            return bytes([L.OK, 1 if age >= self.boots_after else 0]) + struct.pack("<I", max(up, 0))
+    q = lambda *_: None
+    check("confirm waits for the rebooted image", asyncio.run(L.confirm_new_image(FakeNode(0.3), time.monotonic(), q, window=2)))
+    check("old image's answer never counts", not asyncio.run(L.confirm_new_image(FakeNode(99), time.monotonic(), q, window=0.5)))
+    check("silent node -> not confirmed", not asyncio.run(L.confirm_new_image(FakeNode(0, replies=False), time.monotonic(), q, window=0.5)))
 
     print(f"\n{len(failures)} failed" if failures else "\nall passed")
     sys.exit(1 if failures else 0)

@@ -16,7 +16,9 @@ DEFAULT_KEY = os.path.expanduser("~/.config/meshcore/ota-signing.key")
 MARKER = b"MCOTA-ROLLBACK-v1"
 BOARD_LEN = 32
 
-REQ_BEGIN, REQ_DATA, REQ_STATUS, REQ_FINISH, REQ_ABORT = 0x60, 0x61, 0x62, 0x63, 0x64
+REQ_BEGIN, REQ_DATA, REQ_STATUS, REQ_FINISH, REQ_ABORT, REQ_CONFIRM = 0x60, 0x61, 0x62, 0x63, 0x64, 0x65
+CONFIRM_SECS = 60   # firmware LORA_OTA_CONFIRM_SECS
+REBOOT_SECS = 6     # firmware LORA_OTA_REBOOT_DELAY_MS
 BITMAP_CHUNKS = 128 * 8
 STATUS_NAMES = {0: "ok", 1: "bad state", 2: "bad session", 3: "bad signature (or image for another board)",
                 4: "too big", 5: "flash error", 6: "incomplete", 7: "hash mismatch", 8: "no LoRa-OTA marker",
@@ -155,8 +157,10 @@ class OtaSender:
                 await self.keepalive()
             todo = await self.missing()
             if not todo:
+                self.log(f"node: got all {self.chunks} chunks; checking the SHA-256")
                 r = await self.ask(bytes([REQ_FINISH]) + self.sess, "FINISH")
                 if r[0] == OK:
+                    self.log(f"node: checksum good, image set, rebooting in {REBOOT_SECS} s")
                     return
                 if r[0] == HASH_MISMATCH and mismatches < 1:   # a bad flash write: once more
                     mismatches += 1
@@ -175,6 +179,25 @@ class OtaSender:
     async def abort(self):
         if self.session is not None:
             await self.link.request(bytes([REQ_ABORT]) + self.sess, True, self.status_timeout)
+
+
+async def confirm_new_image(link, since, log=print, window=REBOOT_SECS + CONFIRM_SECS):
+    """Send CONFIRM until the REBOOTED node answers (uptime shorter than the
+    time since `since`, a monotonic timestamp taken when it said rebooting).
+    An answer from the old image, before its reboot, does not count."""
+    while time.monotonic() - since < window:
+        r = await link.request(bytes([REQ_CONFIRM]), True, 3.0)
+        if r and len(r) >= 6:
+            up = struct.unpack("<I", r[2:6])[0]
+            if r[0] == OK and up < time.monotonic() - since:
+                log(f"node: new image confirmed ({up} s after boot)" if r[1] else
+                    f"node: new image already confirmed ({up} s after boot)")
+                return True
+            if r[0] != OK:
+                raise OtaError(f"confirm failed on the node: {STATUS_NAMES.get(r[0], r[0])}")
+        else:
+            await asyncio.sleep(1)
+    return False
 
 
 # ---------------------------------------------------------------- radio
@@ -312,30 +335,53 @@ async def cmd_push(a):
             except Exception:
                 pass
             raise
-        print(f"image accepted after {time.monotonic() - t0:.0f} s; target reboots in 6 s")
-
-        if restore:
+        rebooting = time.monotonic()
+        print(f"transfer took {rebooting - t0:.0f} s")
+        if restore:   # the new image boots on the node's own radio settings
             await mc.commands.set_radio(*restore[:4])
             await mc.commands.set_tuning(*restore[4:])
             restore = None
-        await asyncio.sleep(25)
-        for attempt in range(6):
-            try:
-                await adm.login(tries=1)
-                break
-            except OtaError:
-                await asyncio.sleep(10)
-        else:
-            raise OtaError("target not answering after reboot: it rolls back by itself in 15 min")
-        print(f"ver: {await adm.cli('ver')}")
-        print(f"status: {await adm.cli('ota status')}")
-        if not a.no_confirm:
-            print(f"confirm: {await adm.cli('ota confirm')}")
+        if a.no_confirm:
+            print(f"not confirming: the node rolls back {CONFIRM_SECS} s after it boots")
+            return
+        if not await confirm_new_image(CompanionLink(mc, adm.ct), rebooting):
+            raise OtaError(f"no answer from the new image within {CONFIRM_SECS} s of its boot: "
+                           "it rolls back to the old image by itself")
+        try:
+            await adm.login(tries=2)
+            print(f"ver: {await adm.cli('ver')}")
+            print(f"status: {await adm.cli('ota status')}")
+        except OtaError as e:
+            print(f"(confirmed; follow-up check failed: {e})")
     finally:
         if restore:
             await mc.commands.set_radio(*restore[:4])
             await mc.commands.set_tuning(*restore[4:])
             print("companion back on its radio settings; the target reverts when tempradio runs out")
+        await mc.disconnect()
+
+
+async def cmd_confirm(a):
+    """Confirm a freshly booted image (e.g. right after a WiFi OTA): keeps
+    sending CONFIRM for --wait seconds. The node knows us from an earlier login."""
+    mc = await connect(a.companion)
+    try:
+        await mc.ensure_contacts()
+        ct = mc.get_contact_by_name(a.target) or mc.get_contact_by_key_prefix(a.target)
+        if ct is None:
+            raise OtaError(f"no contact {a.target!r} on the companion")
+        link = CompanionLink(mc, ct)
+        deadline = time.monotonic() + a.wait
+        while time.monotonic() < deadline:
+            r = await link.request(bytes([REQ_CONFIRM]), True, 3.0)
+            if r and len(r) >= 6:
+                up = struct.unpack("<I", r[2:6])[0]
+                if r[0] != OK:
+                    raise OtaError(f"confirm failed: {STATUS_NAMES.get(r[0], r[0])}")
+                print(("confirmed" if r[1] else "nothing pending") + f" (node up {up} s)")
+                return
+        raise OtaError("no answer (if it had an unconfirmed image, it rolls back by itself)")
+    finally:
         await mc.disconnect()
 
 
@@ -362,7 +408,9 @@ def main():
         p = sub.add_parser(name)
         p.add_argument("--companion", required=True)
         p.add_argument("--target", required=True)
-        p.add_argument("--password-file", required=True)
+        p.add_argument("--password-file", required=(name != "confirm"))
+        if name == "confirm":
+            p.add_argument("--wait", type=float, default=70, help="keep trying this many seconds")
         if name == "push":
             p.add_argument("image")
             p.add_argument("--fast", default="919.0,500,5,5", help="freq,bw,sf,cr for the transfer")
@@ -375,6 +423,7 @@ def main():
         elif a.cmd == "pubkey": cmd_pubkey(a)
         elif a.cmd == "sign": cmd_sign(a)
         elif a.cmd == "push": asyncio.run(cmd_push(a))
+        elif a.cmd == "confirm": asyncio.run(cmd_confirm(a))
         else: asyncio.run(cmd_cli(a, f"ota {a.cmd}"))
     except OtaError as e:
         print(f"error: {e}", file=sys.stderr)

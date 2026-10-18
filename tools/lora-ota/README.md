@@ -17,12 +17,16 @@ any companion radio, with automatic rollback. Design and decisions:
 4. 156-byte DATA chunks stream without per-chunk acks. STATUS returns a bitmap
    of what's missing, and the sender resends only that. A broken link can
    resume: a new push of the same image continues the same session.
-5. FINISH: the repeater reads the image back, checks the hash and the LoRa-OTA
-   marker, sets it as the boot image and reboots 6 s later.
-6. The new image boots unconfirmed. The sender logs in again on the mesh
-   settings and sends `ota confirm`. If no confirm arrives within 15 min, or
-   the image crashes or hangs before one does, the bootloader goes back to the
-   old image.
+5. When the node has every chunk it says so. On FINISH it reads the image
+   back and checks the SHA-256 and the LoRa-OTA marker. If those pass, it sets
+   the image as the boot image, answers "checksum good, rebooting" and reboots
+   6 s later.
+6. The new image boots on probation. The sender switches the companion back
+   to the mesh settings and sends CONFIRM (a binary request; no new login,
+   since the node keeps its admin list in flash) until the REBOOTED node
+   answers. Uptime in the reply tells the new image from the old one. **No
+   CONFIRM within 60 s of boot, or a crash or hang before one: the bootloader
+   goes back to the old image.**
 
 Every request is an admin REQ datagram (encrypted, MAC'd), so only an admin
 can run a session. The signature means an admin password alone cannot install
@@ -50,7 +54,9 @@ Notes:
   inside US 902–928 and clear of the MeshCore and Meshtastic presets).
 - `--slow` stays on the mesh settings and works across hops, but takes about
   80 min of the shared channel for an ESP32 image.
-- `status` and `confirm` subcommands send `ota status` and `ota confirm`.
+- `status` sends `ota status`. `confirm [--wait 70]` keeps sending CONFIRM, which is how you
+  confirm a first LoRa-OTA build installed by WiFi OTA (no password needed: it uses the
+  earlier login).
 
 Repeater CLI (admin): `ota status`, `ota confirm`, `ota rollback` (only while
 pending).
@@ -58,8 +64,9 @@ pending).
 ## The first LoRa-OTA image
 
 A node gets its first LoRa-OTA build some other way: USB, or WiFi OTA
-(`start ota`). After a WiFi OTA that image also boots unconfirmed. Send
-`ota confirm` over LoRa within 15 min or it rolls back.
+(`start ota`). After a WiFi OTA that image also boots unconfirmed: run
+`lora_ota.py confirm` as the upload finishes. It must land within 60 s of boot
+or the image rolls back.
 
 ## Test
 
@@ -72,5 +79,6 @@ This builds `src/helpers/LoraOTA.cpp` for the host behind a pipe that loses
 packets, with a RAM flash that behaves like NOR. It then runs the real sender
 through: clean transfer, 20% loss, a bad flash write, a foreign key, the wrong
 board, no marker, an unconfirmed running image, too big, an image altered
-after signing, and resume after a dropped link. It needs `.pio/libdeps` (build
+after signing, resume after a dropped link, and the confirm timing (only an
+answer from the rebooted image counts). It needs `.pio/libdeps` (build
 any env once) for the rweather Crypto sources.
