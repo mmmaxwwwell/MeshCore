@@ -24,6 +24,11 @@
 //    hardware watchdog (started by the install, survives soft resets) catches
 //    one that hangs. NOT covered: an image that dies before the OTA service
 //    starts on every boot (no bootloader help to fall back on).
+//  * A delta update (LoraOTADelta.h) reads the running image straight from
+//    the app region and stages its patch next to the new image: LittleFS, a
+//    third file; raw slots, the backup slot (only rewritten by install(),
+//    which runs after the patch is decoded, and never read before that: a
+//    rollback needs a pending image, and BEGIN is refused while one is).
 
 #include "LoraOTAService.h"
 
@@ -65,6 +70,10 @@ struct OtaState {
 #include "LoraOTALfs.h"
 
 static ImageMap new_map, old_map;   // in RAM: the install routine reads them with flash off
+
+#ifndef LORA_OTA_PATCH_EXTENTS
+  #define LORA_OTA_PATCH_EXTENTS 64     // LittleFS: a patch up to ~250 KB; bigger: send the whole image
+#endif
 
 static uint32_t runningImageSize() {
   return ((uint32_t)&__etext - APP_START) + ((uint32_t)&__data_end__ - (uint32_t)&__data_start__);
@@ -210,12 +219,15 @@ static void installNow(const ImageMap* first, const ImageMap* fallback) {
 #define OLD_PATH   "/ota-old.bin"
 #define STATE_PATH "/ota-state"
 #define SESS_PATH  "/ota-session"   // a LONG session's record (lora_ota::Receiver)
+#define PATCH_PATH "/ota-patch.bin"
+
+static ExtentMap<LORA_OTA_PATCH_EXTENTS> patch_map;
 
 // ---------------------------------------------------------------- littlefs helpers
 
 static lfs_t* lfs() { return QSPIFlash._getFS(); }
 
-static bool mapFile(const char* path, uint32_t size, ImageMap& m) { return lfsMapFile(lfs(), path, size, m); }
+template <typename M> static bool mapFile(const char* path, uint32_t size, M& m) { return lfsMapFile(lfs(), path, size, m); }
 static bool writeFile(const char* path, const uint8_t* src, uint32_t size, bool fill_ff) {
   return lfsWriteFile(lfs(), path, src, size, fill_ff);
 }
@@ -283,8 +295,8 @@ public:
     QSPIFlash._unlockFS();
     return ok;
   }
-  bool write(size_t off, const uint8_t* src, size_t len) override { return rawIO(off, (uint8_t*)src, len, true); }
-  bool read(size_t off, uint8_t* dest, size_t len) override { return rawIO(off, dest, len, false); }
+  bool write(size_t off, const uint8_t* src, size_t len) override { return mapIO(new_map, off, (uint8_t*)src, len, true); }
+  bool read(size_t off, uint8_t* dest, size_t len) override { return mapIO(new_map, off, dest, len, false); }
   bool activate(size_t len) override { return len == new_map.size; }   // install() does the rest
 
   // LONG sessions: the staged file keeps its chunks across a reboot; the record is a file too
@@ -338,7 +350,6 @@ public:
     QSPIFlash._unlockFS();
   }
 
-private:
   // QSPI DMA takes word-aligned RAM buffers, word-aligned flash addresses and
   // whole words; a chunk sits anywhere in a packet. So everything goes through
   // an aligned bounce buffer, padded with 0xFF (programming 0xFF over erased
@@ -363,12 +374,13 @@ private:
     return true;
   }
 
-  bool rawIO(size_t off, uint8_t* buf, size_t len, bool write) {
+  template <typename M>
+  static bool mapIO(const M& m, size_t off, uint8_t* buf, size_t len, bool write) {
     QSPIFlash._lockFS();
     bool ok = true;
     uint32_t pos = 0;   // image offset at the start of extent e
-    for (uint16_t e = 0; e < new_map.n && len && ok; e++) {
-      const Extent& x = new_map.ext[e];
+    for (uint16_t e = 0; e < m.n && len && ok; e++) {
+      const Extent& x = m.ext[e];
       if (off < pos + x.len) {
         uint32_t in = off - pos, n = x.len - in < len ? x.len - in : len;
         ok = qspiIO(x.addr + in, buf, n, write);
@@ -382,6 +394,35 @@ private:
 };
 
 typedef QspiFileFlash StageFlash;
+
+// patch staging for a delta: a third file, mapped like the new image
+static lora_ota::Status patchPrepare(size_t new_size, size_t patch_size) {
+  QSPIFlash._lockFS();
+  bool ok = writeFile(PATCH_PATH, NULL, patch_size, true) && mapFile(PATCH_PATH, patch_size, patch_map);
+  if (!ok) {
+    lfs_remove(lfs(), PATCH_PATH);
+    patch_map.n = 0;
+  }
+  QSPIFlash._unlockFS();
+  LORA_OTA_LOG("ota: patch file %lu bytes %s, %u extents", (unsigned long)patch_size, ok ? "ok" : "FAILED", patch_map.n);
+  return ok ? lora_ota::OK : lora_ota::TOO_BIG;   // no room (or too fragmented): the sender sends it whole
+}
+static bool patchReattach(size_t patch_size) {   // a LONG delta session after a reboot
+  QSPIFlash._lockFS();
+  bool ok = fileSize(PATCH_PATH) == patch_size && mapFile(PATCH_PATH, patch_size, patch_map);
+  QSPIFlash._unlockFS();
+  return ok;
+}
+static bool patchIO(size_t off, uint8_t* buf, size_t len, bool write) {
+  return off + len <= patch_map.size && QspiFileFlash::mapIO(patch_map, off, buf, len, write);
+}
+static void patchDone() {
+  QSPIFlash._lockFS();
+  lfs_remove(lfs(), PATCH_PATH);
+  QSPIFlash._unlockFS();
+  patch_map.n = 0;
+  patch_map.size = 0;
+}
 
 #else   // raw slots
 
@@ -615,17 +656,67 @@ public:
 };
 typedef QspiRawFlash StageFlash;
 
+// patch staging for a delta: the backup slot (see the header comment)
+static uint32_t raw_patch_size = 0;
+static lora_ota::Status patchPrepare(size_t new_size, size_t patch_size) {
+  if (patch_size > LORA_OTA_RAW_SLOT) return lora_ota::TOO_BIG;
+  raw_patch_size = 0;
+  if (!rawErase(RAW_OLD, patch_size)) return lora_ota::FLASH_ERROR;
+  raw_patch_size = patch_size;
+  return lora_ota::OK;
+}
+static bool patchReattach(size_t patch_size) {   // a LONG delta session after a reboot
+  if (patch_size > LORA_OTA_RAW_SLOT) return false;
+  raw_patch_size = patch_size;
+  return true;
+}
+static bool patchIO(size_t off, uint8_t* buf, size_t len, bool write) {
+  return off + len <= raw_patch_size && rawIO(RAW_OLD + off, buf, len, write);
+}
+static void patchDone() { raw_patch_size = 0; }
+
 #endif   // QSPIFLASH
+
+// ---------------------------------------------------------------- delta store
+
+static void runningImageSha(uint8_t sha[32]) {
+  SHA256 h;
+  h.update((const void*)APP_START, runningImageSize());
+  h.finalize(sha, 32);
+}
+
+class Nrf52DeltaStore : public lora_ota::DeltaStore {
+public:
+  bool baseSha8(uint8_t out[8]) override {
+    uint8_t sha[32];
+    runningImageSha(sha);
+    memcpy(out, sha, 8);
+    return true;
+  }
+  size_t baseSize() override { return runningImageSize(); }
+  bool readBase(size_t off, uint8_t* dest, size_t len) override {   // internal flash is memory mapped
+    if (off + len > runningImageSize()) return false;
+    memcpy(dest, (const uint8_t*)APP_START + off, len);
+    return true;
+  }
+  lora_ota::Status patchPrepare(size_t new_size, size_t patch_size) override { return ::patchPrepare(new_size, patch_size); }
+  bool patchReattach(size_t new_size, size_t patch_size) override { return ::patchReattach(patch_size); }
+  bool patchWrite(size_t off, const uint8_t* src, size_t len) override { return patchIO(off, (uint8_t*)src, len, true); }
+  bool patchRead(size_t off, uint8_t* dest, size_t len) override { return patchIO(off, dest, len, false); }
+  void patchDone() override { ::patchDone(); }
+};
 
 // ---------------------------------------------------------------- platform
 
 class Nrf52OtaPlatform : public LoraOTAPlatform {
   StageFlash _flash;
+  Nrf52DeltaStore _delta;
   OtaState _st;
   char _desc[64];
 
 public:
   lora_ota::Flash* flash() override { return storeReady() ? &_flash : NULL; }
+  lora_ota::DeltaStore* deltaStore() override { return storeReady() ? &_delta : NULL; }
 
   bool begin() override {
     if (!storeReady()) return false;
@@ -686,9 +777,7 @@ public:
   }
 
   bool runningSha(uint8_t sha[32]) override {
-    SHA256 h;
-    h.update((const void*)APP_START, runningImageSize());
-    h.finalize(sha, 32);
+    runningImageSha(sha);
     return true;
   }
 

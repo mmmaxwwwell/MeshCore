@@ -20,7 +20,10 @@ void LoraOTAService::begin(LoraOTARadio& radio) {
   _pending = _platform->begin();
   LORA_OTA_LOG("ota: begin pending=%d", (int)_pending);
   if (_pending) _confirm_by = millis() + LORA_OTA_CONFIRM_SECS * 1000UL;
-  if (_platform->flash()) _rx = new lora_ota::Receiver(*_platform->flash(), pubkey, LORA_OTA_BOARD);
+  if (_platform->flash()) {
+    _rx = new lora_ota::Receiver(*_platform->flash(), pubkey, LORA_OTA_BOARD);
+    _rx->setDelta(_platform->deltaStore());
+  }
 }
 
 void LoraOTAService::beginSettings(lora_ota_settings::Target& target) {

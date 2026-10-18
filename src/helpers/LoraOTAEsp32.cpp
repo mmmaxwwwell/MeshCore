@@ -62,11 +62,64 @@ public:
   size_t sessSize() override { return _part ? SESS_SECTOR : 0; }
 };
 
+// delta updates: the base is the running partition; the patch is staged at
+// the end of the spare partition (below the LONG session sector), past the
+// 64 KB blocks the new image erases
+class EspDeltaStore : public lora_ota::DeltaStore {
+  const esp_partition_t* _part;
+  size_t _off, _len;
+public:
+  EspDeltaStore() : _off(0), _len(0) { _part = esp_ota_get_next_update_partition(NULL); }
+  bool baseSha8(uint8_t out[8]) override {
+    uint8_t sha[32];   // the same value CONFIRM reports (runningSha)
+    if (esp_partition_get_sha256(esp_ota_get_running_partition(), sha) != ESP_OK) return false;
+    memcpy(out, sha, 8);
+    return true;
+  }
+  size_t baseSize() override { return esp_ota_get_running_partition()->size; }
+  bool readBase(size_t off, uint8_t* dest, size_t len) override {
+    return esp_partition_read(esp_ota_get_running_partition(), off, dest, len) == ESP_OK;
+  }
+  // the patch sits right below the session sector, after the 64 KB blocks the image erases
+  size_t patchEnd() const { return _part && _part->size > SESS_SECTOR ? _part->size - SESS_SECTOR : 0; }
+  bool place(size_t new_size, size_t patch_size) {
+    _len = 0;
+    size_t end = patchEnd();
+    if (!_part || patch_size > end) return false;
+    size_t off = (end - patch_size) & ~(size_t)0xFFF;
+    if (off < ((new_size + 0xFFFF) & ~(size_t)0xFFFF)) return false;   // EspOtaFlash::erase's blocks
+    _off = off;
+    _len = patch_size;
+    return true;
+  }
+  lora_ota::Status patchPrepare(size_t new_size, size_t patch_size) override {
+    if (!place(new_size, patch_size)) return lora_ota::TOO_BIG;
+    size_t end = patchEnd();
+    for (size_t a = _off; a < end; ) {
+      size_t n = (a % 0x10000 == 0 && end - a >= 0x10000) ? 0x10000 : 0x1000;
+      if (esp_partition_erase_range(_part, a, n) != ESP_OK) { _len = 0; return lora_ota::FLASH_ERROR; }
+      a += n;
+      delay(1);
+    }
+    return lora_ota::OK;
+  }
+  // a LONG delta session after a reboot: same sizes = same place, nothing erased
+  bool patchReattach(size_t new_size, size_t patch_size) override { return place(new_size, patch_size); }
+  bool patchWrite(size_t off, const uint8_t* src, size_t len) override {
+    return off + len <= _len && esp_partition_write(_part, _off + off, src, len) == ESP_OK;
+  }
+  bool patchRead(size_t off, uint8_t* dest, size_t len) override {
+    return off + len <= _len && esp_partition_read(_part, _off + off, dest, len) == ESP_OK;
+  }
+};
+
 class Esp32OtaPlatform : public LoraOTAPlatform {
   EspOtaFlash _flash;
+  EspDeltaStore _delta;
   char _desc[24];
 public:
   lora_ota::Flash* flash() override { return &_flash; }
+  lora_ota::DeltaStore* deltaStore() override { return &_delta; }
   bool begin() override {
     esp_ota_img_states_t st;
     return esp_ota_get_state_partition(esp_ota_get_running_partition(), &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY;

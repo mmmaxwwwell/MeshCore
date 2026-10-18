@@ -32,9 +32,13 @@
 #define LORA_OTA_SAVE_CHUNKS    16                     // LONG: persist the bitmap every this many new chunks
 #define LORA_OTA_SAVE_MS        (5 * 60 * 1000UL)      // ... or this long after the first unsaved one
 
-// BEGIN flags (payload offset 101, after the chunk byte); the reply echoes the accepted ones
+// BEGIN flags (payload offset 101, after the chunk byte); the reply echoes the accepted ones.
+// Both may be set.
+#define LORA_OTA_FLAG_DELTA     0x01   // DATA carries a patch against the running image (LoraOTADelta.h);
+                                       // the BEGIN continues: base sha256[0:8] @102 (what CONFIRM reports
+                                       // for the running image), patch size u32 @110
 #define LORA_OTA_FLAG_LONG      0x02   // slow transfer over the mesh: long idle timeout, persisted bitmap
-                                       // (0x01 is reserved: delta images)
+#define LORA_OTA_BEGIN_DELTA_LEN 114
 #define LORA_OTA_BOARD_LEN      32
 
 // Every LoRa-OTA-capable image carries this string; FINISH refuses an image
@@ -57,7 +61,11 @@ enum Status : uint8_t {
   PENDING_VERIFY = 10,
   BAD_ARG = 11,
   WORKING = 12,   // BEGIN/FINISH accepted, the work runs from poll(): ask again
+  BASE_MISMATCH = 13,   // a delta BEGIN names a base that is not the running image
 };
+
+class DeltaStore;
+class DeltaDecoder;
 
 class Flash {
 public:
@@ -120,8 +128,16 @@ class Receiver {
   bool _save_fresh;        // LONG: the persisted record must be (re)started
   uint16_t _unsaved;       // LONG: chunks received since the last save
   uint32_t _unsaved_since;
+  // delta: DATA carries _xfer bytes of patch (else _xfer == _size, the image itself)
+  DeltaStore* _dstore;
+  DeltaDecoder* _dec;
+  bool _decoded;
+  uint8_t _decoding;   // 0 no, 1 to start, 2 running
+  uint8_t _base8[8];
+  uint32_t _xfer;
 
   bool isLong() const { return _flags & LORA_OTA_FLAG_LONG; }
+  bool isDelta() const { return _flags & LORA_OTA_FLAG_DELTA; }
   bool restoreSession();
   void saveSession(bool fresh);
 
@@ -132,6 +148,9 @@ class Receiver {
   int status(const uint8_t* p, size_t len, uint8_t* reply, uint32_t now_ms);
   int finish(const uint8_t* p, size_t len, uint8_t* reply);
   Status verifyImage();
+  Status prepare();
+  Status restage();
+  Status decodeStep();
 
 public:
   Receiver(Flash& flash, const uint8_t pubkey[32], const char* board);
@@ -144,6 +163,8 @@ public:
 
   void loop(uint32_t now_ms);           // drops a session idle for LORA_OTA_IDLE_MS (LONG: _LONG_IDLE_MS); LONG saves
   void poll(uint32_t now_ms);           // the heavy part of BEGIN/FINISH; call from the main loop
+  // delta updates: base image + patch staging (NULL = full images only)
+  void setDelta(DeltaStore* store);
   void reset() { _state = IDLE; _size = 0; }   // e.g. the install of an activated image failed
   bool working() const { return _state == PREPARING || _state == VERIFYING; }
   bool receiving() const { return _state == RECEIVING || working(); }
