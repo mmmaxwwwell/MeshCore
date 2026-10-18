@@ -78,7 +78,7 @@ enum Key : uint8_t {
   K_REGIONS,             // comma list of region names (or *) to exist with flood allowed  repeater
   // our own companion features: on the whitelist ONLY in builds that have them
   K_POSREPORT_INTERVAL,  // minutes 0-1440, 0 = off            POSITION_REPORT builds
-  K_OVERLAY,             // "off" only: turning it on needs the region name (the overlay's key), never in a bundle  OVERLAY_MESH builds
+  K_OVERLAY,             // "off" | "on #<name> <0|1>" (as #ovlset; the name is the overlay's secret)  OVERLAY_MESH builds
   K_COUNT
 };
 #define LORA_OTA_SET_RADIO_KEYS ((1u << K_RADIO) | (1u << K_TX) | (1u << K_RXGAIN))
@@ -105,7 +105,8 @@ struct Values {
   uint8_t advert_interval_min, flood_advert_interval_h;
   uint8_t loop_detect, repeat;
   uint16_t posreport_min;
-  uint8_t overlay;           // 1 = on (some region name configured), 0 = off. The name is never here
+  uint8_t overlay;           // 1 = on (some region name configured), 0 = off. The NAME is never in
+                             // Values: Values go into the state file, and the name is a secret
 };
 
 // persisted by the app (a small file): replay counter + probation record.
@@ -141,7 +142,7 @@ public:
   // a bundle turns it off, put it back on a revert, delete the copy once the bundle is
   // confirmed or reverted (the region name is the overlay's key: no stray copies)
   virtual bool overlaySnapshot() { return false; }
-  virtual bool overlayOff() { return false; }       // as "#ovlset off" (its repeat-off comes as K_REPEAT)
+  virtual bool overlayApply(const char* name) { (void)name; return false; }   // "#..." = on with that name, "" = off
   virtual bool overlayRestore() { return false; }
   virtual void dropSnapshots(uint32_t mask) { (void)mask; }
   // reboot now (prefs are saved). Called only after a confirmed bundle that asked for it
@@ -157,6 +158,10 @@ int formatMilli(char* out, uint32_t milli);
 
 // parse and check one entry into v (range checks here; role checks by the caller)
 Status parseEntry(int key, const char* val, size_t vlen, Values& v, int8_t max_tx);
+
+// "off" | "on #<name> <0|1>" -> on, name (NUL-terminated, < 32 bytes), repeat
+#define LORA_OTA_SET_OVERLAY_NAME 32
+bool parseOverlay(const char* s, size_t n, bool& on, char name[LORA_OTA_SET_OVERLAY_NAME], bool& rep);
 
 // over-LoRa CLI commands that change a whitelisted setting without a
 // signature (blocked when built with LORA_OTA_SETTINGS_SIGNED_ONLY)
@@ -184,6 +189,7 @@ class Settings {
   uint32_t _reboot_at;
 
   uint8_t verifyAndApply(uint32_t now_ms, bool fw_pending);
+  uint8_t verifyAndApplyInner(uint32_t now_ms, bool fw_pending);
   void revert(const char* why);
   int ctrl(const uint8_t* p, size_t len, uint8_t* reply, uint32_t now_ms);
   int statusReply(uint8_t* reply, uint8_t status, uint8_t was, uint32_t now_ms);

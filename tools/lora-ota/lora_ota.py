@@ -124,6 +124,23 @@ def bundle_body(version: int, target, entries) -> bytes:
     return out
 
 
+def valid_overlay(v):
+    if v == "off":
+        return True
+    p = v.split(" ")
+    return (len(p) == 3 and p[0] == "on" and p[1].startswith("#") and 2 <= len(p[1]) < 32 and
+            all(33 <= ord(c) <= 126 for c in p[1]) and p[2] in ("0", "1"))
+
+
+def shown(k, v):
+    """a value as printed: the overlay name is the overlay's secret, so only its first characters show"""
+    if k == "overlay":
+        p = str(v).split(" ")
+        if len(p) == 3 and p[0] == "on":
+            return f"on {p[1][:4]}… {p[2]}"
+    return v
+
+
 def check_entries(entries):
     """the sender's whitelist check (the node checks everything again)"""
     seen = set()
@@ -132,9 +149,9 @@ def check_entries(entries):
             raise OtaError("reboot is not a setting: use --reboot")
         if k not in SETTINGS_KEYS:
             raise OtaError(f"{k!r} is not a setting this can change (whitelist: {', '.join(SETTINGS_KEYS)})")
-        if k == "overlay" and v != "off":
-            raise OtaError("overlay: only 'off' (turning it on needs the region name, which is the overlay's key: "
-                           "use '#ovlset on' or the app)")
+        if k == "overlay" and not valid_overlay(v):
+            raise OtaError("overlay: 'off' or 'on #<name> <0|1>' (as #ovlset; name: '#' + up to 30 printable "
+                           "characters, no spaces; the last field is client repeat)")
         if k in seen:
             raise OtaError(f"{k} given twice")
         seen.add(k)
@@ -200,6 +217,9 @@ def diff_entries(current: dict, wanted):
     changed = []
     for k, v in wanted:
         cur = current.get(k)
+        if k == "overlay" and v != "off":   # the node never reports the name: "on" may be another group
+            changed.append((k, v))
+            continue
         if cur is None or str(cur).startswith("?") or norm_value(k, cur) != norm_value(k, v):
             changed.append((k, v))
     return changed
@@ -1120,12 +1140,17 @@ def parse_sets(sets):
 
 def write_bundle(a, entries, target, version):
     blob = make_bundle(entries, target, version, load_key(a.key), reboot=a.reboot)
-    with open(a.output, "wb") as f:
+    # 0600: a bundle with overlay=on carries the overlay name, a secret (any bundle, to keep it simple)
+    fd = os.open(a.output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)   # an existing file keeps its mode through O_CREAT
+    with os.fdopen(fd, "wb") as f:
         f.write(blob)
     print(f"{a.output}: v{version} for {target_text(target)}, {len(blob)} bytes" +
           (f", node reboots ~{SET_REBOOT_SECS} s after the CONFIRM" if a.reboot else ""))
     for k, v in entries:
-        print(f"  {k} = {v}")
+        print(f"  {k} = {shown(k, v)}")
+    if any(k == "overlay" and v != "off" for k, v in entries):
+        print("  this bundle contains the overlay's secret name: keep the file like a key")
     print(f"  over the mesh: {describe_settings_eta(len(blob))}")
     return blob
 
@@ -1147,7 +1172,7 @@ async def cmd_settings_diff(a):
     changed = diff_entries(cur, wanted)
     print(f"{ct['adv_name']}:")
     for k, v in wanted:
-        print(f"  {k}: {cur.get(k, '?')}" + (f" -> {v}" if (k, v) in changed else " (unchanged)"))
+        print(f"  {k}: {cur.get(k, '?')}" + (f" -> {shown(k, v)}" if (k, v) in changed else " (unchanged)"))
     if not changed:
         print("nothing to change: no bundle written")
         return
@@ -1227,7 +1252,7 @@ async def cmd_settings_push(a):
             if k == SET_REBOOT_KEY:
                 print(f"  (reboot ~{SET_REBOOT_SECS} s after the CONFIRM)")
             else:
-                print(f"  {k}: {cur.get(k, '?')} -> {v}")
+                print(f"  {k}: {cur.get(k, '?')} -> {shown(k, v)}")
         st = set_status(await link.request(bytes([REQ_SET_CTRL, SET_OP_STATUS]), True, 8.0))
         if st is None:
             raise OtaError(f"{ct['adv_name']} does not answer signed-settings requests (no such firmware, or "

@@ -96,7 +96,7 @@ public:
     return true;
   }
   bool overlaySnapshot() override { ovl_snap = ovl_saved; ovl_snap_exists = true; return true; }
-  bool overlayOff() override { ovl = ovl_saved = ""; return true; }
+  bool overlayApply(const char* name) override { ovl = ovl_saved = name; return true; }
   bool overlayRestore() override {
     if (!ovl_snap_exists) return false;
     ovl = ovl_saved = ovl_snap;

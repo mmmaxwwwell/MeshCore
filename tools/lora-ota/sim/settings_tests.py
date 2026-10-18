@@ -398,13 +398,39 @@ def run_feature_tests(check, tmp, crypto, sim, key, pub, bundle, push, refused, 
     check("settings: overlay off confirmed: off for good, no copy of the region name left on the node",
           ok and d["overlay"] == "" and d["repeat"] == 0 and d["overlay_snapshot"] == 0, f"{err}; {d}")
     n.close()
-    ok_, why = refused_on(feat, pub, bundle([("overlay", "on")], check_keys=False), "out of range", push, role="companion")
-    try:
-        L.make_bundle([("overlay", "on")], (1, SELF[:8]), 1, key)
-        sender_ok = False
-    except L.OtaError:
-        sender_ok = True
-    check("settings: overlay=on refused (it would need the region name: key material)", ok_ and sender_ok, why)
+    # 17b. overlay on: as "#ovlset on #<name> <r>" (owner, 2026-10-18: the name travels in the
+    # signed bundle, inside the REQ's end-to-end encryption; the bundle file is kept like a key)
+    n = Node(feat, pub, role="companion", extra=("--client-repeat",))
+    ok, err = push(n, bundle([("overlay", "on #newgrp 0")]), confirm=False)
+    mid = n.dump()
+    in_state = n.control(7, bytes([len(b"newgrp")]) + b"newgrp") == b"1"
+    n.tick(L.SET_CONFIRM_SECS + 2)
+    d = n.dump()
+    check("settings: overlay on #name 0 applies (repeat set from it) and reverts without a CONFIRM",
+          mid["overlay"] == "#newgrp" and mid["repeat"] == 0 and mid["overlay_snapshot"] == 1 and
+          d["overlay"] == "#ourgroup" and d["repeat"] == 1 and d["overlay_snapshot"] == 0 and not d["pending"],
+          f"{err}; {mid}; {d}")
+    check("settings: a bundle's overlay name never goes into the state file", not in_state)
+    ok, err = push(n, bundle([("overlay", "on #newgrp 0")]))
+    d = n.dump()
+    check("settings: overlay on confirmed: new name kept, snapshot deleted",
+          ok and d["overlay"] == "#newgrp" and d["repeat"] == 0 and d["overlay_snapshot"] == 0, f"{err}; {d}")
+    n.close()
+    for bad in ("on", "on #newgrp", "on newgrp 0", "on # 0", "on #a b 0", "on #newgrp 2", "on #" + "x" * 31 + " 0", "On #g 0"):
+        ok_, why = refused_on(feat, pub, bundle([("overlay", bad)], check_keys=False), "out of range", push, role="companion")
+        try:
+            L.make_bundle([("overlay", bad)], (1, SELF[:8]), 1, key)
+            sender_ok = False
+        except L.OtaError:
+            sender_ok = True
+        check(f"settings: overlay={bad!r} refused by node and sender", ok_ and sender_ok, why)
+    check("settings: the sender never prints the overlay name in full",
+          "newgrp" not in str(L.shown("overlay", "on #newgrp 1")) and L.shown("posreport.interval", "5") == "5")
+    ok_, why = refused_on(feat, pub, bundle([("overlay", "on #newgrp 0"), ("repeat", "on")]), "out of range", push,
+                          role="companion", extra=("--client-repeat",))
+    check("settings: overlay on #name 0 + repeat on in one bundle refused (contradiction)", ok_, why)
+    ok_, why = refused_on(feat, pub, bundle([("overlay", "on #newgrp 1")]), "out of range", push, role="companion")
+    check("settings: overlay on #name 1 refused off the client-repeat bands (as CMD_SET_RADIO_PARAMS)", ok_, why)
     ok_, why = refused_on(feat, pub, bundle([("overlay", "off"), ("repeat", "on")]), "out of range", push,
                           role="companion", extra=("--client-repeat",))
     check("settings: overlay off + repeat on in one bundle refused (contradiction)", ok_, why)

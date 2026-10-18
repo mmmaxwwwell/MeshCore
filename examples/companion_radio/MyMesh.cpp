@@ -701,7 +701,7 @@ public:
 static LoraOTAService ota_service;
 
 // signed settings over LoRa (LoraOTASettings.h): a companion has the radio and tuning keys, client
-// repeat, and our own features where they are compiled in (position reports, overlay off)
+// repeat, and our own features where they are compiled in (position reports, overlay)
 #define OTA_SETTINGS_FILE "/ota_settings"
 #define OTA_SETTINGS_OVERLAY "/ota_set_overlay"   // the overlay config while a bundle that turned it off is on probation
 #ifdef OVERLAY_MESH
@@ -791,9 +791,11 @@ public:
     f.close();
     return ok;
   }
-  bool overlayOff() override {   // as "#ovlset off" (its repeat-off comes as K_REPEAT)
+  bool overlayApply(const char* name) override {   // as "#ovlset on #<name> <r>" / "#ovlset off"; repeat comes as K_REPEAT
+    if (strlen(name) >= sizeof(_m->_overlay.name) || (name[0] && name[0] != '#')) return false;
     memset(_m->_overlay.name, 0, sizeof(_m->_overlay.name));
-    memset(&_m->_overlay_key, 0, sizeof(_m->_overlay_key));
+    strcpy(_m->_overlay.name, name);
+    if (name[0]) overlayKeyFor(_m->_overlay.name, _m->_overlay_key); else memset(&_m->_overlay_key, 0, sizeof(_m->_overlay_key));
     _m->overlaySave();
     return true;
   }

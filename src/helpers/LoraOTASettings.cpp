@@ -229,14 +229,35 @@ Status parseEntry(int key, const char* s, size_t n, Values& v, int8_t max_tx) {
       if (!parseUint(s, n, LORA_OTA_SET_POSREPORT_MAX, u)) return BAD_VALUE;
       v.posreport_min = u;
       return (Status)lora_ota::OK;
-    case K_OVERLAY:
-      // only "off": "on" needs the overlay's region name, which is its key
-      // (SHA256 of the name), and no key material travels in a bundle
-      if (!is(s, n, "off")) return BAD_VALUE;
-      v.overlay = 0;
+    case K_OVERLAY: {   // the name is checked here and taken by the caller; Values only say on/off
+      bool on, rep;
+      char name[LORA_OTA_SET_OVERLAY_NAME];
+      if (!parseOverlay(s, n, on, name, rep)) return BAD_VALUE;
+      memset(name, 0, sizeof(name));
+      v.overlay = on;
       return (Status)lora_ota::OK;
+    }
   }
   return NOT_ALLOWED;
+}
+
+// As "#ovlset": "off", or "on #<name> <0|1>" (name: '#' then printable ASCII,
+// no spaces, shorter than the companion's 32-byte OverlayCfg name)
+bool parseOverlay(const char* s, size_t n, bool& on, char name[LORA_OTA_SET_OVERLAY_NAME], bool& rep) {
+  name[0] = 0;
+  if (is(s, n, "off")) { on = false; rep = false; return true; }
+  if (n < 3 + 2 + 2 || memcmp(s, "on ", 3) != 0) return false;
+  size_t start = 3, end = start;
+  while (end < n && s[end] != ' ') end++;
+  size_t len = end - start;
+  if (len < 2 || len >= LORA_OTA_SET_OVERLAY_NAME || s[start] != '#') return false;
+  for (size_t j = start; j < end; j++) if (s[j] <= ' ' || s[j] > '~') return false;
+  if (end + 2 != n || (s[end + 1] != '0' && s[end + 1] != '1')) return false;
+  memcpy(name, &s[start], len);
+  name[len] = 0;
+  on = true;
+  rep = s[end + 1] == '1';
+  return true;
 }
 
 // A command typed over LoRa (admin CLI, sender_timestamp != 0) that changes
@@ -333,14 +354,29 @@ bool Settings::revertNow() {
   return true;
 }
 
+// static: poll() runs on the 4 KB nRF52 loop stack
+static uint8_t s_msg[6 + LORA_OTA_SET_MAX_BUNDLE];
+static char s_overlay_name[LORA_OTA_SET_OVERLAY_NAME];
+
 uint8_t Settings::verifyAndApply(uint32_t now_ms, bool fw_pending) {
+  uint8_t r = verifyAndApplyInner(now_ms, fw_pending);
+  // a bundle may carry the overlay name (a secret): no copy of it stays in RAM. A
+  // repeated APPLY gets the stored result; a new upload starts at offset 0
+  memset(s_msg, 0, sizeof(s_msg));
+  memset(s_overlay_name, 0, sizeof(s_overlay_name));
+  memset(_buf, 0, sizeof(_buf));
+  _have = 0;
+  return r;
+}
+
+uint8_t Settings::verifyAndApplyInner(uint32_t now_ms, bool fw_pending) {
   if (_total < 64 + 8) return BAD_FORMAT;
   size_t blen = _total - 64;
   const uint8_t* body = _buf;
   const uint8_t* sig = &_buf[blen];
 
   // 1. the signature, over DOMAIN || body: before anything in the body is believed
-  static uint8_t msg[6 + LORA_OTA_SET_MAX_BUNDLE];
+  uint8_t* msg = s_msg;
   memcpy(msg, LORA_OTA_SET_DOMAIN, 6);
   memcpy(&msg[6], body, blen);
   if (!ed25519_verify(sig, msg, 6 + blen, _pubkey)) return lora_ota::BAD_SIGNATURE;
@@ -369,7 +405,7 @@ uint8_t Settings::verifyAndApply(uint32_t now_ms, bool fw_pending) {
   _t->read(cur);
   nv = cur;
   uint32_t mask = 0, supported = _t->supported() & compiledKeys();
-  bool reboot = false, reboot_seen = false;
+  bool reboot = false, reboot_seen = false, overlay_rep = false;
   static char regions[LORA_OTA_SET_MAX_BUNDLE];   // static: poll() runs on the 4 KB nRF52 loop stack
   regions[0] = 0;
   for (int e = 0; e < count; e++) {
@@ -393,15 +429,19 @@ uint8_t Settings::verifyAndApply(uint32_t now_ms, bool fw_pending) {
     uint8_t s = parseEntry(k, val, vlen, nv, _t->maxTxPower());
     if (s != lora_ota::OK) return s;
     if (k == K_REGIONS) { memcpy(regions, val, vlen); regions[vlen] = 0; }
+    if (k == K_OVERLAY) { bool on; parseOverlay(val, vlen, on, s_overlay_name, overlay_rep); }
     mask |= 1u << k;
   }
   if (i != blen) return BAD_FORMAT;
   if (mask == 0) return BAD_FORMAT;   // a reboot alone is not a bundle
   if (mask & (1u << K_OVERLAY)) {
-    // overlay off = "#ovlset off": client repeat goes off with it (and comes back on a revert)
+    // as "#ovlset": off takes client repeat off with it, "on #name <r>" sets it to r
+    // (and a revert brings the old value back). Here the band rule (acceptable) refuses
+    // the whole bundle where #ovlset would quietly leave repeat off.
     if (!(supported & (1u << K_REPEAT))) return NOT_SUPPORTED;
-    if ((mask & (1u << K_REPEAT)) && nv.repeat) return BAD_VALUE;   // contradicts itself
-    nv.repeat = 0;
+    uint8_t want = nv.overlay && overlay_rep ? 1 : 0;
+    if ((mask & (1u << K_REPEAT)) && nv.repeat != want) return BAD_VALUE;   // contradicts itself
+    nv.repeat = want;
     mask |= 1u << K_REPEAT;
   }
   if (!_t->acceptable(nv, mask)) return BAD_VALUE;
@@ -424,7 +464,7 @@ uint8_t Settings::verifyAndApply(uint32_t now_ms, bool fw_pending) {
   // 4. apply; the radio itself only after the OK reply has gone out
   bool ok = _t->write(nv, mask & ~((1u << K_REGIONS) | (1u << K_OVERLAY)));
   if (ok && (mask & (1u << K_REGIONS))) ok = _t->regionsApply(regions);
-  if (ok && (mask & (1u << K_OVERLAY))) ok = _t->overlayOff();
+  if (ok && (mask & (1u << K_OVERLAY))) ok = _t->overlayApply(nv.overlay ? s_overlay_name : "");
   if (!ok) {
     revert("apply failed");
     return STORE_ERROR;

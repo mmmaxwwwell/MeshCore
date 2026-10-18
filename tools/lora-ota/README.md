@@ -354,23 +354,34 @@ Source: `src/helpers/LoraOTASettings.{h,cpp}`. Every `*_lora_ota` build has it.
 | `repeat` | on/off. Companion: client repeat, as `CMD_SET_RADIO_PARAMS` sets it: on only on the client-repeat bands (`ALLOWED_REPEAT_FREQ_RANGE`) | both |
 | `regions` | `ct,northeast,east,*`: each region exists (under `*`) with flood allowed. Additive: nothing is removed or denied | repeater |
 | `posreport.interval` | minutes 0-1440, 0 = off. As `#locset <min>`: saved to `/posrep`, next report in 5 s | companion, `POSITION_REPORT` builds |
-| `overlay` | `off` only. As `#ovlset off`: the overlay name is cleared and **client repeat goes off with it** (the bundle's mask includes `repeat`, so a revert restores both) | companion, `OVERLAY_MESH` builds |
+| `overlay` | `off` or `on #<name> <0\|1>`, as `#ovlset`. `off` clears the name and **client repeat goes off with it**; `on` sets the name and client repeat to the last field (the bundle's mask includes `repeat`, so a revert restores both) | companion, `OVERLAY_MESH` builds |
 
 The two feature keys are on the whitelist **only in builds that compile the
 feature in**: elsewhere they are `not on the whitelist`, like any unknown key
 (and a repeater refuses them as `no such setting` in any build).
-`overlay=on` is refused on purpose: turning the overlay on needs its region
-name, and the name IS the overlay's key (the transport key is SHA-256 of
-it). No key material ever travels in a bundle, so the overlay is turned on
-only by `#ovlset on #<name> <repeat>` from the report destination, or the
-app. While an `overlay=off` bundle is on probation the node keeps a copy of
-its own overlay config in `/ota_set_overlay` to revert from; the copy is
-deleted as soon as the bundle is confirmed or reverted. A bundle with
-`overlay=off` and `repeat=on` contradicts itself and is refused.
+`overlay=on #<name> <r>` carries the overlay's region name, and **the name IS
+the overlay's key** (the transport key is SHA-256 of it). Owner decision
+(2026-10-18): allowed anyway, so a radio out in the field can be moved to a
+new overlay group without anyone touching it. What protects the name:
+- Over the air it travels only inside the REQ datagrams, which are encrypted
+  end to end with the sender/target shared secret (as `#ovlset` DMs are).
+- The bundle FILE is signed, not encrypted: `settings make` writes it 0600
+  and says so. Keep it like a key and delete it after the push.
+- The sender prints only the first characters of the name.
+- On the node the name goes only into the overlay config (as `#ovlset`):
+  never into the settings state file. The verify buffers are wiped after
+  every APPLY.
+
+While an overlay bundle is on probation the node keeps a copy of its own
+overlay config in `/ota_set_overlay` to revert from; the copy is deleted as
+soon as the bundle is confirmed or reverted. A bundle whose `repeat` entry
+disagrees with the overlay's (`off` = repeat off, `on ... r` = r) contradicts
+itself and is refused, and `on ... 1` off the client-repeat bands is refused
+like `CMD_SET_RADIO_PARAMS` would refuse it.
 
 Never on the list: passwords (admin, guest), the private key, the signing
 key, name, location, owner info, bridge settings, power saving, Wi-Fi, BLE
-PIN, contacts and telemetry policy, overlay region names, the position
+PIN, contacts and telemetry policy, the position
 report destination, and anything about OTA itself. A companion refuses
 repeater keys (`this node has no such setting`); with client repeat on
 (already, or from the same bundle), it also refuses a `radio` outside the
