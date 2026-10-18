@@ -2266,7 +2266,44 @@ void MyMesh::posReportTick() {
 }
 
 bool MyMesh::posReportDM(const ContactInfo& from, const char* text) {
-  if (memcmp(from.id.pub_key, _posrep.dest, 6) != 0 || strncmp(text, "#locset ", 8) != 0) return false;
+  if (memcmp(from.id.pub_key, _posrep.dest, 6) != 0) return false;
+#ifdef OVERLAY_MESH
+  // Overlay control from the same contact: "#ovlset off" | "#ovlset on #<name> <repeat 0|1>"
+  //   -> "#ovlack off" | "#ovlack on <repeat>" | "#ovlack err ...".
+  if (strncmp(text, "#ovlset ", 8) == 0) {
+    char buf[64];
+    StrHelper::strncpy(buf, text + 8, sizeof(buf));
+    char* op = strtok(buf, " ");
+    char* name = strtok(NULL, " ");
+    char* rep = strtok(NULL, " ");
+    char reply[48];
+    if (op && strcmp(op, "off") == 0) {
+      memset(_overlay.name, 0, sizeof(_overlay.name));
+      memset(&_overlay_key, 0, sizeof(_overlay_key));
+      overlaySave();
+      if (_prefs.isRepeatEn()) { _prefs.setRepeatEn(false); savePrefs(); }
+      strcpy(reply, "#ovlack off");
+    } else if (op && strcmp(op, "on") == 0 && name && name[0] == '#' && strlen(name) < sizeof(_overlay.name)
+               && rep && (rep[0] == '0' || rep[0] == '1') && rep[1] == 0) {
+      bool want_rep = rep[0] == '1';
+      bool rep_ok = !want_rep || isValidClientRepeatFreq((uint32_t)(_prefs.freq * 1000));
+      // Apply first, then answer: the ack travels scoped, so it also proves
+      // the overlay path back to the controller works.
+      memset(_overlay.name, 0, sizeof(_overlay.name));
+      strcpy(_overlay.name, name);
+      overlayKeyFor(_overlay.name, _overlay_key);
+      overlaySave();
+      if (rep_ok && _prefs.isRepeatEn() != want_rep) { _prefs.setRepeatEn(want_rep); savePrefs(); }
+      snprintf(reply, sizeof(reply), rep_ok ? "#ovlack on %d" : "#ovlack on %d norepeat", rep_ok ? (int)want_rep : 0);
+    } else {
+      strcpy(reply, "#ovlack err");
+    }
+    uint32_t ack, est;
+    sendMessage(from, getRTCClock()->getCurrentTimeUnique(), 0, reply, ack, est);
+    return true;
+  }
+#endif
+  if (strncmp(text, "#locset ", 8) != 0) return false;
   char* end;
   long m = strtol(text + 8, &end, 10);
   char reply[32];
