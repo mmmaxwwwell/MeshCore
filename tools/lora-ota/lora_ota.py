@@ -337,45 +337,54 @@ async def cmd_push(a):
                 raise OtaError("target runs an unconfirmed image: confirm it (or let it roll back) first")
         link = CompanionLink(mc, ct)
 
+        probe = bytes([REQ_STATUS]) + b"\0" * 6
+
+        async def answers():
+            return bool(await link.request(probe, True, 8.0) or await link.request(probe, True, 8.0))
+
+        async def go_fast():
+            nonlocal restore
+            if restore is None:
+                info = mc.self_info
+                tun = await mc.commands.get_tuning()
+                # set_radio without the repeat flag switches client repeat OFF (and saves it): keep it as it is
+                dq = await mc.commands.send_device_query()
+                repeat = 1 if (dq.payload or {}).get("repeat") else 0
+                restore = (info["radio_freq"], info["radio_bw"], info["radio_sf"], info["radio_cr"],
+                           tun.payload["rx_delay"], tun.payload["airtime_factor"], repeat)
+            await mc.commands.set_radio(*fast, repeat=0)   # never repeat on the transfer channel
+            await mc.commands.set_tuning(0, 0)   # no airtime budget wait between our packets
+            await mc.commands.change_contact_path(ct, "")   # zero-hop direct: no repeaters out here
+
         # does it speak LoRa OTA, and does it accept us? (a companion: only from a favourite)
-        r = await link.request(bytes([REQ_STATUS]) + b"\0" * 6, True, 8.0)
-        if not r:
-            r = await link.request(bytes([REQ_STATUS]) + b"\0" * 6, True, 8.0)
-        if not r:
-            raise OtaError(f"{ct['adv_name']} does not answer LoRa OTA requests: no OTA firmware, or "
-                           "(companion) this radio is not one of its favourites")
-        print(f"target {ct['adv_name']}: speaks LoRa OTA ({'repeater' if repeater else 'companion'})")
+        already_fast = False
+        if not await answers():
+            if fast:   # an interrupted run can leave it on the transfer channel for up to RADIO_IDLE_SECS
+                await go_fast()
+                already_fast = await answers()
+            if not already_fast:
+                raise OtaError(f"{ct['adv_name']} does not answer LoRa OTA requests: no OTA firmware, or "
+                               "(companion) this radio is not one of its favourites")
+        print(f"target {ct['adv_name']}: speaks LoRa OTA ({'repeater' if repeater else 'companion'})"
+              + (", still on the transfer channel" if already_fast else ""))
 
         if fast:
-            info = mc.self_info
-            tun = await mc.commands.get_tuning()
-            # set_radio without the repeat flag switches client repeat OFF (and saves it): keep it as it is
-            dq = await mc.commands.send_device_query()
-            repeat = 1 if (dq.payload or {}).get("repeat") else 0
             req = bytes([REQ_RADIO]) + struct.pack("<IIBBH", int(fast[0] * 1000), int(fast[1] * 1000),
                                                    fast[2], fast[3], RADIO_IDLE_SECS)
             r = await link.request(req, True, 8.0) or await link.request(req, True, 8.0)
             if not r or r[0] != OK:
                 raise OtaError(f"fast radio refused: {STATUS_NAMES.get(r[0], r[0]) if r else 'no reply'}")
-            restore = (info["radio_freq"], info["radio_bw"], info["radio_sf"], info["radio_cr"],
-                       tun.payload["rx_delay"], tun.payload["airtime_factor"], repeat)
-            await asyncio.sleep(2.5)   # the target switches 1.5 s after replying
-            await mc.commands.set_radio(*fast, repeat=0)   # never repeat on the transfer channel
-            await mc.commands.set_tuning(0, 0)   # no airtime budget wait between our packets
-            await mc.commands.change_contact_path(ct, "")   # zero-hop direct: no repeaters out here
-            print(f"moved to {fast[0]} MHz / {fast[1]} kHz / SF{fast[2]}; the target drops back "
+            if not already_fast:
+                await asyncio.sleep(2.5)   # the target switches 1.5 s after replying
+                await go_fast()
+            print(f"on {fast[0]} MHz / {fast[1]} kHz / SF{fast[2]}; the target drops back "
                   f"by itself after {RADIO_IDLE_SECS} s without OTA traffic")
 
         sender = OtaSender(link, image, m)
         t0 = time.monotonic()
-        try:
-            await sender.run()
-        except BaseException:
-            try:
-                await sender.abort()
-            except Exception:
-                pass
-            raise
+        # no ABORT on failure: the target drops a silent session after 5 min by itself,
+        # and until then a new push of the same image resumes it
+        await sender.run()
         rebooting = time.monotonic()
         print(f"transfer took {rebooting - t0:.0f} s")
         if restore:   # the new image boots on the node's own radio settings
