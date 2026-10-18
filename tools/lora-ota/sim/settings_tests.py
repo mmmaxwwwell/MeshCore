@@ -14,9 +14,10 @@ SELF = bytes(range(0x10, 0x30))   # the fake node's public key
 OLD_RADIO = (910.525, 62.5, 7, 5)
 
 
-def build(out, crypto):
+def build(out, crypto, defines=()):
     ed = os.path.join(REPO, "lib/ed25519")
     subprocess.check_call(["c++", "-O2", "-Wall", "-Wno-unused-function", "-ffast-math", "-DLORA_OTA_HOST_TEST",
+                           *[f"-D{d}" for d in defines],
                            "-I", os.path.join(REPO, "src/helpers"), "-I", ed, "-I", crypto,
                            os.path.join(HERE, "settings_sim.cpp"), os.path.join(REPO, "src/helpers/LoraOTASettings.cpp"),
                            *[os.path.join(crypto, f) for f in ("SHA256.cpp", "Hash.cpp", "Crypto.cpp")],
@@ -31,9 +32,9 @@ def radio_bytes(r):
 class Node:
     """settings_sim over a pipe: requests (only heard on the node's radio), plus a clock"""
 
-    def __init__(self, sim, pub, role="repeater", drop=0, seed=1):
+    def __init__(self, sim, pub, role="repeater", drop=0, seed=1, extra=()):
         self.p = subprocess.Popen([sim, "--pubkey", pub, "--board", BOARD, "--role", role, "--self", SELF.hex(),
-                                   "--drop", str(drop), "--seed", str(seed)],
+                                   "--drop", str(drop), "--seed", str(seed), *extra],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE)
 
     def _frame(self, data):
@@ -100,11 +101,11 @@ def run_settings_tests(check, tmp, crypto):
     node_t = (1, SELF[:8])
     v = [1000]
 
-    def bundle(entries, target=node_t, version=None, k=key, check_keys=True):
+    def bundle(entries, target=node_t, version=None, k=key, check_keys=True, reboot=False):
         if version is None:
             v[0] += 1
             version = v[0]
-        return L.make_bundle(entries, target, version, k, check=check_keys)
+        return L.make_bundle(entries, target, version, k, check=check_keys, reboot=reboot)
 
     def push(node, blob, radio=None, confirm=True):
         s = L.SettingsSender(node, blob, radio=radio, log=lambda *_: None, timeout=0, retries=8, sleep=node.sleep)
@@ -319,3 +320,205 @@ def run_settings_tests(check, tmp, crypto):
     out = subprocess.run([exe, *blocked, *free], capture_output=True, text=True).stdout
     check("settings: signed-only mode blocks exactly the whitelisted settings' commands",
           out == "1" * len(blocked) + "0" * len(free), out)
+
+    run_feature_tests(check, tmp, crypto, sim, key, pub, bundle, push, refused, v)
+
+
+def run_feature_tests(check, tmp, crypto, sim, key, pub, bundle, push, refused, v):
+    """our companion features (POSITION_REPORT, OVERLAY_MESH), client repeat, reboot-after-confirm, diff"""
+    feat = os.path.join(tmp, "settings_sim_feat")
+    build(feat, crypto, defines=("POSITION_REPORT", "OVERLAY_MESH"))
+
+    def ctrl(n, op):
+        return L.set_status(asyncio.run(n.request(bytes([L.REQ_SET_CTRL, op]), True, 0)))
+
+    def get_all(n):
+        text, start = "", 0
+        while start != 0xFF:
+            r = asyncio.run(n.request(bytes([L.REQ_SET_CTRL, L.SET_OP_GET, start]), True, 0))
+            text += r[2:].decode()
+            start = r[1]
+        return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+
+    # 15. feature keys: refused by a build without the features, on any role
+    for k, val in (("posreport.interval", "5"), ("overlay", "off")):
+        for role in ("companion", "repeater"):
+            ok_, why = refused(bundle([(k, val)]), "not on the whitelist", role=role)
+            check(f"settings: '{k}' refused by a {role} built without its feature", ok_, why)
+    n = Node(sim, pub, role="companion")
+    g = get_all(n)
+    check("settings: GET of a featureless companion lists no feature keys",
+          "posreport.interval" not in g and "overlay" not in g and g.get("repeat") == "off", str(g))
+    n.close()
+    # ... and a repeater built WITH them still refuses them (its role has no such setting)
+    ok_, why = refused(bundle([("posreport.interval", "5")]), "no such setting", node=Node(feat, pub))
+    check("settings: feature key refused by a repeater even in a feature build", ok_, why)
+
+    # 16. posreport.interval: applies as #locset, confirmed; and reverts without a CONFIRM
+    n = Node(feat, pub, role="companion")
+    g = get_all(n)
+    check("settings: feature build GET shows posreport.interval and overlay",
+          g.get("posreport.interval") == "0" and g.get("overlay") == "on", str(g))
+    ok, err = push(n, bundle([("posreport.interval", "15")]))
+    d = n.dump()
+    check("settings: posreport.interval applies and is confirmed", ok and d["posreport.interval"] == 15 and not d["pending"],
+          f"{err}; {d}")
+    ok, err = push(n, bundle([("posreport.interval", "1")]), confirm=False)
+    mid = n.dump()
+    n.tick(L.SET_CONFIRM_SECS + 2)
+    d = n.dump()
+    check("settings: posreport.interval reverts without a CONFIRM",
+          mid["posreport.interval"] == 1 and mid["pending"] and d["posreport.interval"] == 15 and not d["pending"],
+          f"{err}; {mid}; {d}")
+    for bad in ("1441", "-1", "2.5", "x"):
+        ok_, why = refused(bundle([("posreport.interval", bad)]), "out of range", node=n)
+        check(f"settings: posreport.interval={bad} refused", ok_, why)
+    n.close()
+
+    # 17. overlay off: as #ovlset off (repeat goes off with it), node-side snapshot, revert, confirm
+    n = Node(feat, pub, role="companion", extra=("--client-repeat",))
+    ok, err = push(n, bundle([("overlay", "off")]), confirm=False)
+    mid = n.dump()
+    in_state = n.control(7, bytes([len(b"ourgroup")]) + b"ourgroup") == b"1"
+    n.tick(L.SET_CONFIRM_SECS + 2)
+    d = n.dump()
+    check("settings: overlay off takes client repeat with it, both revert without a CONFIRM",
+          mid["overlay"] == "" and mid["repeat"] == 0 and mid["overlay_snapshot"] == 1 and
+          d["overlay"] == "#ourgroup" and d["repeat"] == 1 and d["overlay_snapshot"] == 0 and not d["pending"],
+          f"{err}; {mid}; {d}")
+    check("settings: the overlay name never goes into the state file (only the node's overlay snapshot)", not in_state)
+    push(n, bundle([("overlay", "off")]), confirm=False)
+    n.tick(5)
+    n.reboot()
+    d = n.dump()
+    check("settings: reboot before CONFIRM brings the overlay back", d["overlay"] == "#ourgroup" and d["repeat"] == 1 and
+          d["overlay_snapshot"] == 0, str(d))
+    ok, err = push(n, bundle([("overlay", "off")]))
+    d = n.dump()
+    check("settings: overlay off confirmed: off for good, no copy of the region name left on the node",
+          ok and d["overlay"] == "" and d["repeat"] == 0 and d["overlay_snapshot"] == 0, f"{err}; {d}")
+    n.close()
+    ok_, why = refused_on(feat, pub, bundle([("overlay", "on")], check_keys=False), "out of range", push, role="companion")
+    try:
+        L.make_bundle([("overlay", "on")], (1, SELF[:8]), 1, key)
+        sender_ok = False
+    except L.OtaError:
+        sender_ok = True
+    check("settings: overlay=on refused (it would need the region name: key material)", ok_ and sender_ok, why)
+    ok_, why = refused_on(feat, pub, bundle([("overlay", "off"), ("repeat", "on")]), "out of range", push,
+                          role="companion", extra=("--client-repeat",))
+    check("settings: overlay off + repeat on in one bundle refused (contradiction)", ok_, why)
+
+    # 18. client repeat on a companion: the allowed-band rule of CMD_SET_RADIO_PARAMS
+    ok_, why = refused(bundle([("repeat", "on")]), "out of range", role="companion")
+    check("settings: repeat on refused off the allowed bands (910.525)", ok_, why)
+    n = Node(sim, pub, role="companion", extra=("--client-repeat",))
+    ok_, why = refused(bundle([("radio", "910.525,62.5,7,5")]), "out of range", node=n)
+    check("settings: a repeating companion cannot move off the allowed bands", ok_, why)
+    ok, err = push(n, bundle([("repeat", "off")]))
+    d = n.dump()
+    check("settings: repeat off on a companion applies", ok and d["repeat"] == 0, f"{err}; {d}")
+    ok, err = push(n, bundle([("repeat", "on")]), confirm=False)
+    mid = n.dump()
+    n.tick(L.SET_CONFIRM_SECS + 2)
+    d = n.dump()
+    check("settings: repeat on (918 MHz) applies, reverts without a CONFIRM",
+          mid["repeat"] == 1 and d["repeat"] == 0 and not d["pending"], f"{err}; {mid}; {d}")
+    n.close()
+
+    # 19. reboot: once, only after the CONFIRM; never when the bundle reverts
+    n = Node(feat, pub, role="companion")
+    ok, err = push(n, bundle([("posreport.interval", "30")], reboot=True))
+    right_after = n.dump()
+    st = ctrl(n, L.SET_OP_STATUS)
+    n.tick(L.SET_REBOOT_SECS - 1)
+    before = n.dump()
+    n.tick(2)
+    d = n.dump()
+    n.tick(30)
+    later = n.dump()
+    check("settings: reboot=1 reboots once, ~6 s after the CONFIRM; prefs survive",
+          ok and right_after["reboots"] == 0 and right_after["reboot_due"] == 1 and st["reboot_due"] and
+          before["reboots"] == 0 and d["reboots"] == 1 and later["reboots"] == 1 and
+          later["posreport.interval"] == 30 and later["version"] == v[0] and not later["pending"],
+          f"{err}; {right_after}; {before}; {d}; {later}")
+    ok, err = push(n, bundle([("posreport.interval", "45")], reboot=True), confirm=False)
+    st = ctrl(n, L.SET_OP_STATUS)
+    n.tick(L.SET_CONFIRM_SECS + 30)
+    d = n.dump()
+    check("settings: reboot=1 without a CONFIRM: reverts, no reboot",
+          st["reboot_asked"] and not st["reboot_due"] and d["reboots"] == 1 and d["posreport.interval"] == 30 and
+          not d["pending"] and not d["reboot_due"], f"{err}; {st}; {d}")
+    push(n, bundle([("posreport.interval", "45")], reboot=True), confirm=False)
+    st = ctrl(n, L.SET_OP_REVERT)
+    n.tick(30)
+    d = n.dump()
+    check("settings: reboot=1 then REVERT: no reboot", st["was"] and d["reboots"] == 1 and d["posreport.interval"] == 30,
+          f"{st}; {d}")
+    n.close()
+    # a radio change + reboot: CONFIRM only once the node is on the new radio; the reboot keeps it
+    n = Node(feat, pub, role="companion")
+    radio = SimRadio(n)
+    ok, err = push(n, bundle([("radio", "910.525,250,11,5")], reboot=True), radio=radio)
+    n.tick(L.SET_REBOOT_SECS + 2)
+    d = n.dump()
+    check("settings: radio change + reboot: confirmed, rebooted once, comes up on the new radio",
+          ok and d["reboots"] == 1 and d["live"] == [910525, 250000, 11, 5] and not d["pending"], f"{err}; {d}")
+    n.close()
+    # a reboot is not a bundle by itself, and only "1" asks for one
+    body = L.bundle_body(v[0] + 100, (1, SELF[:8]), [("reboot", "1")])
+    ok_, why = refused(body + key.sign(L.SET_DOMAIN + body), "does not parse", role="companion")
+    check("settings: a reboot-only bundle refused", ok_, why)
+    body = L.bundle_body(v[0] + 101, (1, SELF[:8]), [("tx", "10"), ("reboot", "yes")])
+    ok_, why = refused(body + key.sign(L.SET_DOMAIN + body), "out of range", role="companion")
+    check("settings: reboot=<not 1> refused", ok_, why)
+    try:
+        L.make_bundle([("reboot", "1")], (1, SELF[:8]), 1, key)
+        sender_ok = False
+    except L.OtaError:
+        sender_ok = True
+    check("settings: sender wants --reboot, not --set reboot=1", sender_ok)
+    # the replay counter holds across the reboot it asked for
+    n = Node(feat, pub, role="companion")
+    blob = bundle([("posreport.interval", "5")], reboot=True)
+    push(n, blob)
+    n.tick(L.SET_REBOOT_SECS + 2)
+    ok_, why = refused(blob, "not newer", node=n)
+    check("settings: a reboot bundle cannot be replayed after the reboot", ok_ and n.dump()["reboots"] == 1, why)
+    n.close()
+
+    # 20. diff: only the changed keys
+    cur = {"radio": "910.525,62.5,7,5", "tx": "22", "af": "1", "repeat": "off", "posreport.interval": "0",
+           "overlay": "on", "regions": "ct,northeast", "rxdelay": "> 0.0"}
+    want = [("radio", "910.525,62.50,7,5"), ("tx", "22"), ("af", "1.0"), ("repeat", "off"), ("posreport.interval", "10"),
+            ("overlay", "off"), ("regions", "northeast,ct"), ("rxdelay", "0"), ("multi.acks", "1")]
+    got = L.diff_entries(cur, want)
+    check("settings: diff keeps only the changed (and unknown) keys",
+          got == [("posreport.interval", "10"), ("overlay", "off"), ("multi.acks", "1")], str(got))
+    n = Node(feat, pub, role="companion")
+    g = get_all(n)
+    want = [("tx", "22"), ("af", "1"), ("posreport.interval", "20"), ("radio.rxgain", "on")]
+    changed = L.diff_entries(g, want)
+    full = bundle(want)
+    small = bundle(changed)
+    ok, err = push(n, small)
+    d = n.dump()
+    check(f"settings: diff against the node's GET -> {len(small)}-byte bundle (all keys: {len(full)}), applies",
+          changed == [("posreport.interval", "20")] and len(small) < len(full) and ok and d["posreport.interval"] == 20,
+          f"{changed}; {err}; {d}")
+    check("settings: diff of what the node already has is empty", L.diff_entries(get_all(n), want) == [])
+    n.close()
+
+    # 21. airtime of a settings push (slow mode's math)
+    pk, air, t = L.settings_eta(len(small), L.Pacer(hops=0))
+    pk3, air3, _ = L.settings_eta(len(small), L.Pacer(hops=3))
+    check(f"settings: a {len(small)}-byte bundle is {pk} round trips, {air:.1f} s airtime direct, {air3:.1f} s at 3 hops",
+          pk == 5 and 0 < 4 * air <= air3 < 5 * air, f"{pk} {air} {air3}")
+
+
+def refused_on(sim, pub, blob, what, push, **kw):
+    n = Node(sim, pub, **kw)
+    ok, err = push(n, blob)
+    d = n.dump()
+    n.close()
+    return err is not None and what in str(err), f"{err}; {d}"

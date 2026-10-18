@@ -9,7 +9,10 @@
   lora_ota.py eta   IMAGE [--duty PCT | --pace S] [--hops N]           how long a --slow push takes
   lora_ota.py delta BASE NEW -o PATCH      make a changes-only patch (push --delta-from does this itself)
   lora_ota.py status|confirm --companion C --target T --password-file F
-  lora_ota.py settings make --target HEX|board:TAG --set KEY=VALUE ... -o BUNDLE
+  lora_ota.py settings make --target HEX|board:TAG --set KEY=VALUE ... [--reboot] -o BUNDLE
+  lora_ota.py settings diff --companion C --target T [--password-file F] --set KEY=VALUE ... [--reboot] -o BUNDLE
+                                           a bundle of only the keys that differ from the node's values
+  lora_ota.py settings eta BUNDLE [--hops N | --flood] [--duty PCT]     packets and airtime of a push
   lora_ota.py settings push --companion C --target T [--password-file F] BUNDLE
   lora_ota.py settings show|status|confirm|revert --companion C --target T [--password-file F]
 
@@ -70,6 +73,8 @@ SET_MAX_ENTRIES = 24
 SET_MIN_PREFIX = 6
 SET_CONFIRM_SECS = 60    # firmware LORA_OTA_SET_CONFIRM_SECS
 SET_SWITCH_SECS = 1.5    # firmware LORA_OTA_SET_SWITCH_MS: radio changes take effect after the OK reply
+SET_REBOOT_SECS = 6      # firmware LORA_OTA_SET_REBOOT_MS: a reboot=1 bundle reboots the node this long after CONFIRM
+SET_REBOOT_KEY = "reboot"   # control entry (value "1"), not a setting
 SET_CHUNK = COMPANION_FRAME - 1 - 32 - 6   # CMD_SEND_BINARY_REQ + pubkey, then type + total + offset + n
 STATUS_NAMES.update({16: "version not newer than the last applied bundle", 17: "bundle is for another node",
                      18: "setting not on the whitelist", 19: "value out of range", 20: "bundle does not parse",
@@ -78,9 +83,12 @@ STATUS_NAMES.update({16: "version not newer than the last applied bundle", 17: "
 # the whitelist (the firmware's KEY_NAMES); the node checks the values again
 SETTINGS_KEYS = ["radio", "tx", "af", "rxdelay", "txdelay", "direct.txdelay", "multi.acks", "path.hash.mode",
                  "int.thresh", "agc.reset.interval", "radio.rxgain", "flood.max", "flood.max.unscoped",
-                 "flood.max.advert", "advert.interval", "flood.advert.interval", "loop.detect", "repeat", "regions"]
+                 "flood.max.advert", "advert.interval", "flood.advert.interval", "loop.detect", "repeat", "regions",
+                 "posreport.interval", "overlay"]
 REPEATER_ONLY_KEYS = {"flood.max", "flood.max.unscoped", "flood.max.advert", "advert.interval",
-                      "flood.advert.interval", "loop.detect", "repeat", "regions"}
+                      "flood.advert.interval", "loop.detect", "regions"}
+# our companion features: whitelisted only by firmware built with them (else "not on the whitelist")
+COMPANION_FEATURE_KEYS = {"posreport.interval": "POSITION_REPORT", "overlay": "OVERLAY_MESH"}
 # repeater CLI to read a key's current value
 CLI_GET = {k: f"get {k}" for k in SETTINGS_KEYS}
 CLI_GET["regions"] = "region list allowed"
@@ -116,16 +124,29 @@ def bundle_body(version: int, target, entries) -> bytes:
     return out
 
 
-def make_bundle(entries, target, version, key, check=True) -> bytes:
-    """entries: [(key, value)]. Signed message: "MCSET1" || body; bundle = body || sig."""
+def check_entries(entries):
+    """the sender's whitelist check (the node checks everything again)"""
+    seen = set()
+    for k, v in entries:
+        if k == SET_REBOOT_KEY:
+            raise OtaError("reboot is not a setting: use --reboot")
+        if k not in SETTINGS_KEYS:
+            raise OtaError(f"{k!r} is not a setting this can change (whitelist: {', '.join(SETTINGS_KEYS)})")
+        if k == "overlay" and v != "off":
+            raise OtaError("overlay: only 'off' (turning it on needs the region name, which is the overlay's key: "
+                           "use '#ovlset on' or the app)")
+        if k in seen:
+            raise OtaError(f"{k} given twice")
+        seen.add(k)
+
+
+def make_bundle(entries, target, version, key, check=True, reboot=False) -> bytes:
+    """entries: [(key, value)]. Signed message: "MCSET1" || body; bundle = body || sig.
+    reboot: add the control entry reboot=1 (the node reboots once, after the CONFIRM)."""
     if check:
-        seen = set()
-        for k, _ in entries:
-            if k not in SETTINGS_KEYS:
-                raise OtaError(f"{k!r} is not a setting this can change (whitelist: {', '.join(SETTINGS_KEYS)})")
-            if k in seen:
-                raise OtaError(f"{k} given twice")
-            seen.add(k)
+        check_entries(entries)
+    if reboot:
+        entries = list(entries) + [(SET_REBOOT_KEY, "1")]
     body = bundle_body(version, target, entries)
     blob = body + key.sign(SET_DOMAIN + body)
     if len(blob) > SET_MAX_BUNDLE:
@@ -153,6 +174,37 @@ def parse_bundle(blob: bytes) -> dict:
     return {"version": version, "target": (kind, tgt), "entries": entries, "sig": sig}
 
 
+def bundle_reboots(b: dict) -> bool:
+    return any(k == SET_REBOOT_KEY for k, _ in b["entries"])
+
+
+def norm_value(key, v):
+    """a value as the node would hold it, for comparing what we want with what the node reports"""
+    v = str(v).strip()
+    if v.startswith("> "):
+        v = v[2:].strip()
+    if key == "regions":
+        return frozenset(x.strip() for x in v.split(",") if x.strip())
+    out = []
+    for part in v.split(","):
+        part = part.strip().lower()
+        try:
+            out.append(round(float(part) * 1000))
+        except ValueError:
+            out.append(part)
+    return tuple(out)
+
+
+def diff_entries(current: dict, wanted):
+    """[(key, value)] of the wanted settings whose value differs from current (unknown counts as different)"""
+    changed = []
+    for k, v in wanted:
+        cur = current.get(k)
+        if cur is None or str(cur).startswith("?") or norm_value(k, cur) != norm_value(k, v):
+            changed.append((k, v))
+    return changed
+
+
 def target_text(target):
     kind, t = target
     return f"board {t.decode()}" if kind == 2 else f"node {t.hex()}"
@@ -169,7 +221,9 @@ def set_status(r) -> dict:
     if not r or len(r) < 13:
         return None
     return {"status": r[0], "pending": r[1], "was": r[2], "version": struct.unpack("<I", r[3:7])[0],
-            "pending_version": struct.unpack("<I", r[7:11])[0], "secs_left": struct.unpack("<H", r[11:13])[0]}
+            "pending_version": struct.unpack("<I", r[7:11])[0], "secs_left": struct.unpack("<H", r[11:13])[0],
+            # older firmware sends 13 bytes: no reboot flags
+            "reboot_asked": bool(len(r) > 13 and r[13] & 1), "reboot_due": bool(len(r) > 13 and r[13] & 2)}
 
 
 class SettingsSender:
@@ -190,6 +244,7 @@ class SettingsSender:
         except (OtaError, IndexError, UnicodeDecodeError, struct.error):
             self.b = {"version": 0, "entries": []}   # not ours to judge: the node checks it (tests send junk on purpose)
         self.version = self.b["version"]
+        self.reboot = bundle_reboots(self.b)
         self.new_radio = next((radio_tuple(v) for k, v in self.b["entries"] if k == "radio"), None)
 
     async def ask(self, payload, what, tries=None):
@@ -254,6 +309,8 @@ class SettingsSender:
                     if st["version"] > self.version:
                         raise OtaError(f"the node has a newer bundle (v{st['version']})")
                     self.log("node: settings confirmed" + ("" if st["was"] else " (an earlier CONFIRM landed)"))
+                    if self.reboot and st["was"]:
+                        self.log(f"node: reboots in ~{SET_REBOOT_SECS} s (the bundle asked for it)")
                     return True
                 if st["status"] == OK and st["pending"] == 0 and st["version"] < self.version:
                     raise OtaError("the node does not have this bundle (it was not applied)")
@@ -368,7 +425,8 @@ DUTY_DEFAULT = 2.0           # % of the channel's airtime the transfer may use, 
 FLOOD_TX = 10                # transmissions per packet assumed for a flood (unknown repeater count)
 JITTER = 0.25                # +-25 % on every gap: never lock step with another periodic sender
 SLOW_ROUND = 256             # --slow: DATA chunks between STATUS polls (progress lands in the state file)
-REPLY_LEN = {REQ_BEGIN: 9, REQ_STATUS: 5 + 128, REQ_FINISH: 1, REQ_ABORT: 1, REQ_CONFIRM: 14}
+REPLY_LEN = {REQ_BEGIN: 9, REQ_STATUS: 5 + 128, REQ_FINISH: 1, REQ_ABORT: 1, REQ_CONFIRM: 14,
+             REQ_SET_DATA: 3, REQ_SET_APPLY: 7, REQ_SET_CTRL: 14}
 
 
 def lora_airtime(pl, bw_khz=MESH_PRESET[0], sf=MESH_PRESET[1], cr=MESH_PRESET[2], preamble=PREAMBLE):
@@ -434,6 +492,30 @@ def slow_eta(size, pacer, chunk=CHUNK):
     data = n * pacer.gap(1 + 6 + chunk)
     polls = math.ceil(n / SLOW_ROUND) + math.ceil(n / BITMAP_CHUNKS) + 2   # rounds + the final sweep + BEGIN/FINISH
     return data + polls * pacer.gap(7, REPLY_LEN[REQ_STATUS])
+
+
+def settings_packets(size):
+    """[(request length, reply length)] of a lossless settings push: STATUS, the DATA chunks,
+    APPLY (WORKING, then the result), CONFIRM"""
+    out = [(2, REPLY_LEN[REQ_SET_CTRL])]
+    for off in range(0, size, SET_CHUNK):
+        out.append((6 + min(SET_CHUNK, size - off), REPLY_LEN[REQ_SET_DATA]))
+    out += [(11, 1), (11, REPLY_LEN[REQ_SET_APPLY]), (2, REPLY_LEN[REQ_SET_CTRL])]
+    return out
+
+
+def settings_eta(size, pacer):
+    """(round trips, channel airtime s, seconds at the pacer's duty) of a lossless settings push"""
+    pk = settings_packets(size)
+    return len(pk), sum(pacer.cost(q, a) for q, a in pk), sum(pacer.gap(q, a) for q, a in pk)
+
+
+def describe_settings_eta(size, hops=0, flood=False, duty=None):
+    p = Pacer(duty=duty, hops=hops, flood=flood)
+    n, air, t = settings_eta(size, p)
+    route = "flood" if flood else ("direct" if hops == 0 else f"{hops} hop(s)")
+    return (f"{n} round trips, {route}: {air:.1f} s of channel airtime ({p.tx} transmission(s) per packet); "
+            f"~{t:.0f} s if held to {p.duty:g}% of the channel")
 
 
 def fmt_secs(t):
@@ -1020,20 +1102,59 @@ async def cmd_cli(a, cmd):
 
 
 def cmd_settings_make(a):
+    entries = parse_sets(a.set)
+    target = parse_target(a.target)
+    version = a.version if a.version is not None else int(time.time())
+    write_bundle(a, entries, target, version)
+
+
+def parse_sets(sets):
     entries = []
-    for kv in a.set:
+    for kv in sets:
         if "=" not in kv:
             raise OtaError(f"--set {kv!r}: want KEY=VALUE")
         k, v = kv.split("=", 1)
         entries.append((k.strip(), v.strip()))
-    target = parse_target(a.target)
-    version = a.version if a.version is not None else int(time.time())
-    blob = make_bundle(entries, target, version, load_key(a.key))
+    return entries
+
+
+def write_bundle(a, entries, target, version):
+    blob = make_bundle(entries, target, version, load_key(a.key), reboot=a.reboot)
     with open(a.output, "wb") as f:
         f.write(blob)
-    print(f"{a.output}: v{version} for {target_text(target)}, {len(blob)} bytes")
+    print(f"{a.output}: v{version} for {target_text(target)}, {len(blob)} bytes" +
+          (f", node reboots ~{SET_REBOOT_SECS} s after the CONFIRM" if a.reboot else ""))
     for k, v in entries:
         print(f"  {k} = {v}")
+    print(f"  over the mesh: {describe_settings_eta(len(blob))}")
+    return blob
+
+
+def cmd_settings_eta(a):
+    size = len(open(a.bundle, "rb").read()) if os.path.exists(a.bundle) else int(a.bundle)
+    for duty in [a.duty] if a.duty else [DUTY_DEFAULT]:
+        print(f"{size} bytes: {describe_settings_eta(size, a.hops, a.flood, duty)}")
+
+
+async def cmd_settings_diff(a):
+    wanted = parse_sets(a.set)
+    check_entries(wanted)   # before touching the radio
+    mc, ct, adm, link = await settings_session(a)
+    try:
+        cur = await read_current(mc, ct, link, adm, [k for k, _ in wanted])
+    finally:
+        await mc.disconnect()
+    changed = diff_entries(cur, wanted)
+    print(f"{ct['adv_name']}:")
+    for k, v in wanted:
+        print(f"  {k}: {cur.get(k, '?')}" + (f" -> {v}" if (k, v) in changed else " (unchanged)"))
+    if not changed:
+        print("nothing to change: no bundle written")
+        return
+    target = parse_target(a.bundle_target or ct["public_key"][:16])
+    version = a.version if a.version is not None else int(time.time())
+    write_bundle(a, changed, target, version)
+
 
 
 async def read_current(mc, ct, link, adm, keys):
@@ -1099,11 +1220,14 @@ async def cmd_settings_push(a):
         kind, tgt = b["target"]
         if kind == 1 and not bytes.fromhex(ct["public_key"]).startswith(tgt):
             raise OtaError(f"bundle is for {target_text(b['target'])}, {ct['adv_name']} is {ct['public_key'][:16]}...")
-        keys = [k for k, _ in b["entries"]]
+        keys = [k for k, _ in b["entries"] if k in SETTINGS_KEYS]
         cur = await read_current(mc, ct, link, adm, keys)
         print(f"{ct['adv_name']}: bundle v{b['version']} ({target_text(b['target'])})")
         for k, v in b["entries"]:
-            print(f"  {k}: {cur.get(k, '?')} -> {v}")
+            if k == SET_REBOOT_KEY:
+                print(f"  (reboot ~{SET_REBOOT_SECS} s after the CONFIRM)")
+            else:
+                print(f"  {k}: {cur.get(k, '?')} -> {v}")
         st = set_status(await link.request(bytes([REQ_SET_CTRL, SET_OP_STATUS]), True, 8.0))
         if st is None:
             raise OtaError(f"{ct['adv_name']} does not answer signed-settings requests (no such firmware, or "
@@ -1128,7 +1252,7 @@ async def cmd_settings_ctrl(a):
     try:
         if a.settings_cmd == "show":
             # repeater: its CLI (any firmware); companion: GET over LoRa (signed-settings firmware only)
-            keys = SETTINGS_KEYS if adm else []
+            keys = [k for k in SETTINGS_KEYS if k not in COMPANION_FEATURE_KEYS] if adm else []
             for k, v in (await read_current(mc, ct, link, adm, keys)).items():
                 print(f"{k} = {v}")
             return
@@ -1214,7 +1338,13 @@ def main():
     m.add_argument("--set", action="append", required=True, metavar="KEY=VALUE")
     m.add_argument("--version", type=int, help="default: the current unix time")
     m.add_argument("-o", "--output", required=True)
-    for name in ("push", "show", "status", "confirm", "revert"):
+    m.add_argument("--reboot", action="store_true", help=f"the node reboots once, ~{SET_REBOOT_SECS} s after the CONFIRM")
+    se = ssub.add_parser("eta", help="packets and airtime of a settings push over the mesh")
+    se.add_argument("bundle", help="bundle file, or a size in bytes")
+    se.add_argument("--hops", type=int, default=0)
+    se.add_argument("--flood", action="store_true")
+    se.add_argument("--duty", type=float)
+    for name in ("push", "show", "status", "confirm", "revert", "diff"):
         p = ssub.add_parser(name)
         p.add_argument("--companion", required=True)
         p.add_argument("--target", required=True)
@@ -1222,6 +1352,12 @@ def main():
         if name == "push":
             p.add_argument("bundle")
             p.add_argument("--no-confirm", action="store_true")
+        if name == "diff":
+            p.add_argument("--set", action="append", required=True, metavar="KEY=VALUE")
+            p.add_argument("--reboot", action="store_true", help=f"the node reboots once, ~{SET_REBOOT_SECS} s after the CONFIRM")
+            p.add_argument("--version", type=int, help="default: the current unix time")
+            p.add_argument("--bundle-target", help="target in the bundle (default: the node's 8-byte key prefix)")
+            p.add_argument("-o", "--output", required=True)
     a = ap.parse_args()
     if a.cmd == "push" and not a.slow and (a.duty or a.pace or a.resume or a.hops is not None):
         ap.error("--duty/--pace/--hops/--resume go with --slow")
@@ -1236,6 +1372,8 @@ def main():
         elif a.cmd == "push": asyncio.run(cancellable(cmd_push(a)))
         elif a.cmd == "confirm": asyncio.run(cmd_confirm(a))
         elif a.cmd == "settings" and a.settings_cmd == "make": cmd_settings_make(a)
+        elif a.cmd == "settings" and a.settings_cmd == "eta": cmd_settings_eta(a)
+        elif a.cmd == "settings" and a.settings_cmd == "diff": asyncio.run(cmd_settings_diff(a))
         elif a.cmd == "settings" and a.settings_cmd == "push": asyncio.run(cancellable(cmd_settings_push(a)))
         elif a.cmd == "settings": asyncio.run(cmd_settings_ctrl(a))
         else: asyncio.run(cmd_cli(a, f"ota {a.cmd}"))

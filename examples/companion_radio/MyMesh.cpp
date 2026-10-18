@@ -700,8 +700,14 @@ public:
 };
 static LoraOTAService ota_service;
 
-// signed settings over LoRa (LoraOTASettings.h): a companion has the radio and tuning keys only
+// signed settings over LoRa (LoraOTASettings.h): a companion has the radio and tuning keys, client
+// repeat, and our own features where they are compiled in (position reports, overlay off)
 #define OTA_SETTINGS_FILE "/ota_settings"
+#define OTA_SETTINGS_OVERLAY "/ota_set_overlay"   // the overlay config while a bundle that turned it off is on probation
+#ifdef OVERLAY_MESH
+static File overlayOpenWrite(FILESYSTEM* fs, const char* filename);
+static void overlayKeyFor(const char* name, TransportKey& k);
+#endif
 static uint32_t toMilli(float f) { return (uint32_t)(f * 1000.0f + 0.5f); }
 
 class CompanionSettingsTarget : public lora_ota_settings::Target {
@@ -712,7 +718,14 @@ public:
     using namespace lora_ota_settings;
     return (1u << K_RADIO) | (1u << K_TX) | (1u << K_AF) | (1u << K_RXDELAY) | (1u << K_TXDELAY) |
            (1u << K_DIRECT_TXDELAY) | (1u << K_MULTI_ACKS) | (1u << K_PATH_HASH_MODE) | (1u << K_INT_THRESH) |
-           (1u << K_AGC_RESET_INTERVAL) | (1u << K_RXGAIN);
+           (1u << K_AGC_RESET_INTERVAL) | (1u << K_RXGAIN) | (1u << K_REPEAT)
+#ifdef POSITION_REPORT
+           | (1u << K_POSREPORT_INTERVAL)
+#endif
+#ifdef OVERLAY_MESH
+           | (1u << K_OVERLAY)
+#endif
+           ;
   }
   void read(lora_ota_settings::Values& v) override {
     memset(&v, 0, sizeof(v));
@@ -728,10 +741,20 @@ public:
     v.int_thresh = p.interference_threshold;
     v.agc_reset_secs = p.agc_reset_interval * 4;
     v.rxgain = p.rx_boosted_gain;
+    v.repeat = p.isRepeatEn() ? 1 : 0;
+#ifdef POSITION_REPORT
+    v.posreport_min = _m->_posrep.interval_min;
+#endif
+#ifdef OVERLAY_MESH
+    v.overlay = _m->_overlay.name[0] ? 1 : 0;
+#endif
   }
   bool acceptable(const lora_ota_settings::Values& v, uint32_t m) override {
-    // same rule as CMD_SET_RADIO_PARAMS: client repeat only on the allowed bands
-    return !(m & (1u << lora_ota_settings::K_RADIO)) || !_m->_prefs.isRepeatEn() || _m->isValidClientRepeatFreq(v.freq_khz);
+    using namespace lora_ota_settings;
+    // same rule as CMD_SET_RADIO_PARAMS: client repeat only on the allowed bands, whether
+    // the bundle turns repeat on or moves a repeating companion to another frequency
+    if (!(m & ((1u << K_RADIO) | (1u << K_REPEAT)))) return true;
+    return !v.repeat || _m->isValidClientRepeatFreq(v.freq_khz);
   }
   bool write(const lora_ota_settings::Values& v, uint32_t m) override {
     using namespace lora_ota_settings;
@@ -747,8 +770,53 @@ public:
     if (m & (1u << K_INT_THRESH)) p.interference_threshold = v.int_thresh;
     if (m & (1u << K_AGC_RESET_INTERVAL)) p.agc_reset_interval = v.agc_reset_secs / 4;
     if (m & (1u << K_RXGAIN)) p.rx_boosted_gain = v.rxgain;
+    if (m & (1u << K_REPEAT)) p.setRepeatEn(v.repeat != 0);
     _m->savePrefs();
+#ifdef POSITION_REPORT
+    if (m & (1u << K_POSREPORT_INTERVAL)) {   // as "#locset <min>"
+      _m->_posrep.interval_min = v.posreport_min;
+      _m->posReportSave();
+      _m->_posrep_next = millis() + 5000UL;    // report soon under the new interval
+    }
+#endif
     return true;
+  }
+#ifdef OVERLAY_MESH
+  bool overlaySnapshot() override {   // the node's own overlay config, to a file of its own
+    File f = overlayOpenWrite(_m->_store->getPrimaryFS(), OTA_SETTINGS_OVERLAY);
+    if (!f) return false;
+    MyMesh::OverlayCfg c = _m->_overlay;
+    c.magic = OVERLAY_MAGIC;
+    bool ok = f.write((const uint8_t*)&c, sizeof(c)) == sizeof(c);
+    f.close();
+    return ok;
+  }
+  bool overlayOff() override {   // as "#ovlset off" (its repeat-off comes as K_REPEAT)
+    memset(_m->_overlay.name, 0, sizeof(_m->_overlay.name));
+    memset(&_m->_overlay_key, 0, sizeof(_m->_overlay_key));
+    _m->overlaySave();
+    return true;
+  }
+  bool overlayRestore() override {
+    File f = _m->_store->openRead(OTA_SETTINGS_OVERLAY);
+    if (!f) return false;
+    MyMesh::OverlayCfg c;
+    bool ok = f.read((uint8_t*)&c, sizeof(c)) == sizeof(c) && c.magic == OVERLAY_MAGIC && memchr(c.name, 0, sizeof(c.name))
+              && (c.name[0] == 0 || c.name[0] == '#');
+    f.close();
+    if (!ok) return false;
+    _m->_overlay = c;
+    if (c.name[0]) overlayKeyFor(c.name, _m->_overlay_key); else memset(&_m->_overlay_key, 0, sizeof(_m->_overlay_key));
+    _m->overlaySave();
+    return true;
+  }
+  void dropSnapshots(uint32_t mask) override {
+    if (mask & (1u << lora_ota_settings::K_OVERLAY)) _m->_store->getPrimaryFS()->remove(OTA_SETTINGS_OVERLAY);
+  }
+#endif
+  void reboot() override {
+    if (_m->dirty_contacts_expiry) _m->saveContacts();   // as CMD_REBOOT
+    board.reboot();
   }
   void applyRadio() override {
     NodePrefs& p = _m->_prefs;

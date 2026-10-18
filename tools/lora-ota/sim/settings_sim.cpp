@@ -8,9 +8,15 @@
 // stdin:  u16 len, request (type byte first)          -> u16 len, reply body (0 = nothing heard)
 //         u16 0xFFFF, op u8, args                     -> u16 len, text (control, never "lost")
 //           op 1 tick u32 ms | 2 dump | 3 reboot | 4 sender radio u32 khz u32 hz u8 sf u8 cr
-//           op 5 firmware pending u8
+//           op 5 firmware pending u8 | 6 next state save fails | 7 u8 n, bytes: in the state file?
+//
+// Build with -DPOSITION_REPORT -DOVERLAY_MESH for a companion with our
+// feature keys (posreport.interval, overlay); without them those keys are
+// not on the whitelist. Target::reboot() is a real reboot of the fake node
+// (RAM from "flash", a fresh Settings), counted in the dump.
 //
 //   settings_sim --pubkey HEX --board TAG --role repeater|companion [--self HEX32] [--drop PCT] [--seed N]
+//                [--client-repeat]
 
 #include "LoraOTASettings.h"
 #include <stdio.h>
@@ -45,13 +51,20 @@ public:
   int8_t tx_live = 0;
   int radio_applies = 0, writes = 0;
   bool fail_state_save = false;
+  // overlay (OVERLAY_MESH companions): the region name, its "flash" copy, the snapshot file
+  std::string ovl, ovl_saved, ovl_snap;
+  bool ovl_snap_exists = false;
+  int reboots = 0;
+  bool reboot_req = false;
 
   FakeNode(bool rep) : repeater(rep) {
     memset(&prefs, 0, sizeof(prefs));
     prefs.freq_khz = 910525; prefs.bw_hz = 62500; prefs.sf = 7; prefs.cr = 5;
     prefs.tx = 22; prefs.af_milli = 1000; prefs.path_hash_mode = 0; prefs.rxgain = 1;
     prefs.flood_max = 64; prefs.flood_max_unscoped = 64; prefs.flood_max_advert = 64;
-    prefs.advert_interval_min = 0; prefs.flood_advert_interval_h = 12; prefs.repeat = 1;
+    prefs.advert_interval_min = 0; prefs.flood_advert_interval_h = 12; prefs.repeat = rep ? 1 : 0;
+    prefs.posreport_min = 0;   // POSREPORT_INTERVAL_MIN: off
+    if (!rep) ovl = ovl_saved = "#ourgroup";   // a companion starts with the overlay on (when it has one)
     saved = prefs;
     live = { prefs.freq_khz, prefs.bw_hz, prefs.sf, prefs.cr };
     tx_live = prefs.tx;
@@ -60,10 +73,39 @@ public:
     uint32_t common = (1u << K_RADIO) | (1u << K_TX) | (1u << K_AF) | (1u << K_RXDELAY) | (1u << K_TXDELAY) |
                       (1u << K_DIRECT_TXDELAY) | (1u << K_MULTI_ACKS) | (1u << K_PATH_HASH_MODE) |
                       (1u << K_INT_THRESH) | (1u << K_AGC_RESET_INTERVAL) | (1u << K_RXGAIN);
-    return repeater ? (1u << K_COUNT) - 1 : common;
+    common |= 1u << K_REPEAT;
+#ifdef POSITION_REPORT
+    common |= 1u << K_POSREPORT_INTERVAL;
+#endif
+#ifdef OVERLAY_MESH
+    common |= 1u << K_OVERLAY;
+#endif
+    return repeater ? LORA_OTA_SET_REPEATER_KEYS : common;   // as simple_repeater: every stock key, no fork features
   }
-  void read(Values& v) override { v = prefs; }
-  bool write(const Values& v, uint32_t mask) override { copyMasked(prefs, v, mask); saved = prefs; writes++; return true; }
+  void read(Values& v) override { v = prefs; v.overlay = ovl.empty() ? 0 : 1; }
+  static bool repeatFreq(uint32_t f) { return f == 433000 || f == 869495 || f == 918000; }   // companion default bands
+  bool acceptable(const Values& v, uint32_t m) override {   // the companion's CMD_SET_RADIO_PARAMS rule
+    if (repeater || !(m & ((1u << K_RADIO) | (1u << K_REPEAT)))) return true;
+    return !v.repeat || repeatFreq(v.freq_khz);
+  }
+  bool write(const Values& v, uint32_t mask) override {
+    copyMasked(prefs, v, mask);
+    saved = prefs;
+    ovl_saved = ovl;
+    writes++;
+    return true;
+  }
+  bool overlaySnapshot() override { ovl_snap = ovl_saved; ovl_snap_exists = true; return true; }
+  bool overlayOff() override { ovl = ovl_saved = ""; return true; }
+  bool overlayRestore() override {
+    if (!ovl_snap_exists) return false;
+    ovl = ovl_saved = ovl_snap;
+    return true;
+  }
+  void dropSnapshots(uint32_t mask) override {
+    if (mask & (1u << K_OVERLAY)) { ovl_snap_exists = false; ovl_snap.clear(); }
+  }
+  void reboot() override { reboots++; reboot_req = true; }
   void applyRadio() override { live = { prefs.freq_khz, prefs.bw_hz, prefs.sf, prefs.cr }; tx_live = prefs.tx; radio_applies++; }
   int8_t maxTxPower() override { return 22; }
   const uint8_t* selfPubKey() override { return self; }
@@ -101,9 +143,10 @@ public:
     snprintf(out, max, "%s", s.c_str());
     return strlen(out);
   }
-  void reboot() {   // RAM comes back from "flash", the radio from the prefs
+  void powerCycle() {   // RAM comes back from "flash", the radio from the prefs
     prefs = saved;
     regions = regions_saved;
+    ovl = ovl_saved;
     live = { prefs.freq_khz, prefs.bw_hz, prefs.sf, prefs.cr };
     tx_live = prefs.tx;
   }
@@ -119,7 +162,7 @@ static void out(const void* p, size_t n) {
 
 int main(int argc, char** argv) {
   const char *pubhex = NULL, *board = "test_board", *selfhex = NULL;
-  bool repeater = true;
+  bool repeater = true, client_repeat = false;
   int drop = 0;
   unsigned seed = 1;
   for (int i = 1; i < argc; i++) {
@@ -129,12 +172,18 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--self")) selfhex = argv[++i];
     else if (!strcmp(argv[i], "--drop")) drop = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--seed")) seed = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--client-repeat")) client_repeat = true;   // companion: repeat on, on 918 MHz
   }
   if (!pubhex || strlen(pubhex) != 64) { fprintf(stderr, "usage: see source\n"); return 2; }
   srand(seed);
   uint8_t pub[32];
   fromHex(pub, pubhex, 32);
   FakeNode node(repeater);
+  if (client_repeat) {
+    node.prefs.repeat = 1; node.prefs.freq_khz = 918000;
+    node.saved = node.prefs;
+    node.live.khz = 918000;
+  }
   if (selfhex) fromHex(node.self, selfhex, 32); else memset(node.self, 0x5A, 32);
   if (repeater) { node.regions = node.regions_saved = { "ct" }; }
   Radio sender = node.live;
@@ -143,12 +192,19 @@ int main(int argc, char** argv) {
   Settings* s = new Settings(node, pub, board);
   s->begin();
   uint32_t now = 1000;
+  auto restart = [&]() {
+    node.powerCycle();
+    delete s;
+    s = new Settings(node, pub, board);
+    s->begin();
+  };
   auto step = [&](uint32_t ms) {
     for (uint32_t t = 0; t < ms; t += 50) {
       now += 50;
       s->poll(now, fw_pending);
       s->loop(now);
       s->takeRadioEvent();
+      if (node.reboot_req) { node.reboot_req = false; restart(); }   // Target::reboot() from inside loop()
     }
   };
 
@@ -177,18 +233,18 @@ int main(int argc, char** argv) {
           "{\"saved\": {\"radio\": [%u, %u, %u, %u], \"tx\": %d, \"af\": %u, \"flood.max\": %u, \"flood.max.unscoped\": %u, "
           "\"flood.advert.interval\": %u, \"path.hash.mode\": %u, \"loop.detect\": %u, \"regions\": \"%s\"}, "
           "\"ram_radio\": [%u, %u, %u, %u], \"live\": [%u, %u, %u, %u], \"tx_live\": %d, \"radio_applies\": %d, \"writes\": %d, "
-          "\"version\": %u, \"pending_version\": %u, \"pending\": %d, \"busy\": %d}",
+          "\"version\": %u, \"pending_version\": %u, \"pending\": %d, \"busy\": %d, "
+          "\"repeat\": %u, \"posreport.interval\": %u, \"overlay\": \"%s\", \"overlay_snapshot\": %d, \"reboots\": %d, "
+          "\"reboot_due\": %d}",
           v.freq_khz, v.bw_hz, v.sf, v.cr, v.tx, v.af_milli, v.flood_max, v.flood_max_unscoped, v.flood_advert_interval_h,
           v.path_hash_mode, v.loop_detect, regs.c_str(),
           node.prefs.freq_khz, node.prefs.bw_hz, node.prefs.sf, node.prefs.cr,
           node.live.khz, node.live.hz, node.live.sf, node.live.cr, node.tx_live, node.radio_applies, node.writes,
-          st.version, st.pending_version, (int)s->pending(), (int)s->busy());
+          st.version, st.pending_version, (int)s->pending(), (int)s->busy(),
+          v.repeat, v.posreport_min, node.ovl_saved.c_str(), (int)node.ovl_snap_exists, node.reboots, (int)s->rebootDue());
         out(txt, n);
       } else if (op == 3) {
-        node.reboot();
-        delete s;
-        s = new Settings(node, pub, board);
-        s->begin();
+        restart();
         out("", 0);
       } else if (op == 4) {
         uint8_t b[10];
@@ -205,6 +261,13 @@ int main(int argc, char** argv) {
       } else if (op == 6) {   // the next state save fails
         node.fail_state_save = true;
         out("", 0);
+      } else if (op == 7) {   // u8 n, n bytes: does the state file contain them? ("1"/"0")
+        uint8_t n;
+        readFull(&n, 1);
+        std::string needle(n, 0);
+        readFull((uint8_t*)&needle[0], n);
+        std::string hay(node.state.begin(), node.state.end());
+        out(hay.find(needle) != std::string::npos ? "1" : "0", 1);
       }
       continue;
     }

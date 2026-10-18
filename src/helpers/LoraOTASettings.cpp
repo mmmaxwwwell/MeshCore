@@ -19,14 +19,28 @@ static const char* const KEY_NAMES[K_COUNT] = {
   "radio", "tx", "af", "rxdelay", "txdelay", "direct.txdelay", "multi.acks", "path.hash.mode",
   "int.thresh", "agc.reset.interval", "radio.rxgain", "flood.max", "flood.max.unscoped",
   "flood.max.advert", "advert.interval", "flood.advert.interval", "loop.detect", "repeat", "regions",
+  "posreport.interval", "overlay",
 };
 static const char* const LOOP_NAMES[4] = { "off", "minimal", "moderate", "strict" };
 
 const char* keyName(int k) { return k >= 0 && k < K_COUNT ? KEY_NAMES[k] : "?"; }
 
+uint32_t compiledKeys() {
+  uint32_t m = LORA_OTA_SET_REPEATER_KEYS;
+#ifdef POSITION_REPORT
+  m |= 1u << K_POSREPORT_INTERVAL;
+#endif
+#ifdef OVERLAY_MESH
+  m |= 1u << K_OVERLAY;
+#endif
+  return m;
+}
+
 int keyByName(const char* name, size_t len) {
   for (int k = 0; k < K_COUNT; k++) {
-    if (strlen(KEY_NAMES[k]) == len && memcmp(KEY_NAMES[k], name, len) == 0) return k;
+    if (strlen(KEY_NAMES[k]) == len && memcmp(KEY_NAMES[k], name, len) == 0) {
+      return (compiledKeys() & (1u << k)) ? k : -1;   // a feature this build lacks is not on its whitelist
+    }
   }
   return -1;
 }
@@ -50,6 +64,8 @@ void copyMasked(Values& d, const Values& s, uint32_t m) {
   if (m & (1u << K_FLOOD_ADVERT_INTERVAL)) d.flood_advert_interval_h = s.flood_advert_interval_h;
   if (m & (1u << K_LOOP_DETECT)) d.loop_detect = s.loop_detect;
   if (m & (1u << K_REPEAT)) d.repeat = s.repeat;
+  if (m & (1u << K_POSREPORT_INTERVAL)) d.posreport_min = s.posreport_min;
+  if (m & (1u << K_OVERLAY)) d.overlay = s.overlay;
 }
 
 bool parseMilli(const char* s, size_t n, uint32_t& out) {
@@ -209,6 +225,16 @@ Status parseEntry(int key, const char* s, size_t n, Values& v, int8_t max_tx) {
       return BAD_VALUE;
     case K_REGIONS:
       return validRegions(s, n) ? (Status)lora_ota::OK : BAD_VALUE;
+    case K_POSREPORT_INTERVAL:   // same range as "#locset <min>"
+      if (!parseUint(s, n, LORA_OTA_SET_POSREPORT_MAX, u)) return BAD_VALUE;
+      v.posreport_min = u;
+      return (Status)lora_ota::OK;
+    case K_OVERLAY:
+      // only "off": "on" needs the overlay's region name, which is its key
+      // (SHA256 of the name), and no key material travels in a bundle
+      if (!is(s, n, "off")) return BAD_VALUE;
+      v.overlay = 0;
+      return (Status)lora_ota::OK;
   }
   return NOT_ALLOWED;
 }
@@ -245,6 +271,8 @@ Settings::Settings(Target& t, const uint8_t pubkey[32], const char* board) : _t(
   _result_version = 0;
   _switch_pending = _switch_asked = _radio_event = false;
   _applied_ms = _switch_at = _confirm_by = 0;
+  _reboot_asked = _reboot_due = false;
+  _reboot_at = 0;
 }
 
 void Settings::begin() {
@@ -269,8 +297,11 @@ long Settings::secondsLeft(uint32_t now_ms) const {
 void Settings::revert(const char* why) {
   (void)why;
   uint32_t mask = _st.pending_mask;
-  _t->write(_st.snapshot, mask & ~(1u << K_REGIONS));
+  _t->write(_st.snapshot, mask & ~((1u << K_REGIONS) | (1u << K_OVERLAY)));
   if (mask & (1u << K_REGIONS)) _t->regionsRestore();
+  if (mask & (1u << K_OVERLAY)) _t->overlayRestore();   // the name comes back from the node's own copy
+  _t->dropSnapshots(mask);
+  _reboot_asked = false;   // a reverted bundle never reboots the node
   if (mask & LORA_OTA_SET_RADIO_KEYS) {
     _t->applyRadio();   // even if the switch never happened: the radio follows the restored prefs
     _radio_event = true;
@@ -283,9 +314,17 @@ void Settings::revert(const char* why) {
 
 bool Settings::confirm() {
   if (!pending() || _switch_pending) return false;
+  uint32_t mask = _st.pending_mask;
   _st.pending_version = 0;
   _st.pending_mask = 0;
-  return _t->saveState((const uint8_t*)&_st, sizeof(_st));
+  if (!_t->saveState((const uint8_t*)&_st, sizeof(_st))) return false;
+  _t->dropSnapshots(mask);
+  if (_reboot_asked) {   // only now: the new settings are confirmed and saved
+    _reboot_asked = false;
+    _reboot_due = true;
+    _reboot_at = 0;      // timed from the next loop(), after the CONFIRM reply has been handed over
+  }
+  return true;
 }
 
 bool Settings::revertNow() {
@@ -329,7 +368,8 @@ uint8_t Settings::verifyAndApply(uint32_t now_ms, bool fw_pending) {
   Values cur, nv;
   _t->read(cur);
   nv = cur;
-  uint32_t mask = 0, supported = _t->supported();
+  uint32_t mask = 0, supported = _t->supported() & compiledKeys();
+  bool reboot = false, reboot_seen = false;
   static char regions[LORA_OTA_SET_MAX_BUNDLE];   // static: poll() runs on the 4 KB nRF52 loop stack
   regions[0] = 0;
   for (int e = 0; e < count; e++) {
@@ -340,6 +380,12 @@ uint8_t Settings::verifyAndApply(uint32_t now_ms, bool fw_pending) {
     uint8_t vlen = body[i++];
     if (i + vlen > blen) return BAD_FORMAT;
     const char* val = (const char*)&body[i]; i += vlen;
+    if (is(key, klen, LORA_OTA_SET_REBOOT_KEY)) {   // control entry, not a setting
+      if (reboot_seen) return BAD_FORMAT;
+      if (!is(val, vlen, "1")) return BAD_VALUE;
+      reboot = reboot_seen = true;
+      continue;
+    }
     int k = keyByName(key, klen);
     if (k < 0) return NOT_ALLOWED;
     if (mask & (1u << k)) return BAD_FORMAT;   // twice in one bundle
@@ -350,10 +396,19 @@ uint8_t Settings::verifyAndApply(uint32_t now_ms, bool fw_pending) {
     mask |= 1u << k;
   }
   if (i != blen) return BAD_FORMAT;
+  if (mask == 0) return BAD_FORMAT;   // a reboot alone is not a bundle
+  if (mask & (1u << K_OVERLAY)) {
+    // overlay off = "#ovlset off": client repeat goes off with it (and comes back on a revert)
+    if (!(supported & (1u << K_REPEAT))) return NOT_SUPPORTED;
+    if ((mask & (1u << K_REPEAT)) && nv.repeat) return BAD_VALUE;   // contradicts itself
+    nv.repeat = 0;
+    mask |= 1u << K_REPEAT;
+  }
   if (!_t->acceptable(nv, mask)) return BAD_VALUE;
 
   // 3. probation record first: a power cut from here on brings the old values back
   if ((mask & (1u << K_REGIONS)) && !_t->regionsSnapshot()) return STORE_ERROR;
+  if ((mask & (1u << K_OVERLAY)) && !_t->overlaySnapshot()) return STORE_ERROR;
   _st.version = version;
   _st.pending_version = version;
   _st.pending_mask = mask;
@@ -361,12 +416,15 @@ uint8_t Settings::verifyAndApply(uint32_t now_ms, bool fw_pending) {
   if (!_t->saveState((const uint8_t*)&_st, sizeof(_st))) {
     _st.pending_version = 0;   // nothing changed yet; the version is spent either way
     _st.pending_mask = 0;
+    _t->dropSnapshots(mask);
     return STORE_ERROR;
   }
+  _reboot_asked = reboot;
 
   // 4. apply; the radio itself only after the OK reply has gone out
-  bool ok = _t->write(nv, mask & ~(1u << K_REGIONS));
+  bool ok = _t->write(nv, mask & ~((1u << K_REGIONS) | (1u << K_OVERLAY)));
   if (ok && (mask & (1u << K_REGIONS))) ok = _t->regionsApply(regions);
+  if (ok && (mask & (1u << K_OVERLAY))) ok = _t->overlayOff();
   if (!ok) {
     revert("apply failed");
     return STORE_ERROR;
@@ -392,7 +450,9 @@ int Settings::statusReply(uint8_t* reply, uint8_t status, uint8_t was, uint32_t 
   wr32(&reply[3], _st.version);
   wr32(&reply[7], _st.pending_version);
   wr16(&reply[11], left > 0xFFFF ? 0xFFFF : (uint16_t)left);
-  return 13;
+  // flags: bit0 = the pending bundle asks for a reboot after its CONFIRM, bit1 = that reboot is due
+  reply[13] = (_reboot_asked ? 1 : 0) | (_reboot_due ? 2 : 0);
+  return 14;
 }
 
 int Settings::ctrl(const uint8_t* p, size_t len, uint8_t* reply, uint32_t now_ms) {
@@ -413,7 +473,7 @@ int Settings::ctrl(const uint8_t* p, size_t len, uint8_t* reply, uint32_t now_ms
     case LORA_OTA_SET_OP_GET: {   // start u8 -> status, next u8, "key=value\n"...
       Values v;
       _t->read(v);
-      uint32_t sup = _t->supported();
+      uint32_t sup = _t->supported() & compiledKeys();
       int k = len > 1 ? p[1] : 0;
       char* out = (char*)&reply[2];
       int used = 0;
@@ -445,6 +505,8 @@ int Settings::ctrl(const uint8_t* p, size_t len, uint8_t* reply, uint32_t now_ms
           case K_ADVERT_INTERVAL: n += sprintf(&line[n], "%u", v.advert_interval_min); break;
           case K_FLOOD_ADVERT_INTERVAL: n += sprintf(&line[n], "%u", v.flood_advert_interval_h); break;
           case K_LOOP_DETECT: n += sprintf(&line[n], "%s", v.loop_detect < 4 ? LOOP_NAMES[v.loop_detect] : "?"); break;
+          case K_POSREPORT_INTERVAL: n += sprintf(&line[n], "%u", v.posreport_min); break;
+          case K_OVERLAY: n += sprintf(&line[n], "%s", v.overlay ? "on" : "off"); break;
           case K_REGIONS: {
             char r[LORA_OTA_SET_GET_TEXT];
             _t->regionsExport(r, sizeof(r) - 16);
@@ -546,6 +608,16 @@ void Settings::loop(uint32_t now_ms) {
   }
   if (pending() && !_switch_pending && (int32_t)(now_ms - _confirm_by) >= 0) {
     revert("no CONFIRM");
+  }
+  if (_reboot_due) {
+    if (_reboot_at == 0) {
+      _reboot_at = now_ms + LORA_OTA_SET_REBOOT_MS;
+      if (_reboot_at == 0) _reboot_at = 1;
+    } else if ((int32_t)(now_ms - _reboot_at) >= 0) {
+      _reboot_due = false;
+      _reboot_at = 0;
+      _t->reboot();   // does not return on the radio
+    }
   }
 }
 
