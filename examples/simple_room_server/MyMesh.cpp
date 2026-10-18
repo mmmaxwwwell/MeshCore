@@ -148,11 +148,31 @@ File MyMesh::openAppend(const char *fname) {
 #endif
 }
 
+#ifdef LORA_OTA_ENABLED
+// firmware over LoRa: admins only (see handleRequest); the image itself must be signed (LORA_OTA_PUBKEY)
+class RoomOtaRadio : public LoraOTARadio {
+  NodePrefs* _p;
+public:
+  RoomOtaRadio(NodePrefs* p) : _p(p) { }
+  void otaTempRadio(float freq, float bw, uint8_t sf, uint8_t cr) override { radio_driver.setParams(freq, bw, sf, cr); }
+  void otaRestoreRadio() override { radio_driver.setParams(_p->freq, _p->bw, _p->sf, _p->cr); }
+};
+static LoraOTAService ota_service;
+#endif
+
 int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t *payload,
                           size_t payload_len) {
   // uint32_t now = getRTCClock()->getCurrentTimeUnique();
   // memcpy(reply_data, &now, 4);   // response packets always prefixed with timestamp
   memcpy(reply_data, &sender_timestamp, 4); // reflect sender_timestamp back in response packet (kind of like a 'tag')
+
+#ifdef LORA_OTA_ENABLED
+  if (lora_ota::Receiver::isOtaReq(payload[0])) {
+    if (!sender->isAdmin()) return 0;
+    int n = ota_service.handleRequest(payload, payload_len, &reply_data[4], getRNG()->nextInt(1, 0x7FFFFFFF));
+    return n > 0 ? 4 + n : 0;
+  }
+#endif
 
   if (payload[0] == REQ_TYPE_GET_STATUS) {
     ServerStats stats;
@@ -541,6 +561,11 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
     if (sender_timestamp < client->last_timestamp) { // prevent replay attacks
       MESH_DEBUG_PRINTLN("onPeerDataRecv: possible replay attack detected");
     } else {
+#ifdef LORA_OTA_ENABLED
+      // OTA tags run far ahead of real time (one per chunk); recording one
+      // would lock out the real-time-stamped CLI, posts and logins
+      if (!lora_ota::Receiver::isOtaReq(data[4]))
+#endif
       client->last_timestamp = sender_timestamp;
 
       uint32_t now = getRTCClock()->getCurrentTime();
@@ -696,6 +721,9 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
 void MyMesh::begin(FILESYSTEM *fs) {
   mesh::Mesh::begin();
   _fs = fs;
+#ifdef LORA_OTA_ENABLED
+  ota_service.begin(*new RoomOtaRadio(&_prefs));   // first: arms the rollback deadline if this image is unconfirmed
+#endif
   // load persisted prefs
   _cli.loadPrefs(_fs);
 
@@ -985,6 +1013,10 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     }
   } else if (memcmp(command, "set repeat on", 13) == 0) {
     strcpy(reply, "ERR - repeat now deprecated");
+#ifdef LORA_OTA_ENABLED
+  } else if (memcmp(command, "ota ", 4) == 0 && ota_service.handleCommand(&command[4], reply)) {
+    // ota status | confirm | rollback
+#endif
   } else{
     _cli.handleCommand(sender_timestamp, command, reply);  // common CLI commands
   }
@@ -996,6 +1028,9 @@ bool MyMesh::saveFilter(ClientInfo* client) {
 
 void MyMesh::loop() {
   mesh::Mesh::loop();
+#ifdef LORA_OTA_ENABLED
+  ota_service.loop();
+#endif
 
   if (millisHasNowPassed(next_push) && acl.getNumClients() > 0) {
     // check for ACK timeouts

@@ -1,12 +1,17 @@
-// LoRa OTA on nRF52840 boards whose app keeps a LittleFS on QSPI flash
-// (QSPIFLASH: the Wio Tracker L1 companions).
+// LoRa OTA on nRF52840 boards with QSPI flash. Two ways to stage an image:
+//  * QSPIFLASH (companions): the app keeps a LittleFS on the QSPI chip, so the
+//    image and the backup are files in it.
+//  * otherwise (repeaters, room servers): nothing else uses the chip, so the
+//    image, the backup and the state sit in fixed raw slots on it; mounting a
+//    filesystem there would only format the chip.
 //
 // The Adafruit bootloader has no rollback and the app region cannot hold two
 // images, so:
-//  * A new image is staged as a file in the QSPI LittleFS. BEGIN writes the
-//    file full of 0xFF (so its blocks are allocated and still erased), records
-//    each block's physical QSPI address, and chunks are then programmed raw at
-//    those addresses (littlefs v1 does not checksum file data).
+//  * A new image is staged on QSPI. LittleFS: BEGIN writes the file full of
+//    0xFF (so its blocks are allocated and still erased), records each block's
+//    physical QSPI address, and chunks are then programmed raw at those
+//    addresses (littlefs v1 does not checksum file data). Raw: BEGIN erases
+//    the new-image slot, which is then one extent.
 //  * Install backs the running image up to a second file, then a routine that
 //    runs from RAM (SoftDevice off, interrupts off) copies the staged file into
 //    the app region and resets. The bootloader settings say "invalid app"
@@ -30,13 +35,6 @@
 #include <Adafruit_LittleFS.h>
 #include <SHA256.h>
 
-#ifndef QSPIFLASH
-  #error "LoRa OTA on nRF52 stages the image on the QSPI LittleFS (QSPIFLASH)"
-#endif
-#include <CustomLFS_QSPIFlash.h>
-#define LORA_OTA_MAX_EXTENTS 384
-#include "LoraOTALfs.h"
-
 extern "C" uint32_t __flash_arduino_start, __flash_arduino_end, __etext, __data_start__, __data_end__;
 
 #define APP_START    ((uint32_t)&__flash_arduino_start)
@@ -48,50 +46,25 @@ extern "C" uint32_t __flash_arduino_start, __flash_arduino_end, __etext, __data_
 #define WDT_SECS     120
 #define MAX_TRIAL_BOOTS 3
 
-#define NEW_PATH   "/ota-new.bin"
-#define OLD_PATH   "/ota-old.bin"
-#define STATE_PATH "/ota-state"
-
-
 struct OtaState {
   uint32_t magic;
   uint8_t trial;      // running image is on probation
   uint8_t boots;      // probation boots so far
-  uint8_t has_old;    // OLD_PATH holds the image to go back to
+  uint8_t has_old;    // the backup holds the image to go back to
   uint8_t rolled_back;
 };
 #define STATE_MAGIC 0x4D434F31   // "MCO1"
 
+#if defined(QSPIFLASH)
+  #include <CustomLFS_QSPIFlash.h>
+  #define LORA_OTA_MAX_EXTENTS 384
+#else
+  #include <nrfx_qspi.h>
+  #define LORA_OTA_MAX_EXTENTS 1
+#endif
+#include "LoraOTALfs.h"
+
 static ImageMap new_map, old_map;   // in RAM: the install routine reads them with flash off
-
-// ---------------------------------------------------------------- littlefs helpers
-
-static lfs_t* lfs() { return QSPIFlash._getFS(); }
-
-static bool mapFile(const char* path, uint32_t size, ImageMap& m) { return lfsMapFile(lfs(), path, size, m); }
-static bool writeFile(const char* path, const uint8_t* src, uint32_t size, bool fill_ff) {
-  return lfsWriteFile(lfs(), path, src, size, fill_ff);
-}
-
-static bool loadState(OtaState& s) {
-  lfs_file_t f;
-  memset(&s, 0, sizeof(s));
-  if (lfs_file_open(lfs(), &f, STATE_PATH, LFS_O_RDONLY) < 0) return false;
-  bool ok = lfs_file_read(lfs(), &f, &s, sizeof(s)) == sizeof(s) && s.magic == STATE_MAGIC;
-  lfs_file_close(lfs(), &f);
-  if (!ok) memset(&s, 0, sizeof(s));
-  return ok;
-}
-
-static bool saveState(OtaState s) {
-  s.magic = STATE_MAGIC;
-  return writeFile(STATE_PATH, (const uint8_t*)&s, sizeof(s), false);
-}
-
-static uint32_t fileSize(const char* path) {
-  struct lfs_info info;
-  return lfs_stat(lfs(), path, &info) >= 0 ? info.size : 0;
-}
 
 static uint32_t runningImageSize() {
   return ((uint32_t)&__etext - APP_START) + ((uint32_t)&__data_end__ - (uint32_t)&__data_start__);
@@ -231,7 +204,55 @@ static void installNow(const ImageMap* first, const ImageMap* fallback) {
   r_install(first, fallback);
 }
 
-// ---------------------------------------------------------------- staging flash
+#if defined(QSPIFLASH)
+
+#define NEW_PATH   "/ota-new.bin"
+#define OLD_PATH   "/ota-old.bin"
+#define STATE_PATH "/ota-state"
+
+// ---------------------------------------------------------------- littlefs helpers
+
+static lfs_t* lfs() { return QSPIFlash._getFS(); }
+
+static bool mapFile(const char* path, uint32_t size, ImageMap& m) { return lfsMapFile(lfs(), path, size, m); }
+static bool writeFile(const char* path, const uint8_t* src, uint32_t size, bool fill_ff) {
+  return lfsWriteFile(lfs(), path, src, size, fill_ff);
+}
+
+static bool loadState(OtaState& s) {
+  lfs_file_t f;
+  memset(&s, 0, sizeof(s));
+  if (lfs_file_open(lfs(), &f, STATE_PATH, LFS_O_RDONLY) < 0) return false;
+  bool ok = lfs_file_read(lfs(), &f, &s, sizeof(s)) == sizeof(s) && s.magic == STATE_MAGIC;
+  lfs_file_close(lfs(), &f);
+  if (!ok) memset(&s, 0, sizeof(s));
+  return ok;
+}
+
+static bool saveState(OtaState s) {
+  s.magic = STATE_MAGIC;
+  return writeFile(STATE_PATH, (const uint8_t*)&s, sizeof(s), false);
+}
+
+static uint32_t fileSize(const char* path) {
+  struct lfs_info info;
+  return lfs_stat(lfs(), path, &info) >= 0 ? info.size : 0;
+}
+
+
+// the store the platform below uses: files on the app's LittleFS
+
+static bool storeReady() { return lfs()->cfg != NULL; }   // mounted by the app before ota.begin()
+static void storeLock() { QSPIFlash._lockFS(); }
+static void storeUnlock() { QSPIFlash._unlockFS(); }
+static bool storeLoad(OtaState& s) { return loadState(s); }
+static bool storeSave(OtaState s) { return saveState(s); }
+static bool storeBackup(uint32_t size) {
+  return writeFile(OLD_PATH, (const uint8_t*)APP_START, size, false) && mapFile(OLD_PATH, size, old_map);
+}
+static bool storeMapOld() { return mapFile(OLD_PATH, fileSize(OLD_PATH), old_map) && old_map.size > 0; }
+
+// ---------------------------------------------------------------- staging flash (LittleFS)
 
 class QspiFileFlash : public lora_ota::Flash {
 public:
@@ -307,28 +328,202 @@ private:
   }
 };
 
+typedef QspiFileFlash StageFlash;
+
+#else   // raw slots
+
+// ---------------------------------------------------------------- raw QSPI slots
+
+// Fixed addresses, so an update cannot move them under the running image. A
+// slot holds a whole app region (792 KB on the S140 v7 layout).
+#ifndef LORA_OTA_RAW_SLOT
+  #define LORA_OTA_RAW_SLOT  0x0D0000UL                        // 832 KB
+#endif
+#define RAW_NEW    0UL
+#define RAW_OLD    LORA_OTA_RAW_SLOT
+#define RAW_STATE  (2 * LORA_OTA_RAW_SLOT)                     // one 4 KB sector
+#define RAW_NEEDED (RAW_STATE + PAGE)
+#define QSPI_PAGE  256
+
+struct RawState { OtaState st; uint32_t old_size; uint32_t spare; };   // whole words
+
+static bool raw_up = false, raw_failed = false;
+static uint32_t raw_old_size = 0;
+static uint32_t bounce[QSPI_PAGE / 4 + 2];   // QSPI DMA: word-aligned RAM only
+
+static bool rawBegin() {
+  if (raw_up) return true;
+  if (raw_failed) return false;
+  raw_failed = true;   // one attempt per boot
+#ifdef QSPI_FLASH_EN
+  pinMode(QSPI_FLASH_EN, OUTPUT);   // boards that power the chip from a GPIO (ThinkNode M6)
+  digitalWrite(QSPI_FLASH_EN, HIGH);
+  delay(5);
+#endif
+  nrfx_qspi_config_t c;   // this nrfx has no QSPI defaults in its config, so no NRFX_QSPI_DEFAULT_CONFIG
+  memset(&c, 0, sizeof(c));
+  c.pins.sck_pin = g_ADigitalPinMap[PIN_QSPI_SCK];
+  c.pins.csn_pin = g_ADigitalPinMap[PIN_QSPI_CS];
+  c.pins.io0_pin = g_ADigitalPinMap[PIN_QSPI_IO0];
+  c.pins.io1_pin = g_ADigitalPinMap[PIN_QSPI_IO1];
+  c.pins.io2_pin = g_ADigitalPinMap[PIN_QSPI_IO2];
+  c.pins.io3_pin = g_ADigitalPinMap[PIN_QSPI_IO3];
+  c.prot_if.readoc = NRF_QSPI_READOC_FASTREAD;   // single line, 24-bit: every QSPI NOR does this
+  c.prot_if.writeoc = NRF_QSPI_WRITEOC_PP;
+  c.prot_if.addrmode = NRF_QSPI_ADDRMODE_24BIT;
+  c.phy_if.sck_delay = 0x05;
+  c.phy_if.spi_mode = NRF_QSPI_MODE_0;
+  c.phy_if.sck_freq = NRF_QSPI_FREQ_32MDIV2;     // 16 MHz
+  c.irq_priority = 7;
+  if (nrfx_qspi_init(&c, NULL, NULL) != NRFX_SUCCESS) return false;   // no handler = blocking calls
+
+  // a bootloader or an earlier app may have left the chip in deep power-down
+  nrf_qspi_cinstr_conf_t rel = NRFX_QSPI_DEFAULT_CINSTR(0xAB, NRF_QSPI_CINSTR_LEN_1B);
+  nrfx_qspi_cinstr_xfer(&rel, NULL, NULL);
+  delayMicroseconds(50);
+
+  uint8_t id[3] = {0};   // JEDEC: manufacturer, type, log2(capacity)
+  nrf_qspi_cinstr_conf_t rdid = NRFX_QSPI_DEFAULT_CINSTR(0x9F, NRF_QSPI_CINSTR_LEN_4B);
+  if (nrfx_qspi_cinstr_xfer(&rdid, NULL, id) != NRFX_SUCCESS) return false;
+  uint32_t size = (id[2] >= 16 && id[2] <= 28) ? (1UL << id[2]) : 0;
+  LORA_OTA_LOG("ota: qspi %02X %02X %02X, %lu KB", id[0], id[1], id[2], (unsigned long)(size / 1024));
+  if (size < RAW_NEEDED) return false;   // missing chip or too small for two slots
+  raw_up = true;
+  raw_failed = false;
+  return true;
+}
+
+static bool rawErase(uint32_t addr, uint32_t len) {   // addr 4 KB aligned
+  uint32_t end = (addr + len + PAGE - 1) & ~(PAGE - 1);
+  while (addr < end) {
+    bool big = (addr & 0xFFFF) == 0 && end - addr >= 0x10000;
+    if (nrfx_qspi_erase(big ? NRF_QSPI_ERASE_LEN_64KB : NRF_QSPI_ERASE_LEN_4KB, addr) != NRFX_SUCCESS) return false;
+    addr += big ? 0x10000 : PAGE;
+  }
+  return true;
+}
+
+// Any address, any length, any source (RAM, packet, or internal flash, which
+// DMA cannot read): everything goes through the aligned bounce buffer, never
+// across a 256-byte program page, padded with 0xFF (programming 0xFF over
+// erased flash changes nothing; read padding is dropped).
+static bool rawIO(uint32_t addr, uint8_t* buf, uint32_t n, bool write) {
+  uint8_t* b = (uint8_t*)bounce;
+  while (n) {
+    uint32_t a = addr & ~3u, lead = addr - a;
+    uint32_t room = QSPI_PAGE - (a & (QSPI_PAGE - 1));   // to the end of this program page
+    uint32_t take = n < room - lead ? n : room - lead;
+    uint32_t total = (lead + take + 3) & ~3u;
+    if (write) {
+      memset(b, 0xFF, total);
+      memcpy(b + lead, buf, take);
+      if (nrfx_qspi_write(b, total, a) != NRFX_SUCCESS) return false;
+    } else {
+      if (nrfx_qspi_read(b, total, a) != NRFX_SUCCESS) return false;
+      memcpy(buf, b + lead, take);
+    }
+    addr += take; buf += take; n -= take;
+  }
+  return true;
+}
+
+static void setMap(ImageMap& m, uint32_t addr, uint32_t size) {
+  m.size = size;
+  m.n = 1;
+  m.ext[0].addr = addr;
+  m.ext[0].len = size;
+}
+
+// the store the platform below uses: raw slots
+
+static bool storeReady() { return rawBegin(); }
+static void storeLock() { }
+static void storeUnlock() { }
+
+static bool storeLoad(OtaState& s) {
+  RawState r;
+  memset(&s, 0, sizeof(s));
+  if (!rawIO(RAW_STATE, (uint8_t*)&r, sizeof(r), false) || r.st.magic != STATE_MAGIC) return false;
+  s = r.st;
+  raw_old_size = r.old_size <= RAW_OLD - RAW_NEW ? r.old_size : 0;
+  return true;
+}
+
+static bool storeSave(OtaState s) {
+  RawState r;
+  memset(&r, 0xFF, sizeof(r));
+  r.st = s;
+  r.st.magic = STATE_MAGIC;
+  r.old_size = raw_old_size;
+  return rawErase(RAW_STATE, PAGE) && rawIO(RAW_STATE, (uint8_t*)&r, sizeof(r), true);
+}
+
+static bool storeBackup(uint32_t size) {
+  if (size > LORA_OTA_RAW_SLOT) return false;
+  bool ok = rawErase(RAW_OLD, size) && rawIO(RAW_OLD, (uint8_t*)APP_START, size, true);
+  for (uint32_t off = 0; ok && off < size; off += QSPI_PAGE) {   // read back: the slot is the only way back
+    uint8_t chk[QSPI_PAGE];
+    uint32_t n = size - off < QSPI_PAGE ? size - off : QSPI_PAGE;
+    ok = rawIO(RAW_OLD + off, chk, n, false) && memcmp(chk, (const uint8_t*)APP_START + off, n) == 0;
+  }
+  raw_old_size = ok ? size : 0;
+  if (ok) setMap(old_map, RAW_OLD, size);
+  return ok;
+}
+
+static bool storeMapOld() {
+  if (raw_old_size == 0) return false;
+  setMap(old_map, RAW_OLD, raw_old_size);
+  return true;
+}
+
+// ---------------------------------------------------------------- staging flash (raw slot)
+
+class QspiRawFlash : public lora_ota::Flash {
+public:
+  size_t capacity() override {
+    uint32_t app = APP_END - APP_START;
+    return app < LORA_OTA_RAW_SLOT ? app : LORA_OTA_RAW_SLOT;
+  }
+  bool erase(size_t len) override {
+    LORA_OTA_LOG("ota: staging %lu bytes", (unsigned long)len);
+    bool ok = len <= capacity() && rawErase(RAW_NEW, len);
+    if (ok) setMap(new_map, RAW_NEW, len);
+    LORA_OTA_LOG("ota: slot %s t=%lu", ok ? "erased" : "FAILED", millis());
+    return ok;
+  }
+  bool write(size_t off, const uint8_t* src, size_t len) override {
+    return off + len <= new_map.size && rawIO(RAW_NEW + off, (uint8_t*)src, len, true);
+  }
+  bool read(size_t off, uint8_t* dest, size_t len) override {
+    return off + len <= new_map.size && rawIO(RAW_NEW + off, dest, len, false);
+  }
+  bool activate(size_t len) override { return len == new_map.size; }   // install() does the rest
+};
+typedef QspiRawFlash StageFlash;
+
+#endif   // QSPIFLASH
+
 // ---------------------------------------------------------------- platform
 
 class Nrf52OtaPlatform : public LoraOTAPlatform {
-  QspiFileFlash _flash;
+  StageFlash _flash;
   OtaState _st;
   char _desc[32];
 
-  bool haveFs() { return lfs()->cfg != NULL; }   // mounted by the app before ota.begin()
-
 public:
-  lora_ota::Flash* flash() override { return haveFs() ? &_flash : NULL; }
+  lora_ota::Flash* flash() override { return storeReady() ? &_flash : NULL; }
 
   bool begin() override {
-    if (!haveFs()) return false;
-    QSPIFlash._lockFS();
-    loadState(_st);
+    if (!storeReady()) return false;
+    storeLock();
+    storeLoad(_st);
     bool pending = _st.trial;
     if (pending) {
       _st.boots++;
-      saveState(_st);
+      storeSave(_st);
     }
-    QSPIFlash._unlockFS();
+    storeUnlock();
     if (pending && _st.boots > MAX_TRIAL_BOOTS) {
       MESH_DEBUG_PRINTLN("lora ota: new image keeps resetting, rolling back");
       rollback();
@@ -337,33 +532,33 @@ public:
   }
 
   bool confirm() override {
-    QSPIFlash._lockFS();
+    storeLock();
     _st.trial = 0;
     _st.boots = 0;
-    bool ok = saveState(_st);
-    QSPIFlash._unlockFS();
+    bool ok = storeSave(_st);
+    storeUnlock();
     return ok;   // the watchdog keeps running (it cannot be stopped): feedWatchdog() carries on
   }
 
   void rollback() override {
-    QSPIFlash._lockFS();
-    bool ok = _st.has_old && mapFile(OLD_PATH, fileSize(OLD_PATH), old_map) && old_map.size > 0;
+    storeLock();
+    bool ok = _st.has_old && storeMapOld();
     if (ok) {
       _st.trial = 0;
       _st.boots = 0;
       _st.rolled_back = 1;
-      ok = saveState(_st);
+      ok = storeSave(_st);
     }
-    QSPIFlash._unlockFS();
+    storeUnlock();
     if (ok) installNow(&old_map, NULL);
   }
 
   void install() override {
     // back up the running image, then copy the staged one in (reverting to the backup if it will not verify)
-    QSPIFlash._lockFS();
+    storeLock();
     uint32_t size = runningImageSize();
     LORA_OTA_LOG("ota: backing up %lu bytes", (unsigned long)size);
-    bool ok = writeFile(OLD_PATH, (const uint8_t*)APP_START, size, false) && mapFile(OLD_PATH, size, old_map);
+    bool ok = storeBackup(size);
     LORA_OTA_LOG("ota: backup %s, %u extents; new image %lu bytes, %u extents", ok ? "ok" : "FAILED", old_map.n,
                  (unsigned long)new_map.size, new_map.n);
     if (ok) {
@@ -371,9 +566,9 @@ public:
       _st.boots = 0;
       _st.has_old = 1;
       _st.rolled_back = 0;
-      ok = saveState(_st);
+      ok = storeSave(_st);
     }
-    QSPIFlash._unlockFS();
+    storeUnlock();
     if (ok) installNow(&new_map, &old_map);
   }
 
