@@ -34,6 +34,13 @@
 // without it, so nobody can OTA into firmware that cannot confirm/roll back.
 #define LORA_OTA_MARKER         "MCOTA-ROLLBACK-v1"
 
+// BEGIN's optional FLAGS byte (payload offset 101, after the chunk byte)
+#define LORA_OTA_FLAG_DELTA     0x01   // DATA carries a patch against the running image (LoraOTADelta.h)
+// bit1 (0x02) is reserved for another feature
+// a delta BEGIN continues: base sha256[0:8] @102 (what CONFIRM reports for the
+// running image), patch size u32 @110
+#define LORA_OTA_BEGIN_DELTA_LEN 114
+
 namespace lora_ota {
 
 enum Status : uint8_t {
@@ -50,7 +57,11 @@ enum Status : uint8_t {
   PENDING_VERIFY = 10,
   BAD_ARG = 11,
   WORKING = 12,   // BEGIN/FINISH accepted, the work runs from poll(): ask again
+  BASE_MISMATCH = 13,   // a delta BEGIN names a base that is not the running image
 };
+
+class DeltaStore;
+class DeltaDecoder;
 
 class Flash {
 public:
@@ -84,6 +95,13 @@ class Receiver {
   uint8_t _sha[32];
   uint32_t _last_ms;
   uint8_t _bitmap[LORA_OTA_MAX_CHUNKS / 8];
+  // delta: DATA carries _xfer bytes of patch (else _xfer == _size, the image itself)
+  DeltaStore* _dstore;
+  DeltaDecoder* _dec;
+  bool _delta, _decoded;
+  uint8_t _decoding;   // 0 no, 1 to start, 2 running
+  uint8_t _base8[8];
+  uint32_t _xfer;
 
   bool hasChunk(uint16_t i) const { return _bitmap[i >> 3] & (1 << (i & 7)); }
   uint16_t firstMissing() const;
@@ -92,6 +110,9 @@ class Receiver {
   int status(const uint8_t* p, size_t len, uint8_t* reply, uint32_t now_ms);
   int finish(const uint8_t* p, size_t len, uint8_t* reply);
   Status verifyImage();
+  Status prepare();
+  Status restage();
+  Status decodeStep();
 
 public:
   Receiver(Flash& flash, const uint8_t pubkey[32], const char* board);
@@ -104,6 +125,8 @@ public:
 
   void loop(uint32_t now_ms);           // drops a session idle for LORA_OTA_IDLE_MS
   void poll(uint32_t now_ms);           // the heavy part of BEGIN/FINISH; call from the main loop
+  // delta updates: base image + patch staging (NULL = full images only)
+  void setDelta(DeltaStore* store);
   void reset() { _state = IDLE; _size = 0; }   // e.g. the install of an activated image failed
   bool working() const { return _state == PREPARING || _state == VERIFYING; }
   bool receiving() const { return _state == RECEIVING || working(); }

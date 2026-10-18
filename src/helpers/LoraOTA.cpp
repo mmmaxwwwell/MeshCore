@@ -1,4 +1,5 @@
 #include "LoraOTA.h"
+#include "LoraOTADelta.h"
 
 #if defined(LORA_OTA_ENABLED) || defined(LORA_OTA_HOST_TEST)
 
@@ -32,6 +33,17 @@ Receiver::Receiver(Flash& flash, const uint8_t pubkey[32], const char* board) : 
   _chunk = LORA_OTA_CHUNK;
   _result = OK;
   _last_ms = 0;
+  _dstore = NULL;
+  _dec = NULL;
+  _delta = _decoded = false;
+  _decoding = 0;
+  _xfer = 0;
+  memset(_base8, 0, sizeof(_base8));
+}
+
+void Receiver::setDelta(DeltaStore* store) {
+  _dstore = store;
+  if (store && !_dec) _dec = new DeltaDecoder();
 }
 
 uint16_t Receiver::firstMissing() const {
@@ -59,7 +71,11 @@ int Receiver::handle(const uint8_t* req, size_t len, uint8_t* reply, uint32_t no
   return 0;
 }
 
-// BEGIN: size u32, sha256[32], sig[64] [, chunk u8] -> status, session u32, chunk u8, chunks u16
+// BEGIN: size u32, sha256[32], sig[64] [, chunk u8 [, flags u8 [, base_sha8[8], patch_size u32]]]
+//   -> status, session u32, chunk u8, chunks u16
+// size/sha/sig always describe the NEW image. With LORA_OTA_FLAG_DELTA the
+// DATA chunks carry patch_size bytes of patch against the running image,
+// which must be the one named by base_sha8 (else BASE_MISMATCH).
 // A new image answers WORKING; poll() checks the signature and prepares the
 // staging area, and a repeated BEGIN then gets OK + session (or the error).
 int Receiver::begin(const uint8_t* p, size_t len, uint8_t* reply, uint32_t now_ms, uint32_t random32, bool pending) {
@@ -71,8 +87,18 @@ int Receiver::begin(const uint8_t* p, size_t len, uint8_t* reply, uint32_t now_m
   uint8_t chunk = len > 100 ? p[100] : LORA_OTA_CHUNK;
   if (chunk > LORA_OTA_CHUNK) chunk = LORA_OTA_CHUNK;
   if (chunk < LORA_OTA_CHUNK_MIN) { reply[0] = BAD_ARG; return 1; }
+  uint8_t flags = len > 101 ? p[101] : 0;   // requests arrive zero padded: absent = 0
+  bool delta = flags & LORA_OTA_FLAG_DELTA;
+  uint32_t xfer = size;
+  const uint8_t* base8 = NULL;
+  if (delta) {
+    if (len < LORA_OTA_BEGIN_DELTA_LEN || !_dstore || !_dec) { reply[0] = BAD_ARG; return 1; }   // sender: send it whole
+    base8 = &p[102];
+    xfer = rd32(&p[110]);
+  }
 
-  bool same = size == _size && chunk == _chunk && memcmp(sha, _sha, 32) == 0;
+  bool same = size == _size && chunk == _chunk && memcmp(sha, _sha, 32) == 0 && delta == _delta &&
+              (!delta || (xfer == _xfer && memcmp(base8, _base8, 8) == 0));
   if (same && _state == PREPARING) { reply[0] = WORKING; return 1; }
   if (same && _state == IDLE && _result != OK) {   // the preparation failed: report it once
     reply[0] = _result;
@@ -86,8 +112,11 @@ int Receiver::begin(const uint8_t* p, size_t len, uint8_t* reply, uint32_t now_m
   } else {
     if (pending) { reply[0] = PENDING_VERIFY; return 1; }   // confirm the running image first
     if (_state == DONE || _state == VERIFYING) { reply[0] = BAD_STATE; return 1; }
-    if (size == 0 || (size + chunk - 1) / chunk > LORA_OTA_MAX_CHUNKS) { reply[0] = TOO_BIG; return 1; }
+    if (size == 0 || xfer == 0 || (xfer + chunk - 1) / chunk > LORA_OTA_MAX_CHUNKS) { reply[0] = TOO_BIG; return 1; }
     _size = size;
+    _xfer = xfer;
+    _delta = delta;
+    if (delta) memcpy(_base8, base8, 8);
     _chunk = chunk;
     memcpy(_sha, sha, 32);
     memcpy(_sig, sig, 64);
@@ -110,11 +139,12 @@ int Receiver::data(const uint8_t* p, size_t len, uint32_t now_ms) {
   if (_state != RECEIVING || len < 6 || rd32(p) != _session) return 0;
   uint16_t idx = rd16(&p[4]);
   if (idx >= _chunks) return 0;
-  size_t want = (idx == _chunks - 1) ? _size - (size_t)idx * _chunk : _chunk;
+  size_t want = (idx == _chunks - 1) ? _xfer - (size_t)idx * _chunk : _chunk;
   if (len - 6 < want) return 0;   // datagrams arrive zero-padded to the AES block size
   _last_ms = now_ms;
   if (hasChunk(idx)) return 0;   // duplicate: flash bits only go 1 -> 0, never rewrite
-  if (!_flash->write((size_t)idx * _chunk, &p[6], want)) return 0;
+  bool ok = _delta ? _dstore->patchWrite((size_t)idx * _chunk, &p[6], want) : _flash->write((size_t)idx * _chunk, &p[6], want);
+  if (!ok) return 0;
   _bitmap[idx >> 3] |= 1 << (idx & 7);
   _received++;
   return 0;
@@ -177,30 +207,66 @@ int Receiver::finish(const uint8_t* p, size_t len, uint8_t* reply) {
   }
   if (_received != _chunks) { reply[0] = INCOMPLETE; return 1; }
   _state = VERIFYING;
+  _decoding = (_delta && !_decoded) ? 1 : 0;   // a patch: poll() decodes it into the image first
   reply[0] = WORKING;
   return 1;
 }
 
+// erase the staging area (and, for a delta, the patch's) for a fresh pass
+Status Receiver::restage() {
+  _decoded = false;
+  _decoding = 0;
+  if (_dstore) _dstore->patchDone();   // a stale patch must not eat the room the image needs
+  if (!_flash->erase(_size)) return FLASH_ERROR;
+  return _delta ? _dstore->patchPrepare(_size, _xfer) : OK;
+}
+
+Status Receiver::prepare() {
+  uint8_t manifest[LORA_OTA_MANIFEST_LEN];
+  buildManifest(manifest, _board, _size, _sha);
+  if (_size > _flash->capacity()) return TOO_BIG;
+  if (!ed25519_verify(_sig, manifest, sizeof(manifest), _pubkey)) return BAD_SIGNATURE;
+  if (_delta) {
+    uint8_t running[8];
+    if (!_dstore->baseSha8(running) || memcmp(running, _base8, 8) != 0) return BASE_MISMATCH;
+  }
+  return restage();
+}
+
+// a slice of the patch decode: WORKING = more to do, OK = the image is written
+Status Receiver::decodeStep() {
+  if (_decoding == 1) {
+    if (!_dec->start(_dstore, _flash, _xfer, _size)) { _decoding = 0; return HASH_MISMATCH; }
+    _decoding = 2;
+  }
+  int r = _dec->step(LORA_OTA_DELTA_STEP);
+  if (r == 0) return WORKING;
+  _decoding = 0;
+  _decoded = r > 0;
+  return _decoded ? OK : HASH_MISMATCH;   // a bad patch: start over, like a bad image
+}
+
 void Receiver::poll(uint32_t now_ms) {
   if (_state == PREPARING) {
-    uint8_t manifest[LORA_OTA_MANIFEST_LEN];
-    buildManifest(manifest, _board, _size, _sha);
-    Status s = OK;
-    if (_size > _flash->capacity()) s = TOO_BIG;
-    else if (!ed25519_verify(_sig, manifest, sizeof(manifest), _pubkey)) s = BAD_SIGNATURE;
-    else if (!_flash->erase(_size)) s = FLASH_ERROR;
+    Status s = prepare();
     if (s != OK) {
       _state = IDLE;   // the next BEGIN with this image reports s
       _result = s;
       return;
     }
-    _chunks = (_size + _chunk - 1) / _chunk;
+    _chunks = (_xfer + _chunk - 1) / _chunk;
     _received = 0;
     memset(_bitmap, 0, sizeof(_bitmap));
     _state = RECEIVING;
     _last_ms = now_ms;
   } else if (_state == VERIFYING) {
-    Status s = verifyImage();
+    Status s = _decoding ? decodeStep() : OK;
+    if (s == WORKING) {
+      _last_ms = now_ms;
+      return;
+    }
+    if (s == OK) s = verifyImage();
+    if (s == OK && _delta) _dstore->patchDone();   // free its room before the install needs it
     if (s == OK && !_flash->activate(_size)) s = ACTIVATE_FAILED;
     if (s == OK) {
       _state = DONE;
@@ -212,7 +278,7 @@ void Receiver::poll(uint32_t now_ms) {
     if (s == HASH_MISMATCH || s == FLASH_ERROR) {
       memset(_bitmap, 0, sizeof(_bitmap));   // start over within the same session
       _received = 0;
-      if (!_flash->erase(_size)) _state = IDLE;
+      if (restage() != OK) _state = IDLE;
     }
   }
 }

@@ -73,6 +73,10 @@ $P tools/lora-ota/lora_ota.py sign wayfarer.bin --board wio_l1_companion_ble
 lora_ota.py push --companion E2:7D:69:21:47:AA --target Rhea rhea.bin                 # companion target
 lora_ota.py push --companion /dev/serial/by-id/... --target Wayfarer wayfarer.bin     # e.g. on titan, Rhea as sender
 lora_ota.py push --companion ... --target Quartz --password-file <admin pw> quartz.bin  # repeater target
+
+# delta: send only what changed since the image the target runs now (keep the .bin you flashed!)
+lora_ota.py push --companion ... --target Rhea --delta-from rhea-previous.bin rhea.bin
+lora_ota.py delta rhea-previous.bin rhea.bin -o rhea.patch   # just make one, to see its size
 ```
 
 Notes:
@@ -103,17 +107,77 @@ Notes:
 Repeater CLI (admin): `ota status`, `ota confirm`, `ota rollback` (only while
 pending).
 
+### Delta updates (`--delta-from`)
+
+Between two of our own builds most of the image is unchanged, so `push
+--delta-from BASE.bin` sends a patch that rebuilds the new image from the one
+the target runs (`delta.py`, stdlib only; format in its docstring):
+
+- **Patch:** bsdiff's matching (code that moved keeps its alignment; where an
+  address changed, a sparse byte diff), then raw deflate with a 2 KiB window.
+- **Target:** BEGIN carries the base's sha256[0:8] (what CONFIRM reports for
+  the running image). The target compares it with its running image before
+  any DATA, and refuses a mismatch with `BASE_MISMATCH` (13).
+  - The sender then sends the whole image instead. It does the same for
+    firmware without delta support (`BAD_ARG`) or without room for the
+    patch (`TOO_BIG`).
+  - The sender doesn't probe with CONFIRM first: CONFIRM would also confirm
+    a pending image.
+- **Staging:** the DATA chunks are the patch. The existing bitmap, STATUS
+  and resume logic is unchanged. The patch is staged:
+  - ESP32: at the end of the spare OTA partition.
+  - nRF52 LittleFS: in `/ota-patch.bin`, at most ~250 KB.
+  - nRF52 raw slots: in the backup slot, which install rewrites afterwards.
+- **FINISH:** the target decodes the patch into the normal staging area, a
+  32 KB slice per main-loop pass, answering WORKING meanwhile.
+  `verifyImage()` then checks the result against the **signed** size and
+  sha256, plus the marker.
+  - The signature always covers the final image, so a patch is never
+    trusted. A corrupt or malicious one decodes to garbage, which fails the
+    hash and never activates (`hash mismatch`; the sender resends once,
+    then gives up).
+  - Everything after verify (install, probation, rollback) is the same as
+    for a full image.
+- **Decoder** (`src/helpers/LoraOTADelta.cpp`): about 3.6 KB of RAM,
+  allocated once at boot, with no big stack frames. It reads the patch once,
+  front to back, and writes the image strictly in order.
+  - ESP32 reads the base with `esp_partition_read` on the running partition.
+  - nRF52 reads it straight from internal flash at `APP_START`.
+- **Keep the exact `.bin` each radio runs.** The base must be byte-identical
+  to what is flashed.
+  - ESP32: the app-only `firmware.bin`. The base sha is the hash esptool
+    appends to it.
+  - nRF52: the objcopy'd app region.
+
+Measured (2026-10-18, two builds of the same env from the same tree):
+
+| Env | Change | Image | Patch |
+|---|---|---|---|
+| Heltec_v3_companion_radio_usb_lora_ota (ESP32-S3) | `FIRMWARE_BUILD_DATE` "x" -> "y" | 664,432 B | 110 B (1 chunk) |
+| Heltec_v3_companion_radio_usb_lora_ota | +5-line CLI command (`uptime`) | 664,560 B | 23,255 B (3.5%) |
+| WioTrackerL1_companion_radio_ble_posreport_lora_ota (nRF52) | `FIRMWARE_BUILD_DATE` | 421,640 B | 40 B (1 chunk) |
+| WioTrackerL1_companion_radio_ble_posreport_lora_ota | +5-line CLI command | 421,784 B | 4,828 B (1.1%) |
+
+A code change shifts everything linked after it, so every pointer into the
+moved code changes: that, not the new code, is most of a code-change patch.
+
 ### Protocol (REQ payload, little endian; replies after the 4-byte tag)
 
 | Type | Request | Reply |
 |---|---|---|
-| `0x60` BEGIN | size u32, sha256[32], sig[64], chunk u8 | WORKING (12) while it checks the signature and stages; then status, session u32, chunk u8, chunks u16 |
+| `0x60` BEGIN | size u32, sha256[32], sig[64], chunk u8 [, flags u8 [, base sha256[0:8], patch size u32]] | WORKING (12) while it checks the signature and stages; then status, session u32, chunk u8, chunks u16 |
 | `0x61` DATA | session u32, index u16, bytes | none |
 | `0x62` STATUS | session u32, from u16 | status, received u16, first_missing u16, bitmap[128] |
 | `0x63` FINISH | session u32 | WORKING while it re-hashes; then status (OK: reboots in 6 s) |
 | `0x64` ABORT | session u32 | status |
 | `0x65` CONFIRM | none | status, was_pending u8, uptime_s u32, running sha256[0:8] |
 | `0x66` RADIO | freq kHz u32, bw Hz u32, sf, cr, idle s u16 | status; applies 1.5 s later, reverts after `idle` s without OTA traffic |
+
+BEGIN's size/sha/sig always describe the NEW image. flags (offset 101; absent =
+0): bit0 DELTA = DATA carries a patch of `patch size` bytes (offsets 102-113)
+against the running image named by `base sha256[0:8]`, and `chunks` counts
+patch chunks; bit1 is reserved for another feature. Status 13 BASE_MISMATCH =
+the target runs another image (codes 14+ belong to other features).
 
 The running sha is what the chip reports. On ESP32 that's the hash esptool
 appends to the image; on nRF52 it's the SHA-256 of the app image.
@@ -159,5 +223,20 @@ board, no marker, an unconfirmed running image, too big, an image altered
 after signing, resume after a dropped link, the confirm timing (only an
 answer from the rebooted image counts, and a rollback is reported), plus the
 nRF52 littlefs staging and the service layer under `-ffast-math`.
+
+Delta updates are tested the same way, against a simulated running image:
+- delta transfer, 20% loss, and a bad flash write in the patch;
+- a wrong base is refused before any DATA, and `push` falls back to the
+  whole image (also for firmware without delta support, or no room);
+- a corrupt patch, and one that decodes to a different image, never
+  activate;
+- a malformed patch is refused;
+- resume mid-delta.
+
+The firmware decoder is also built alone (`sim/delta_test.cpp`, `-ffast-math`,
+with ASan and UBSan where the compiler has them). It is run with odd step
+budgets and 300 fuzzed patches per pair. Set `LORA_OTA_DELTA_PAIRS` to a
+directory of real builds (`<env>-x.bin`, `<env>-y.bin`, `<env>-code.bin`) to
+run those pairs through the decoder and the whole protocol too.
 Requests are padded and size-checked like a real companion's. It needs
 `.pio/libdeps` (build any env once) for the rweather Crypto sources.

@@ -23,7 +23,8 @@ def build(out):
     if crypto is None:
         sys.exit("no rweather Crypto under .pio/libdeps (build any env once)")
     ed = os.path.join(REPO, "lib/ed25519")
-    srcs = [os.path.join(HERE, "ota_sim.cpp"), os.path.join(REPO, "src/helpers/LoraOTA.cpp")] + \
+    srcs = [os.path.join(HERE, "ota_sim.cpp"), os.path.join(REPO, "src/helpers/LoraOTA.cpp"),
+            os.path.join(REPO, "src/helpers/LoraOTADelta.cpp")] + \
            [os.path.join(crypto, f) for f in ("SHA256.cpp", "Hash.cpp", "Crypto.cpp")]
     objs = []
     for c in sorted(f for f in os.listdir(ed) if f.endswith(".c")):
@@ -80,18 +81,157 @@ def sign(img, key, board=BOARD, check_marker=True):
     return {"size": len(img), "sha256": sha.hex(), "sig": key.sign(L.manifest_message(board, len(img), sha)).hex()}
 
 
-def run(sim, tmp, img, m, args=(), cut_after=None, link=None):
+def run(sim, tmp, img, m, args=(), cut_after=None, link=None, **kw):
     out = os.path.join(tmp, "flash.out")
-    if os.path.exists(out):
+    if link is None and os.path.exists(out):
         os.unlink(out)
     link = link or SimLink(sim, list(args), out, cut_after)
-    s = L.OtaSender(link, img, m, log=lambda *_: None, status_timeout=0, retries=8)
+    s = L.OtaSender(link, img, m, log=lambda *_: None, status_timeout=0, retries=8, **kw)
     err = None
     try:
         asyncio.run(s.run())
     except (L.OtaError, ConnectionError) as e:
         err = e
     return link, s, out, err
+
+
+def build_delta_test(tmp):
+    """the firmware's delta decoder alone, -ffast-math like the nRF52 build, sanitizers if the compiler has them"""
+    exe = os.path.join(tmp, "delta_test")
+    base = ["c++", "-O1", "-g", "-ffast-math", "-Wall", "-DLORA_OTA_HOST_TEST", "-I", os.path.join(REPO, "src/helpers"),
+            os.path.join(HERE, "delta_test.cpp"), os.path.join(REPO, "src/helpers/LoraOTADelta.cpp"), "-o", exe]
+    san = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
+    if subprocess.run(base[:1] + san + base[1:], capture_output=True).returncode == 0:
+        return exe, True
+    subprocess.check_call(base)
+    return exe, False
+
+
+def realistic_change(img, insert_at, n_insert, every, seed=11):
+    """what a rebuild after a small code change looks like: code inserted, and
+    the code after it shifted, so pointers into it change all over the image"""
+    import random
+    r = random.Random(seed)
+    new = bytearray(img[:insert_at]) + bytearray(r.getrandbits(8) for _ in range(n_insert)) + bytearray(img[insert_at:])
+    for i in range(0, len(new) - 4, every):
+        v = (struct.unpack_from("<I", new, i)[0] + n_insert) & 0xFFFFFFFF
+        struct.pack_into("<I", new, i, v)
+    return bytes(new)
+
+
+def delta_tests(sim, tmp, key, pub, base, check):
+    import delta as D
+    q = lambda *_: None
+    base_path = os.path.join(tmp, "base.bin")
+    open(base_path, "wb").write(base)
+    base8 = L.running_sha(base)[:8]
+    darg = ["--pubkey", pub, "--base", base_path, "--base-sha8", base8.hex()]
+    new = realistic_change(base, 400_000, 300, 1500)
+    m = sign(new, key)
+    patch = D.make_patch(base, new)
+    check("delta: python round trip", D.apply_patch(base, patch) == new)
+    print(f"     (synthetic: {len(patch)}-byte patch for a {len(new)}-byte image)")
+
+    def got(link, out, err, want):
+        link.close()
+        return err is None and os.path.exists(out) and open(out, "rb").read() == want
+
+    link, s, out, err = run(sim, tmp, new, m, darg, patch=patch, base_sha8=base8)
+    frames = link.frames
+    check("delta: transfer, decode on target, signed sha verified", got(link, out, err, new), str(err))
+    check("delta: sends the patch, not the image", s.chunks == -(-len(patch) // s.chunk) and frames < len(new) // L.CHUNK // 4,
+          f"{frames} frames")
+
+    link, s, out, err = run(sim, tmp, new, m, darg + ["--drop", "20", "--seed", "5"], patch=patch, base_sha8=base8)
+    check("delta: 20% packet loss", got(link, out, err, new), str(err))
+
+    link, s, out, err = run(sim, tmp, new, m, darg + ["--corrupt-chunk", "3"], patch=patch, base_sha8=base8)
+    check("delta: bad flash write in the patch -> hash mismatch -> resend", got(link, out, err, new), str(err))
+
+    # the target runs something else: refused at BEGIN, before any DATA
+    other_base = realistic_change(base, 10, 4, 999, seed=3)
+    wrong = ["--pubkey", pub, "--base", base_path, "--base-sha8", L.running_sha(other_base)[:8].hex()]
+    link, s, out, err = run(sim, tmp, new, m, wrong, patch=patch, base_sha8=base8); link.close()
+    check("delta: wrong base refused (BASE_MISMATCH), nothing activated",
+          isinstance(err, L.DeltaRefused) and "base image" in str(err) and not os.path.exists(out) and link.data_sent == 0, str(err))
+
+    def push(args):
+        out = os.path.join(tmp, "flash.out")
+        if os.path.exists(out):
+            os.unlink(out)
+        link, logs = SimLink(sim, args, out), []
+        err, used = None, None
+        try:
+            used = asyncio.run(L.send_image(link, new, m, (patch, base8), log=logs.append, status_timeout=0, retries=8))
+        except L.OtaError as e:
+            err = e
+        return got(link, out, err, new), used, logs
+    ok, used, logs = push(wrong)
+    check("delta: wrong base -> push falls back to the whole image", ok and used is False and any("whole image" in x for x in logs),
+          str(logs))
+    ok, used, logs = push(["--pubkey", pub])   # firmware without a delta store answers BAD_ARG
+    check("delta: target without delta support -> whole image", ok and used is False, str(logs))
+    ok, used, logs = push(darg + ["--patch-capacity", "100"])
+    check("delta: no room for the patch -> whole image", ok and used is False, str(logs))
+    ok, used, logs = push(darg)
+    check("delta: push uses the delta when the base matches", ok and used is True, str(logs))
+
+    # corrupted patches never activate: the decode fails, or decodes to an image whose sha is not the signed one
+    bad = bytearray(patch); bad[len(bad) // 2] ^= 0x40
+    link, s, out, err = run(sim, tmp, new, m, darg, patch=bytes(bad), base_sha8=base8); link.close()
+    check("delta: corrupted patch never activates", err is not None and "hash mismatch" in str(err) and not os.path.exists(out),
+          str(err))
+    sneaky = D.make_patch(base, realistic_change(base, 400_000, 300, 1500, seed=99))   # decodes fine, to another image
+    link, s, out, err = run(sim, tmp, new, m, darg, patch=sneaky, base_sha8=base8); link.close()
+    check("delta: patch that decodes to another image never activates", err is not None and not os.path.exists(out), str(err))
+    junk = D.HDR.pack(D.MAGIC, 0, len(base), len(new)) + bytes([0x85, 0x80, 0x80, 0x80, 0x80, 0x01]) + b"\x00" * 50
+    link, s, out, err = run(sim, tmp, new, m, darg, patch=junk, base_sha8=base8); link.close()
+    check("delta: malformed patch refused cleanly", err is not None and not os.path.exists(out), str(err))
+
+    # resume mid-delta: the link dies, a new sender on the same target picks up the same session
+    big_new = realistic_change(base, 300_000, 20_000, 700, seed=4)
+    bm = sign(big_new, key)
+    big = D.make_patch(base, big_new)
+    link, s1, out, err = run(sim, tmp, big_new, bm, darg, cut_after=len(big) // L.CHUNK // 2, patch=big, base_sha8=base8)
+    link.cut_after, sent_before = None, link.data_sent
+    link, s2, out, err = run(sim, tmp, big_new, bm, link=link, patch=big, base_sha8=base8)
+    resent = link.data_sent - sent_before
+    check("delta: resume mid-delta", got(link, out, err, big_new) and s2.session == s1.session, str(err))
+    check("delta: resume sends only what is missing", resent < s2.chunks * 0.6, f"{resent} DATA frames, {s2.chunks} chunks")
+
+    # the firmware decoder on its own: odd step budgets, sanitizers, fuzzed patches
+    exe, sanitized = build_delta_test(tmp)
+    pairs = [("synthetic", base, new), ("synthetic big", base, big_new), ("from nothing", b"", new[:200_000])]
+    pair_dir = os.environ.get("LORA_OTA_DELTA_PAIRS")   # real builds: <env>-x.bin, -y.bin, -code.bin
+    real = []
+    if pair_dir:
+        for f in sorted(os.listdir(pair_dir)):
+            if f.endswith("-x.bin"):
+                stem = f[:-6]
+                for v in ("y", "code"):
+                    nf = os.path.join(pair_dir, f"{stem}-{v}.bin")
+                    if os.path.exists(nf):
+                        real.append((f"{stem} x->{v}", open(os.path.join(pair_dir, f), "rb").read(), open(nf, "rb").read()))
+    for name, b, n in pairs + real:
+        pb, nb, pp = (os.path.join(tmp, x) for x in ("d_base", "d_new", "d_patch"))
+        pt = D.make_patch(b, n)
+        for path, data in ((pb, b), (nb, n), (pp, pt)):
+            open(path, "wb").write(data)
+        r = subprocess.run([exe, pb, nb, pp, "300"], capture_output=True, text=True)
+        check(f"delta decoder (C, -ffast-math{', ASan+UBSan' if sanitized else ''}): {name}, {len(pt)} B for {len(n)} B",
+              r.returncode == 0 and "FAIL" not in r.stdout, r.stdout + r.stderr)
+    for name, b, n in real:   # and through the whole protocol, as the target would see it
+        rb = os.path.join(tmp, "real_base.bin")
+        open(rb, "wb").write(b)
+        b8 = L.running_sha(b)[:8]
+        rm = sign(n, key)
+        pt = D.make_patch(b, n)
+        link, s, out, err = run(sim, tmp, n, rm, ["--pubkey", pub, "--base", rb, "--base-sha8", b8.hex(), "--capacity", "0x300000"],
+                                patch=pt, base_sha8=b8)
+        check(f"delta over the protocol, real build {name}: {len(pt)} B patch ({100 * len(pt) / len(n):.2f}%)",
+              got(link, out, err, n), str(err))
+    if not real:
+        print("SKIP real build pairs (set LORA_OTA_DELTA_PAIRS to a directory of <env>-x.bin/-y.bin/-code.bin)")
 
 
 def main():
@@ -215,6 +355,8 @@ def main():
         r = subprocess.run([exe], capture_output=True, text=True)
         check("nRF52 littlefs staging: extents, raw out-of-order writes, remount, backup", r.returncode == 0, r.stdout)
 
+    delta_tests(sim, tmp, key, pub, img, check)
+
     # LoraOTAService (radio switch, confirm window, rollback) with -ffast-math like the nRF52 build
     crypto = next(os.path.join(REPO, ".pio/libdeps", d, "Crypto") for d in sorted(os.listdir(os.path.join(REPO, ".pio/libdeps")))
                   if os.path.exists(os.path.join(REPO, ".pio/libdeps", d, "Crypto", "SHA256.cpp")))
@@ -224,7 +366,7 @@ def main():
                            '-DLORA_OTA_PUBKEY="' + "00" * 32 + '"', '-DLORA_OTA_BOARD="test"',
                            "-I", os.path.join(HERE, "stubs"), "-I", os.path.join(REPO, "src/helpers"), "-I", ed, "-I", crypto,
                            os.path.join(HERE, "service_test.cpp"), os.path.join(REPO, "src/helpers/LoraOTAService.cpp"),
-                           os.path.join(REPO, "src/helpers/LoraOTA.cpp"),
+                           os.path.join(REPO, "src/helpers/LoraOTA.cpp"), os.path.join(REPO, "src/helpers/LoraOTADelta.cpp"),
                            *[os.path.join(crypto, f) for f in ("SHA256.cpp", "Hash.cpp", "Crypto.cpp")],
                            *[os.path.join(ed, f) for f in sorted(os.listdir(ed)) if f.endswith(".c")], "-o", exe])
     r = subprocess.run([exe], capture_output=True, text=True)

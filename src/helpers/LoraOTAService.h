@@ -6,6 +6,7 @@
 // (LoraOTAEsp32.cpp, LoraOTANrf52.cpp); the app supplies a LoraOTARadio.
 
 #include "LoraOTA.h"
+#include "LoraOTADelta.h"
 
 #ifdef LORA_OTA_ENABLED
 
@@ -30,6 +31,7 @@
 class LoraOTAPlatform {
 public:
   virtual lora_ota::Flash* flash() = 0;       // where a new image is staged; NULL = no OTA
+  virtual lora_ota::DeltaStore* deltaStore() { return NULL; }   // base + patch staging; NULL = full images only
   virtual bool begin() = 0;                   // true = this boot is an unconfirmed new image
   virtual bool confirm() = 0;                 // keep the running image
   virtual void rollback() = 0;                // boot the previous image; returns only on failure

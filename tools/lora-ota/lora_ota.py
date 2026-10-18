@@ -4,7 +4,8 @@
   lora_ota.py keygen                       make the signing key (once)
   lora_ota.py pubkey                       print it for -D LORA_OTA_PUBKEY
   lora_ota.py sign IMAGE --board TAG       write IMAGE.mcota (manifest + signature)
-  lora_ota.py push  --companion C --target T [--password-file F] IMAGE
+  lora_ota.py push  --companion C --target T [--password-file F] [--delta-from BASE] IMAGE
+  lora_ota.py delta BASE NEW -o PATCH      make a changes-only patch (push --delta-from does this itself)
   lora_ota.py status|confirm --companion C --target T --password-file F
 
 C is a companion radio: a /dev/... serial path or a BLE address.
@@ -28,13 +29,19 @@ CHUNK = COMPANION_FRAME - 1 - 32 - 7   # minus CMD_SEND_BINARY_REQ + pubkey, DAT
 STATUS_NAMES = {0: "ok", 1: "bad state", 2: "bad session", 3: "bad signature (or image for another board)",
                 4: "too big", 5: "flash error", 6: "incomplete", 7: "hash mismatch", 8: "no LoRa-OTA marker",
                 9: "activate failed", 10: "running image not confirmed yet ('ota confirm' first)", 11: "bad argument",
-                12: "working"}
+                12: "working", 13: "the target does not run the base image of this delta"}
 OK, INCOMPLETE, HASH_MISMATCH, WORKING = 0, 6, 7, 12
+BAD_ARG, BASE_MISMATCH = 11, 13
+FLAG_DELTA = 0x01   # BEGIN flags byte (offset 101); bit1 belongs to another feature
 WORK_SECS = 240   # longest a BEGIN (erase/stage) or FINISH (verify) may take on the target
 
 
 class OtaError(Exception):
     pass
+
+
+class DeltaRefused(OtaError):
+    """the target will not take this delta (other base, no delta support, no room): send it whole"""
 
 
 def manifest_message(board: str, size: int, sha: bytes) -> bytes:
@@ -119,8 +126,14 @@ class OtaSender:
          async request(payload, want_reply, timeout) -> reply body | None
        (None = no reply in time). Transport-agnostic: radio or simulator."""
 
-    def __init__(self, link, image, manifest, log=print, status_timeout=8.0, retries=6, keepalive=None, chunk=CHUNK):
-        self.link, self.image, self.m, self.log = link, image, manifest, log
+    def __init__(self, link, image, manifest, log=print, status_timeout=8.0, retries=6, keepalive=None, chunk=CHUNK,
+                 patch=None, base_sha8=None):
+        """patch + base_sha8: send a delta (DATA carries the patch); the manifest still
+        describes the NEW image, which the target rebuilds and checks against it."""
+        self.link, self.m, self.log = link, manifest, log
+        self.delta = patch is not None
+        self.image = patch if self.delta else image   # the bytes DATA carries
+        self.base_sha8 = base_sha8
         self.keepalive = keepalive   # async callable, run before each round
         self.status_timeout, self.retries = status_timeout, retries
         self.want_chunk = chunk
@@ -149,7 +162,12 @@ class OtaSender:
     async def begin(self):
         p = (bytes([REQ_BEGIN]) + struct.pack("<I", self.m["size"]) + bytes.fromhex(self.m["sha256"]) +
              bytes.fromhex(self.m["sig"]) + bytes([self.want_chunk]))
+        if self.delta:
+            assert len(self.base_sha8) == 8
+            p += bytes([FLAG_DELTA]) + self.base_sha8 + struct.pack("<I", len(self.image))
         r = await self.ask_done(p, "BEGIN")
+        if self.delta and r[0] in (BASE_MISMATCH, BAD_ARG, 4):   # 4 = too big: no room for the patch
+            raise DeltaRefused(f"delta refused: {STATUS_NAMES.get(r[0], r[0])}")
         if r[0] != OK:
             raise OtaError(f"BEGIN refused: {STATUS_NAMES.get(r[0], r[0])}")
         self.session, self.chunk, self.chunks = struct.unpack("<IBH", r[1:8])
@@ -210,6 +228,49 @@ class OtaSender:
     async def abort(self):
         if self.session is not None:
             await self.link.request(bytes([REQ_ABORT]) + self.sess, True, self.status_timeout)
+
+
+def plan_delta(base_path, image, log=print):
+    """(patch, base_sha8) for push --delta-from, or None when the whole image is as good"""
+    import delta as D
+    base = open(base_path, "rb").read()
+    t0 = time.monotonic()
+    patch = D.make_patch(base, image)
+    if D.apply_patch(base, patch) != image:   # never send a patch we cannot decode ourselves
+        raise OtaError("delta: the patch does not rebuild the image (bug in delta.py)")
+    log(f"delta from {os.path.basename(base_path)}: patch {len(patch)} bytes for a {len(image)}-byte image "
+        f"({100 * len(patch) / len(image):.1f}%, {time.monotonic() - t0:.0f} s to make)")
+    if len(patch) >= len(image):
+        log("delta: no smaller than the image; sending it whole")
+        return None
+    return patch, running_sha(base)[:8]
+
+
+async def send_image(link, image, m, plan=None, log=print, **kw):
+    """Send a delta if there is a plan and the target takes it, else the whole image.
+    The target checks the base at BEGIN, before any DATA: it must RUN that image.
+    (CONFIRM would tell us its sha too, but it also confirms a pending image.)
+    Returns True if the delta went through."""
+    if plan:
+        try:
+            await OtaSender(link, image, m, log=log, patch=plan[0], base_sha8=plan[1], **kw).run()
+            return True
+        except DeltaRefused as e:
+            log(f"{e}: the node runs another image (or cannot stage a patch); sending the whole image instead")
+    await OtaSender(link, image, m, log=log, **kw).run()
+    return False
+
+
+def cmd_delta(a):
+    import delta as D
+    base, new = open(a.base, "rb").read(), open(a.new, "rb").read()
+    patch = D.make_patch(base, new)
+    if D.apply_patch(base, patch) != new:
+        raise OtaError("the patch does not rebuild NEW (bug in delta.py)")
+    with open(a.output, "wb") as f:
+        f.write(patch)
+    print(f"{a.output}: {len(patch)} bytes for a {len(new)}-byte image ({100 * len(patch) / len(new):.1f}%); "
+          f"base sha8 {running_sha(base)[:8].hex()}")
 
 
 async def confirm_new_image(link, since, log=print, window=REBOOT_SECS + CONFIRM_SECS, sha=None):
@@ -334,6 +395,7 @@ def find_contact(mc, target):
 async def cmd_push(a):
     image, m = load_signed(a.image)
     fast = None if a.slow else parse_fast(a.fast)
+    plan = plan_delta(a.delta_from, image) if a.delta_from else None   # before the radio work: takes seconds
     mc = await connect(a.companion)
     restore = None
     try:
@@ -396,11 +458,10 @@ async def cmd_push(a):
             print(f"on {fast[0]} MHz / {fast[1]} kHz / SF{fast[2]}; the target drops back "
                   f"by itself after {RADIO_IDLE_SECS} s without OTA traffic")
 
-        sender = OtaSender(link, image, m)
         t0 = time.monotonic()
         # no ABORT on failure: the target drops a silent session after 5 min by itself,
         # and until then a new push of the same image resumes it
-        await sender.run()
+        await send_image(link, image, m, plan)
         rebooting = time.monotonic()
         print(f"transfer took {rebooting - t0:.0f} s")
         if restore:   # the new image boots on the node's own radio settings
@@ -496,6 +557,10 @@ def main():
     s = sub.add_parser("sign")
     s.add_argument("image")
     s.add_argument("--board", required=True)
+    d = sub.add_parser("delta")
+    d.add_argument("base")
+    d.add_argument("new")
+    d.add_argument("-o", "--output", required=True)
     for name in ("push", "status", "confirm"):
         p = sub.add_parser(name)
         p.add_argument("--companion", required=True)
@@ -510,11 +575,15 @@ def main():
             p.add_argument("--slow", action="store_true",
                            help="stay on the mesh radio settings (hours on the shared channel)")
             p.add_argument("--no-confirm", action="store_true")
+            p.add_argument("--delta-from", metavar="BASE",
+                           help="send only the changes from BASE, the image the target runs now "
+                                "(falls back to the whole image if it runs something else)")
     a = ap.parse_args()
     try:
         if a.cmd == "keygen": cmd_keygen(a)
         elif a.cmd == "pubkey": cmd_pubkey(a)
         elif a.cmd == "sign": cmd_sign(a)
+        elif a.cmd == "delta": cmd_delta(a)
         elif a.cmd == "push": asyncio.run(cancellable(cmd_push(a)))
         elif a.cmd == "confirm": asyncio.run(cmd_confirm(a))
         else: asyncio.run(cmd_cli(a, f"ota {a.cmd}"))

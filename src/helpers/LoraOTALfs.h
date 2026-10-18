@@ -17,12 +17,17 @@
 #endif
 
 struct Extent { uint32_t addr, len; };   // a run of image bytes at a flash address
-struct ImageMap { uint32_t size; uint16_t n; Extent ext[LORA_OTA_MAX_EXTENTS]; };
+template <uint16_t N> struct ExtentMap {
+  enum { MAX = N };
+  uint32_t size; uint16_t n; Extent ext[N];
+};
+typedef ExtentMap<LORA_OTA_MAX_EXTENTS> ImageMap;
 
 // Physical extents of a file's first `size` bytes. Reading one byte resolves
 // the file's current block/offset (littlefs v1 skips each block's ctz
 // pointers), so each extent runs from there to the end of that block.
-static inline bool lfsMapFile(lfs_t* l, const char* path, uint32_t size, ImageMap& m) {
+template <typename M>
+static inline bool lfsMapFile(lfs_t* l, const char* path, uint32_t size, M& m) {
   lfs_file_t f;
   m.size = size;
   m.n = 0;
@@ -35,7 +40,7 @@ static inline bool lfsMapFile(lfs_t* l, const char* path, uint32_t size, ImageMa
     uint32_t off = f.off - 1;
     uint32_t run = bs - off;
     if (run > size - pos) run = size - pos;
-    if (m.n == LORA_OTA_MAX_EXTENTS || (off & 3)) { ok = false; break; }
+    if (m.n == M::MAX || (off & 3)) { ok = false; break; }
     m.ext[m.n].addr = f.block * bs + off;
     m.ext[m.n].len = run;
     m.n++;

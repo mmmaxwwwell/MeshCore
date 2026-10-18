@@ -7,8 +7,10 @@
 //
 //   ota_sim --board TAG --pubkey HEX [--capacity N] [--drop PCT] [--seed N]
 //           [--corrupt-chunk I] [--pending] --out FILE
+//           [--base FILE --base-sha8 HEX [--patch-capacity N]]   (delta: the running image)
 
 #include "LoraOTA.h"
+#include "LoraOTADelta.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,6 +49,33 @@ public:
   }
 };
 
+// the running image (read-only) + a NOR area for the patch
+class RamDelta : public lora_ota::DeltaStore {
+public:
+  std::vector<uint8_t> base;
+  uint8_t sha8[8];
+  RamFlash patch;
+  bool done_called = false;
+  RamDelta(size_t cap) : patch(cap) { }
+  bool baseSha8(uint8_t out[8]) override { memcpy(out, sha8, 8); return true; }
+  size_t baseSize() override { return base.size(); }
+  bool readBase(size_t off, uint8_t* dest, size_t len) override {
+    if (off + len > base.size()) return false;
+    memcpy(dest, &base[off], len);
+    return true;
+  }
+  lora_ota::Status patchPrepare(size_t new_size, size_t patch_size) override {
+    if (patch_size > patch.capacity()) return lora_ota::TOO_BIG;
+    return patch.erase(patch_size) ? lora_ota::OK : lora_ota::FLASH_ERROR;
+  }
+  bool patchWrite(size_t off, const uint8_t* src, size_t len) override { return patch.write(off, src, len); }
+  bool patchRead(size_t off, uint8_t* dest, size_t len) override {
+    if (off + len > patch.erased) return false;
+    return patch.read(off, dest, len);
+  }
+  void patchDone() override { done_called = true; }
+};
+
 static bool readFull(uint8_t* p, size_t n) { return fread(p, 1, n, stdin) == n; }
 
 int main(int argc, char** argv) {
@@ -56,6 +85,8 @@ int main(int argc, char** argv) {
   unsigned seed = 1;
   long corrupt = -1;
   bool pending = false;
+  const char *base_path = NULL, *base_sha = NULL;
+  size_t patch_cap = 0x80000;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--board")) board = argv[++i];
     else if (!strcmp(argv[i], "--pubkey")) pubhex = argv[++i];
@@ -65,6 +96,9 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--corrupt-chunk")) corrupt = atol(argv[++i]);
     else if (!strcmp(argv[i], "--pending")) pending = true;
     else if (!strcmp(argv[i], "--out")) out = argv[++i];
+    else if (!strcmp(argv[i], "--base")) base_path = argv[++i];
+    else if (!strcmp(argv[i], "--base-sha8")) base_sha = argv[++i];
+    else if (!strcmp(argv[i], "--patch-capacity")) patch_cap = strtoul(argv[++i], NULL, 0);
   }
   if (!board || !pubhex || strlen(pubhex) != 64 || !out) { fprintf(stderr, "usage: see source\n"); return 2; }
   uint8_t pub[32];
@@ -74,6 +108,17 @@ int main(int argc, char** argv) {
   RamFlash flash(capacity);
   long corrupt_chunk = corrupt;   // byte offset known once BEGIN fixes the chunk size
   static lora_ota::Receiver rx(flash, pub, board);
+  static RamDelta delta(patch_cap);
+  if (base_path) {
+    FILE* f = fopen(base_path, "rb");
+    if (!f || !base_sha || strlen(base_sha) != 16) { fprintf(stderr, "sim: --base needs a file and --base-sha8\n"); return 2; }
+    uint8_t buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) delta.base.insert(delta.base.end(), buf, buf + n);
+    fclose(f);
+    for (int i = 0; i < 8; i++) delta.sha8[i] = hexval(base_sha[2 * i]) << 4 | hexval(base_sha[2 * i + 1]);
+    rx.setDelta(&delta);
+  }
 
   uint32_t now = 0;
   uint8_t req[256], reply[256];
@@ -91,7 +136,8 @@ int main(int argc, char** argv) {
     } else {
       n = rx.handle(req, len, reply, now, (uint32_t)rand() | 1, pending);
       if (req[0] == LORA_OTA_REQ_BEGIN && n >= 8 && reply[0] == 0 && corrupt_chunk >= 0 && flash.corrupt_off < 0) {
-        flash.corrupt_off = corrupt_chunk * reply[5];
+        RamFlash& target = base_path ? delta.patch : flash;   // a delta's chunks land in the patch area
+        target.corrupt_off = corrupt_chunk * reply[5];
         corrupt_chunk = -1;
       }
       if (n > 0 && rand() % 100 < drop) { n = 0; n_dropped++; }   // reply lost on air
@@ -103,7 +149,8 @@ int main(int argc, char** argv) {
     fflush(stdout);
   }
 
-  fprintf(stderr, "sim: %u requests, %u lost, activated %zu bytes\n", n_req, n_dropped, flash.activated);
+  fprintf(stderr, "sim: %u requests, %u lost, activated %zu bytes%s\n", n_req, n_dropped, flash.activated,
+          base_path && delta.done_called ? ", patch area released" : "");
   if (flash.activated) {
     FILE* f = fopen(out, "wb");
     fwrite(flash.mem.data(), 1, flash.activated, f);
