@@ -22,6 +22,7 @@
 #include <helpers/ClientACL.h>
 #include <helpers/RegionMap.h>
 #include <helpers/RoutingPolicy.h>
+#include <helpers/LoraOTAService.h>
 #include <RTClib.h>
 #include <target.h>
 
