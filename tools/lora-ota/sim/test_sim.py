@@ -49,6 +49,8 @@ class SimLink:
             if self.cut_after is not None and self.data_sent > self.cut_after:
                 raise ConnectionError("link cut")
         self.frames += 1
+        # MeshCore encrypts tag + payload in 16-byte AES blocks: the target sees zero padding
+        payload = payload + b"\0" * ((-(4 + len(payload))) % 16)
         self.p.stdin.write(struct.pack("<H", len(payload)) + payload)
         self.p.stdin.flush()
         n = struct.unpack("<H", self.p.stdout.read(2))[0]

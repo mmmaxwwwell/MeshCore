@@ -12,7 +12,7 @@ T is the target: a contact name or a public-key hex prefix. A repeater target
 takes the admin password; a companion target takes OTA only from radios it has
 favourited.
 """
-import argparse, asyncio, hashlib, json, math, os, random, struct, sys, time
+import argparse, asyncio, hashlib, json, math, os, random, signal, struct, sys, time
 
 DEFAULT_KEY = os.path.expanduser("~/.config/meshcore/ota-signing.key")
 MARKER = b"MCOTA-ROLLBACK-v1"
@@ -380,11 +380,13 @@ async def cmd_push(a):
             except OtaError as e:
                 print(f"(confirmed; follow-up check failed: {e})")
     finally:
-        if restore:
-            await mc.commands.set_radio(*restore[:4], repeat=restore[6])
-            await mc.commands.set_tuning(*restore[4:6])
-            print(f"companion back on its radio settings; the target drops back within {RADIO_IDLE_SECS} s")
-        await mc.disconnect()
+        async def cleanup():
+            if restore:
+                await mc.commands.set_radio(*restore[:4], repeat=restore[6])
+                await mc.commands.set_tuning(*restore[4:6])
+                print(f"companion back on its radio settings; the target drops back within {RADIO_IDLE_SECS} s")
+            await mc.disconnect()
+        await asyncio.shield(cleanup())   # a Ctrl-C mid-transfer must still put the companion back
 
 
 async def cmd_confirm(a):
@@ -421,6 +423,25 @@ async def cmd_cli(a, cmd):
         await mc.disconnect()
 
 
+async def cancellable(coro):
+    """SIGINT/SIGTERM cancel the transfer ONCE, so its finally (radio restore) runs to the end."""
+    task = asyncio.ensure_future(coro)
+    loop = asyncio.get_running_loop()
+    def stop():
+        if not task.cancelled():
+            print("interrupted: restoring the companion's radio settings", file=sys.stderr)
+            task.cancel()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.remove_signal_handler(sig)
+            loop.add_signal_handler(sig, lambda: None)   # ignore further signals until cleanup ends
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop)
+    try:
+        return await task
+    except asyncio.CancelledError:
+        raise OtaError("interrupted")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--key", default=DEFAULT_KEY)
@@ -449,7 +470,7 @@ def main():
         if a.cmd == "keygen": cmd_keygen(a)
         elif a.cmd == "pubkey": cmd_pubkey(a)
         elif a.cmd == "sign": cmd_sign(a)
-        elif a.cmd == "push": asyncio.run(cmd_push(a))
+        elif a.cmd == "push": asyncio.run(cancellable(cmd_push(a)))
         elif a.cmd == "confirm": asyncio.run(cmd_confirm(a))
         else: asyncio.run(cmd_cli(a, f"ota {a.cmd}"))
     except OtaError as e:

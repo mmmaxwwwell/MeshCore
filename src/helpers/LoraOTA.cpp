@@ -107,7 +107,7 @@ int Receiver::data(const uint8_t* p, size_t len, uint32_t now_ms) {
   uint16_t idx = rd16(&p[4]);
   if (idx >= _chunks) return 0;
   size_t want = (idx == _chunks - 1) ? _size - (size_t)idx * _chunk : _chunk;
-  if (len - 6 != want) return 0;
+  if (len - 6 < want) return 0;   // datagrams arrive zero-padded to the AES block size
   _last_ms = now_ms;
   if (hasChunk(idx)) return 0;   // duplicate: flash bits only go 1 -> 0, never rewrite
   if (!_flash->write((size_t)idx * _chunk, &p[6], want)) return 0;

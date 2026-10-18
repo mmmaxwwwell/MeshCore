@@ -1,4 +1,4 @@
-# Firmware over LoRa (ESP32 repeaters)
+# Firmware over LoRa (ESP32 and nRF52, repeaters and companions)
 
 Sends a signed firmware image to a repeater over the LoRa link itself, through
 any companion radio, with automatic rollback. Design and decisions:
@@ -6,30 +6,49 @@ any companion radio, with automatic rollback. Design and decisions:
 
 ## How it works
 
-1. The sender logs in to the repeater as admin through a companion (USB or BLE)
-   and checks `ota status` (board tag, not pending).
-2. `tempradio 919.0 500 5 5 <mins>` moves the repeater to a private fast
-   channel. The companion follows. The repeater falls back to its own settings
-   by itself when the timer ends, so a dead laptop can't strand it.
-3. BEGIN carries size, SHA-256 and an ed25519 signature. The repeater checks
-   the signature against the key compiled into it (`LORA_OTA_PUBKEY`) and
-   its own board tag (`LORA_OTA_BOARD`), then erases its spare OTA partition.
-4. 156-byte DATA chunks stream without per-chunk acks. STATUS returns a bitmap
-   of what's missing, and the sender resends only that. A broken link can
-   resume: a new push of the same image continues the same session.
-5. When the node has every chunk it says so. On FINISH it reads the image
-   back and checks the SHA-256 and the LoRa-OTA marker. If those pass, it sets
-   the image as the boot image, answers "checksum good, rebooting" and reboots
-   6 s later.
-6. The new image boots on probation. The sender switches the companion back
-   to the mesh settings and sends CONFIRM (a binary request; no new login,
-   since the node keeps its admin list in flash) until the REBOOTED node
-   answers. Uptime in the reply tells the new image from the old one. **No
-   CONFIRM within 60 s of boot, or a crash or hang before one: the bootloader
-   goes back to the old image.**
+1. The sender talks to the target through any companion radio (USB or BLE).
+   - **Repeater target:** the sender logs in as admin.
+   - **Companion target:** no login. A companion takes OTA requests only
+     from radios it has **favourited**.
+2. REQ_RADIO moves the target to a private fast channel (default 919.0 MHz,
+   500 kHz, SF5); the sending companion follows. The target drops back to
+   its own settings by itself after 90 s without OTA traffic, so a dead
+   laptop can't strand it.
+3. BEGIN carries size, SHA-256, an ed25519 signature and the chunk size.
+   The target checks the signature against the key compiled into it
+   (`LORA_OTA_PUBKEY`) and its own board tag (`LORA_OTA_BOARD`), then
+   prepares its staging area.
+4. DATA chunks stream without per-chunk acks. 136 bytes is the most a stock
+   companion's 176-byte command frame carries; the target caps chunks at
+   156. STATUS returns a bitmap of what's missing, and the sender resends
+   only that. A broken link can resume: a new push of the same image
+   continues the same session.
+5. FINISH: the target reads the image back and checks the hash and the
+   LoRa-OTA marker, answers "checksum good, rebooting", and installs it 6 s
+   later.
+6. The new image boots on probation. The sender sends CONFIRM until the
+   REBOOTED target answers (its uptime tells new from old). **No CONFIRM
+   within 60 s of boot, or a crash or hang before one: back to the old
+   image.**
 
-Every request is an admin REQ datagram (encrypted, MAC'd), so only an admin
-can run a session. The signature means an admin password alone cannot install
+Per chip:
+- **ESP32:** staged in the spare OTA partition. The bootloader's own
+  rollback does the rest.
+- **nRF52840 with a QSPI LittleFS** (Wio Tracker L1 companions etc.):
+  - **Staging:** in a file on that filesystem.
+  - **Install:** back up the running image to a second file, then a RAM
+    routine copies the new one into the app region. It marks the app invalid
+    while it copies, so a power cut lands in the bootloader's DFU mode
+    instead of half an image. It verifies the copy, falls back to the backup
+    if the copy won't verify, and starts the hardware watchdog.
+  - **Rollback:** the probation logic reinstalls the backup.
+  - **Not covered:** an image that dies on every boot before the OTA service
+    starts.
+  - Which boards: `~/git/homelab/docs/build-notes/meshcore-lora-ota-plan.md` L8.
+
+Every request is a REQ datagram encrypted and MAC'd with the shared secret of
+an admin (repeater) or a favourite (companion), so nobody else can run a
+session. The signature means an admin password alone cannot install
 code: you also need the signing key.
 
 ## Use
