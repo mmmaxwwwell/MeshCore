@@ -124,6 +124,9 @@ public:
 #ifdef POSITION_REPORT
   void handlePosReportCmd(size_t len);
 #endif
+#ifdef OVERLAY_MESH
+  void handleOverlayCmd(size_t len);
+#endif
   bool advert();
   void enterCLIRescue();
 
@@ -244,6 +247,23 @@ private:
 
   DataStore* _store;
   NodePrefs _prefs;
+#ifdef OVERLAY_MESH
+  // Overlay mesh on top of the public one: floods addressed to OUR nodes
+  // (favourited contacts) carry the transport code of one region ("#<name>",
+  // key = SHA256 of the name, as for any hashtag region), so public repeaters,
+  // which do not list it, drop them; our repeaters list it and forward. With
+  // client repeat on, this companion forwards ONLY those region floods and
+  // direct packets routed through it, never public floods.
+  struct OverlayCfg {
+    uint32_t magic;
+    char name[32];     // "#..."; empty = off
+  };
+  OverlayCfg _overlay;
+  TransportKey _overlay_key;
+  void overlayLoad();
+  void overlaySave();
+  bool isOverlayFlood(const mesh::Packet* pkt) const;
+#endif
 #ifdef POSITION_REPORT
   // Position reports to one contact (titan's Rhea): while the GPS is on, every
   // interval_min a DM "#loc1 lat lon alt_m sats batt_mv fix_unix" (or "#loc1

@@ -5,6 +5,9 @@
 #include <WiFi.h>
 #endif
 #include <Mesh.h>
+#ifdef OVERLAY_MESH
+#include <SHA256.h>
+#endif
 
 #define CMD_APP_START                 1
 #define CMD_SEND_TXT_MSG              2
@@ -67,6 +70,7 @@
 #define CMD_SEND_RAW_PACKET           65
 #define CMD_RUN_CLI_COMMAND           66  // v14+
 #define CMD_POSREPORT                 0xA1  // fork: position reports (POSITION_REPORT builds), sub-op in byte 1
+#define CMD_OVERLAY                   0xA2  // fork: overlay mesh (OVERLAY_MESH builds), sub-op in byte 1
 
 // Stats sub-types for CMD_GET_STATS
 #define STATS_TYPE_CORE               0
@@ -104,6 +108,13 @@
 #define RESP_CODE_DEFAULT_FLOOD_SCOPE 28
 #define RESP_CODE_CLI_REPLY           29  // v14+, a reply to CMD_RUN_CLI_COMMAND
 #define RESP_CODE_POSREPORT           0xA1  // fork: reply to CMD_POSREPORT / POSREPORT_OP_STATUS
+
+#define RESP_CODE_OVERLAY             0xA2
+#define OVERLAY_OP_STATUS             0x01  // -> A2 01 | on | repeat | name(NUL-terminated, 32)
+#define OVERLAY_OP_SET                0x02  // name (bytes to end of frame, "#..."; empty = off)
+#define OVERLAY_FILE                  "/overlay"
+#define OVERLAY_MAGIC                 0x31594C4FUL   // "OLY1"
+#define OVERLAY_MAX_HOPS              8
 
 #define POSREPORT_OP_STATUS           0x01
 #define POSREPORT_OP_SET              0x02  // interval_min(u16 LE) dest_prefix[6]
@@ -501,7 +512,16 @@ bool MyMesh::filterRecvFloodPacket(mesh::Packet* packet) {
 }
 
 bool MyMesh::allowPacketForward(const mesh::Packet* packet) {
+#ifdef OVERLAY_MESH
+  if (!_prefs.isRepeatEn()) return false;
+  if (packet->isRouteFlood()) {
+    // Public floods are not ours to carry: only the overlay region, and bounded.
+    return isOverlayFlood(packet) && packet->getPathHashCount() < OVERLAY_MAX_HOPS;
+  }
+  return true;   // direct: we are on its path (paths are learned from overlay floods)
+#else
   return _prefs.isRepeatEn();
+#endif
 }
 
 void MyMesh::sendFloodScoped(const TransportKey& scope, mesh::Packet* pkt, uint32_t delay_millis) {
@@ -516,6 +536,14 @@ void MyMesh::sendFloodScoped(const TransportKey& scope, mesh::Packet* pkt, uint3
 }
 
 void MyMesh::sendFloodScoped(const ContactInfo& recipient, mesh::Packet* pkt, uint32_t delay_millis) {
+#ifdef OVERLAY_MESH
+  // Traffic between our nodes (DMs, ACKs, path returns, replies all come
+  // through here) stays on the overlay: never relayed by public repeaters.
+  if (_overlay.name[0] && (recipient.flags & 1)) {
+    sendFloodScoped(_overlay_key, pkt, delay_millis);
+    return;
+  }
+#endif
   // TODO: dynamic send_scope, depending on recipient and current 'home' Region
   if (send_unscoped) {
     sendFlood(pkt, delay_millis, _prefs.path_hash_mode + 1);  // app has explicitly requested un-scoped
@@ -1022,6 +1050,9 @@ void MyMesh::begin() {
   _store->loadChannels(this);
 #ifdef POSITION_REPORT
   posReportLoad();
+#endif
+#ifdef OVERLAY_MESH
+  overlayLoad();
 #endif
 
   radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
@@ -2082,11 +2113,86 @@ void MyMesh::handleCmdFrame(size_t len) {
   } else if (cmd_frame[0] == CMD_POSREPORT && len >= 2) {
     handlePosReportCmd(len);
 #endif
+#ifdef OVERLAY_MESH
+  } else if (cmd_frame[0] == CMD_OVERLAY && len >= 2) {
+    handleOverlayCmd(len);
+#endif
   } else {
     writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
     MESH_DEBUG_PRINTLN("ERROR: unknown command: %02X", cmd_frame[0]);
   }
 }
+
+#ifdef OVERLAY_MESH
+static File overlayOpenWrite(FILESYSTEM* fs, const char* filename) {
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  fs->remove(filename);
+  return fs->open(filename, FILE_O_WRITE);
+#elif defined(RP2040_PLATFORM)
+  return fs->open(filename, "w");
+#else
+  return fs->open(filename, "w", true);
+#endif
+}
+
+static void overlayKeyFor(const char* name, TransportKey& k) {
+  SHA256 sha;   // same derivation as TransportKeyStore::getAutoKeyFor for a "#name" region
+  sha.update(name, strlen(name));
+  sha.finalize(k.key, sizeof(k.key));
+}
+
+void MyMesh::overlayLoad() {
+  memset(&_overlay, 0, sizeof(_overlay));
+  memset(&_overlay_key, 0, sizeof(_overlay_key));
+  File f = _store->openRead(OVERLAY_FILE);
+  if (f) {
+    OverlayCfg c;
+    if (f.read((uint8_t*)&c, sizeof(c)) == sizeof(c) && c.magic == OVERLAY_MAGIC && c.name[0] == '#'
+        && memchr(c.name, 0, sizeof(c.name))) {
+      _overlay = c;
+      overlayKeyFor(_overlay.name, _overlay_key);
+    }
+    f.close();
+  }
+}
+
+void MyMesh::overlaySave() {
+  File f = overlayOpenWrite(_store->getPrimaryFS(), OVERLAY_FILE);
+  if (f) {
+    _overlay.magic = OVERLAY_MAGIC;
+    f.write((const uint8_t*)&_overlay, sizeof(_overlay));
+    f.close();
+  }
+}
+
+bool MyMesh::isOverlayFlood(const mesh::Packet* pkt) const {
+  return _overlay.name[0] && pkt->getRouteType() == ROUTE_TYPE_TRANSPORT_FLOOD
+      && pkt->transport_codes[0] == _overlay_key.calcTransportCode(pkt);
+}
+
+void MyMesh::handleOverlayCmd(size_t len) {
+  uint8_t op = cmd_frame[1];
+  if (op == OVERLAY_OP_STATUS) {
+    int i = 0;
+    out_frame[i++] = RESP_CODE_OVERLAY;
+    out_frame[i++] = OVERLAY_OP_STATUS;
+    out_frame[i++] = _overlay.name[0] ? 1 : 0;
+    out_frame[i++] = _prefs.isRepeatEn() ? 1 : 0;
+    memcpy(&out_frame[i], _overlay.name, sizeof(_overlay.name)); i += sizeof(_overlay.name);
+    _serial->writeFrame(out_frame, i);
+  } else if (op == OVERLAY_OP_SET) {
+    size_t n = len - 2;
+    if (n >= sizeof(_overlay.name) || (n > 0 && cmd_frame[2] != '#')) { writeErrFrame(ERR_CODE_ILLEGAL_ARG); return; }
+    memset(_overlay.name, 0, sizeof(_overlay.name));
+    memcpy(_overlay.name, &cmd_frame[2], n);
+    if (n) overlayKeyFor(_overlay.name, _overlay_key); else memset(&_overlay_key, 0, sizeof(_overlay_key));
+    overlaySave();
+    writeOKFrame();
+  } else {
+    writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+  }
+}
+#endif
 
 #ifdef POSITION_REPORT
 static File posrepOpenWrite(FILESYSTEM* fs, const char* filename) {
