@@ -40,11 +40,13 @@ int LoraOTAService::handleRequest(const uint8_t* req, size_t len, uint8_t* reply
 
   if (req[0] == LORA_OTA_REQ_RADIO) {     // freq_khz u32, bw_hz u32, sf, cr, idle_s u16 -> status
     if (len < 13) { reply[0] = lora_ota::BAD_ARG; return 1; }
-    float freq = rd32(&req[1]) / 1000.0f, bw = rd32(&req[5]) / 1000.0f;
+    // check the integers: as floats, 500000 Hz / 1000 came out 500.00003 kHz on nRF52 (> 500)
+    uint32_t f_khz = rd32(&req[1]), bw_hz = rd32(&req[5]);
     uint8_t sf = req[9], cr = req[10];
     uint16_t idle = req[11] | (req[12] << 8);
-    if (freq < 150 || freq > 2500 || bw < 7 || bw > 500 || sf < 5 || sf > 12 || cr < 5 || cr > 8 ||
-        idle < 10 || idle > LORA_OTA_RADIO_MAX_IDLE_S) {
+    float freq = f_khz / 1000.0f, bw = bw_hz / 1000.0f;   // RadioLib matches bandwidths with slack
+    if (f_khz < 150000 || f_khz > 2500000 || bw_hz < 7000 || bw_hz > 500000 || sf < 5 || sf > 12 ||
+        cr < 5 || cr > 8 || idle < 10 || idle > LORA_OTA_RADIO_MAX_IDLE_S) {
       reply[0] = lora_ota::BAD_ARG;
       return 1;
     }
