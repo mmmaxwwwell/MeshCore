@@ -90,6 +90,7 @@ struct AdvertPath {
 
 class MyMesh : public BaseChatMesh, public DataStoreHost {
   friend class CompanionSettingsTarget;   // signed settings over LoRa (MyMesh.cpp)
+  friend class CompanionMaintTarget;      // maintenance over LoRa (MyMesh.cpp)
 public:
   class Listener {
     public:

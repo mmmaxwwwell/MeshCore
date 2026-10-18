@@ -15,6 +15,11 @@
   lora_ota.py settings eta BUNDLE [--hops N | --flood] [--duty PCT]     packets and airtime of a push
   lora_ota.py settings push --companion C --target T [--password-file F] BUNDLE
   lora_ota.py settings show|status|confirm|revert --companion C --target T [--password-file F]
+  lora_ota.py maint OP --companion C --target T [--password-file F] [--json] ...   (README: Maintenance)
+      read:   status | files [--fs 0|1] [DIR] | contacts [--types T] [--non-favourites] | channels
+      signed: delete-contact PREFIX|NAME... [--force] | prune --types repeater,sensor [--dry-run]
+              | favourite PREFIX|NAME [--off] | add-contact --from-json F | format-extrafs
+              | delete-file [--fs 0|1] PATH | reboot
 
 C is a companion radio: a /dev/... serial path or a BLE address.
 T is the target: a contact name or a public-key hex prefix. A repeater or room server target
@@ -36,7 +41,7 @@ COMPANION_FRAME = 176   # a stock companion's max command frame (BaseSerialInter
 CHUNK = COMPANION_FRAME - 1 - 32 - 7   # minus CMD_SEND_BINARY_REQ + pubkey, DATA's type + session + index
 STATUS_NAMES = {0: "ok", 1: "bad state", 2: "bad session", 3: "bad signature (or image for another board)",
                 4: "too big", 5: "flash error", 6: "incomplete", 7: "hash mismatch", 8: "no LoRa-OTA marker",
-                9: "activate failed", 10: "running image (or a settings bundle) not confirmed yet ('ota confirm' first)", 11: "bad argument",
+                9: "activate failed", 10: "running image (or a settings bundle) not confirmed yet ('ota confirm' first), or a maintenance command running", 11: "bad argument",
                 12: "working", 13: "the target does not run the base image of this delta"}
 OK, BAD_SESSION, INCOMPLETE, HASH_MISMATCH, WORKING = 0, 2, 6, 7, 12
 BAD_ARG, BASE_MISMATCH = 11, 13
@@ -382,6 +387,261 @@ class SettingsSender:
             self.log(f"no CONFIRM got through: the node puts its old settings back by itself "
                      f"within {SET_CONFIRM_SECS} s of the change")
         return ok
+
+
+# ---------------------------------------------------------------- maintenance (LoraOTAMaint.h)
+
+REQ_MNT_READ, REQ_MNT_DATA, REQ_MNT_EXEC = 0x6A, 0x6B, 0x6C
+MNT_RD_STATUS, MNT_RD_FILES, MNT_RD_CONTACTS, MNT_RD_CHANNELS = 0, 1, 2, 3
+MNT_CF_NONFAV, MNT_CF_NONAMES = 0x01, 0x02
+MNT_OP_DELETE_CONTACTS, MNT_OP_PRUNE, MNT_OP_FAVOURITE, MNT_OP_ADD_CONTACT = 0x10, 0x11, 0x12, 0x13
+MNT_OP_FORMAT_EXTRAFS, MNT_OP_DELETE_FILE, MNT_OP_REBOOT = 0x14, 0x15, 0x16
+MNT_OP_NAMES = {0x10: "delete-contact", 0x11: "prune", 0x12: "favourite", 0x13: "add-contact",
+                0x14: "format-extrafs", 0x15: "delete-file", 0x16: "reboot"}
+MNT_DEL_FORCE = 0x01
+MNT_DOMAIN = b"MCMNT1"   # firmware "MCOTA1", settings "MCSET1": a signature for one never verifies as another
+MNT_MAX_CMD = 256
+MNT_MIN_PREFIX = 6
+MNT_REBOOT_SECS = 6       # firmware LORA_OTA_MNT_REBOOT_MS
+MNT_CHUNK = COMPANION_FRAME - 1 - 32 - 6   # CMD_SEND_BINARY_REQ + pubkey, then type + total + offset + n
+MNT_ROLES = {0: "companion", 1: "repeater", 2: "room server"}
+ADV_TYPES = {"chat": 1, "repeater": 2, "room": 3, "sensor": 4}
+ADV_NAMES = {v: k for k, v in ADV_TYPES.items()}
+NOT_FOUND, PROTECTED, FULL, BUSY, AMBIGUOUS = 24, 25, 26, 27, 28
+STATUS_NAMES.update({24: "not found", 25: "protected (a protected file, the node itself, or your own contact)",
+                     26: "contact table full",
+                     27: "busy: a firmware image, transfer or settings bundle is in flight (confirm it or let it finish)",
+                     28: "prefix matches more than one contact"})
+# a command's counter is "not newer" (16) / for another node (17) in the settings wording
+MNT_STATUS_NAMES = dict(STATUS_NAMES)
+MNT_STATUS_NAMES.update({16: "counter not newer than the last command this node took (replay)",
+                         17: "command is for another node/board", 20: "command does not parse",
+                         22: "this node has no such operation (or no such filesystem/table)"})
+
+
+def mnt_status(s):
+    return MNT_STATUS_NAMES.get(s, f"status {s}")
+
+
+def parse_types(s):
+    """'repeater,sensor' (or numbers) -> ADV type bitmask"""
+    mask = 0
+    for t in s.split(","):
+        t = t.strip().lower()
+        if not t:
+            continue
+        v = ADV_TYPES.get(t, ADV_TYPES.get(t.rstrip("s")))
+        if v is None:
+            try:
+                v = int(t)
+            except ValueError:
+                raise OtaError(f"type {t!r}: one of {', '.join(ADV_TYPES)} or a number 1..7")
+        if not 1 <= v <= 7:
+            raise OtaError(f"type {v}: 1..7")
+        mask |= 1 << v
+    if not mask:
+        raise OtaError("no contact types given")
+    return mask
+
+
+def maint_args(op, **kw) -> bytes:
+    """the argument bytes of a signed op"""
+    if op == MNT_OP_DELETE_CONTACTS:
+        prefixes = kw["prefixes"]
+        plen = max(len(p) for p in prefixes)
+        if not all(len(p) == plen for p in prefixes):
+            prefixes = [p[:min(len(q) for q in prefixes)] for p in prefixes]
+            plen = len(prefixes[0])
+        if plen < MNT_MIN_PREFIX:
+            raise OtaError(f"contact prefixes: at least {MNT_MIN_PREFIX} bytes")
+        return bytes([MNT_DEL_FORCE if kw.get("force") else 0, plen, len(prefixes)]) + b"".join(prefixes)
+    if op == MNT_OP_PRUNE:
+        return bytes([kw["types"]])
+    if op == MNT_OP_FAVOURITE:
+        p = kw["prefix"]
+        if not MNT_MIN_PREFIX <= len(p) <= 32:
+            raise OtaError(f"contact prefix: {MNT_MIN_PREFIX}..32 bytes")
+        return bytes([1 if kw.get("on", True) else 0, len(p)]) + p
+    if op == MNT_OP_ADD_CONTACT:
+        c = kw["contact"]
+        key = bytes.fromhex(c["public_key"])
+        if len(key) != 32:
+            raise OtaError("contact public_key: 32 bytes (64 hex digits)")
+        name = c["name"].encode()
+        if not 1 <= len(name) <= 31 or b"\0" in name:
+            raise OtaError("contact name: 1..31 bytes")
+        pl = c.get("out_path_len", -1)
+        pl = 0xFF if pl is None or pl < 0 else pl
+        path = bytes.fromhex(c.get("out_path", "") or "")
+        need = 0 if pl == 0xFF else (pl & 63) * ((pl >> 6) + 1)
+        path = (path + bytes(64))[:need]
+        t = c.get("type", 1)
+        if not 1 <= t <= 4:
+            raise OtaError("contact type: 1 chat, 2 repeater, 3 room, 4 sensor")
+        return key + bytes([t, c.get("flags", 0) & 0xFF, pl]) + struct.pack("<I", c.get("last_advert", 0)) + path + name
+    if op == MNT_OP_DELETE_FILE:
+        p = kw["path"].encode()
+        if not p.startswith(b"/") or len(p) >= 64:
+            raise OtaError("path: starts with /, under 64 bytes")
+        return bytes([kw.get("fs", 0)]) + p
+    if op in (MNT_OP_FORMAT_EXTRAFS, MNT_OP_REBOOT):
+        return b""
+    raise OtaError(f"unknown op {op}")
+
+
+def make_command(op, args: bytes, target, counter: int, key) -> bytes:
+    """Signed message: "MCMNT1" || body; command = body || sig.
+    body = counter u32, target kind u8, target len u8, target, op u8, args."""
+    kind, tgt = target
+    body = struct.pack("<IBB", counter, kind, len(tgt)) + tgt + bytes([op]) + args
+    blob = body + key.sign(MNT_DOMAIN + body)
+    if len(blob) > MNT_MAX_CMD:
+        raise OtaError(f"command is {len(blob)} bytes, the node takes {MNT_MAX_CMD}")
+    return blob
+
+
+def parse_mnt_status(r) -> dict:
+    if not r or len(r) < 42 or r[0] != OK:
+        return None
+    u = lambda o: struct.unpack("<I", r[o:o + 4])[0]
+    h = lambda o: struct.unpack("<H", r[o:o + 2])[0]
+    fl = r[40]
+    fw = r[41:41 + fl].decode(errors="replace")
+    bl = r[41 + fl] if len(r) > 41 + fl else 0
+    board = r[42 + fl:42 + fl + bl].decode(errors="replace")
+    none = 0xFFFFFFFF
+    return {"role": MNT_ROLES.get(r[1], r[1]), "flags": r[2],
+            "fw_pending": bool(r[2] & 1), "ota_busy": bool(r[2] & 2), "settings_busy": bool(r[2] & 4),
+            "working": bool(r[2] & 8), "reboot_due": bool(r[2] & 16), "has_extrafs": bool(r[2] & 32),
+            "uptime_s": u(3), "batt_mv": h(7),
+            "fs": {"primary": {"used_kb": u(9), "total_kb": u(13)},
+                   "extrafs": None if u(21) == none else {"used_kb": u(17), "total_kb": u(21)}},
+            "contacts": None if h(25) == 0xFFFF else h(25), "contacts_max": h(27), "favourites": h(29),
+            "channels": None if r[31] == 0xFF else r[31], "settings_version": u(32), "maint_counter": u(36),
+            "fw": fw, "board": board}
+
+
+class MaintSender:
+    """Maintenance requests over a link (see OtaSender): reads, and signed commands."""
+
+    def __init__(self, link, log=print, timeout=8.0, retries=6, sleep=None):
+        self.link, self.log, self.timeout, self.retries = link, log, timeout, retries
+        self.sleep = sleep or asyncio.sleep
+
+    async def ask(self, payload, what, tries=None):
+        for attempt in range(tries or self.retries):
+            r = await self.link.request(payload, True, self.timeout)
+            if r:
+                if r[0] == WORKING and payload[0] == REQ_MNT_READ:   # a long command is changing the tables
+                    await self.sleep(1)
+                    continue
+                return r
+            self.log(f"  {what}: no reply (attempt {attempt + 1})")
+        raise OtaError(f"{what}: target not answering")
+
+    async def status(self):
+        r = await self.ask(bytes([REQ_MNT_READ, MNT_RD_STATUS]), "STATUS")
+        st = parse_mnt_status(r)
+        if st is None:
+            raise OtaError(f"STATUS: {mnt_status(r[0])}")
+        return st
+
+    async def files(self, fs=0, path="/"):
+        out, start = [], 0
+        while start != 0xFFFF:
+            r = await self.ask(bytes([REQ_MNT_READ, MNT_RD_FILES, fs]) + struct.pack("<H", start) +
+                               (b"" if path == "/" else path.encode()), "FILES")
+            if r[0] != OK:
+                raise OtaError(f"FILES {path}: {mnt_status(r[0])}")
+            nxt = struct.unpack("<H", r[1:3])[0]
+            i = 3
+            while i + 6 <= len(r):
+                kind, size, nl = r[i], struct.unpack("<I", r[i + 1:i + 5])[0], r[i + 5]
+                out.append({"name": r[i + 6:i + 6 + nl].decode(errors="replace"), "size": size, "dir": bool(kind & 1)})
+                i += 6 + nl
+            if nxt != 0xFFFF and nxt <= start and i == 3:
+                raise OtaError("FILES: no progress")
+            start = nxt
+        return out
+
+    async def contacts(self, types=0, nonfav=False, names=True):
+        out, start, total = [], 0, None
+        flags = (MNT_CF_NONFAV if nonfav else 0) | (0 if names else MNT_CF_NONAMES)
+        while start != 0xFFFF:
+            r = await self.ask(bytes([REQ_MNT_READ, MNT_RD_CONTACTS]) + struct.pack("<HBB", start, types, flags), "CONTACTS")
+            if r[0] != OK:
+                raise OtaError(f"CONTACTS: {mnt_status(r[0])}")
+            total, nxt = struct.unpack("<HH", r[1:5])
+            i = 5
+            while i + 12 <= len(r):
+                c = {"prefix": r[i:i + 6].hex(), "type": r[i + 6], "flags": r[i + 7],
+                     "last_advert": struct.unpack("<I", r[i + 8:i + 12])[0]}
+                i += 12
+                if names:
+                    nl = r[i]
+                    c["name"] = r[i + 1:i + 1 + nl].decode(errors="replace")
+                    i += 1 + nl
+                out.append(c)
+            if nxt != 0xFFFF and nxt <= start:
+                raise OtaError("CONTACTS: no progress")
+            start = nxt
+        return out, total
+
+    async def channels(self):
+        out, start = [], 0
+        while start != 0xFF:
+            r = await self.ask(bytes([REQ_MNT_READ, MNT_RD_CHANNELS, start]), "CHANNELS")
+            if r[0] != OK:
+                raise OtaError(f"CHANNELS: {mnt_status(r[0])}")
+            nxt, i = r[1], 2
+            while i + 3 <= len(r):
+                idx, kind, nl = r[i], r[i + 1], r[i + 2]
+                out.append({"index": idx, "name": r[i + 3:i + 3 + nl].decode(errors="replace"), "name_keyed": bool(kind & 1)})
+                i += 3 + nl
+            if nxt != 0xFF and nxt <= start:
+                raise OtaError("CHANNELS: no progress")
+            start = nxt
+        return out
+
+    async def upload(self, blob):
+        total, have, stalls = len(blob), 0, 0
+        while have < total:
+            n = min(MNT_CHUNK, total - have)
+            r = await self.ask(bytes([REQ_MNT_DATA]) + struct.pack("<HHB", total, have, n) + blob[have:have + n], "DATA")
+            if r[0] == WORKING:   # an earlier command still running
+                await self.sleep(1)
+                continue
+            if r[0] != OK:
+                raise OtaError(f"DATA refused: {mnt_status(r[0])}")
+            got = struct.unpack("<H", r[1:3])[0]
+            stalls = stalls + 1 if got <= have else 0
+            if stalls > 4:
+                raise OtaError("DATA: no progress")
+            have = got
+
+    async def run(self, blob, max_secs=600):
+        """upload a signed command, EXEC it, wait out WORKING -> (status, counter, op, result bytes)"""
+        await self.upload(blob)
+        h = hashlib.sha256(blob).digest()[:8]
+        req = bytes([REQ_MNT_EXEC]) + struct.pack("<H", len(blob)) + h
+        waited, reuploads = 0, 0
+        while True:
+            r = await self.ask(req, "EXEC")
+            if r[0] == WORKING:
+                await self.sleep(1)
+                waited += 1
+                if waited > max_secs:
+                    raise OtaError("EXEC: the node never finished")
+                continue
+            if r[0] in (INCOMPLETE, HASH_MISMATCH):   # lost, or someone else's upload in between: ours again
+                reuploads += 1
+                if reuploads > 3:
+                    raise OtaError(f"EXEC: {mnt_status(r[0])}")
+                await self.upload(blob)
+                continue
+            if len(r) < 6:
+                return r[0], None, None, b""
+            return r[0], struct.unpack("<I", r[1:5])[0], r[5], bytes(r[6:])
 
 
 # ---------------------------------------------------------------- signing
@@ -1323,6 +1583,196 @@ async def cmd_settings_ctrl(a):
         await mc.disconnect()
 
 
+# ---------------------------------------------------------------- maint CLI
+
+def mnt_result(op, status, res):
+    """a signed command's outcome as a dict"""
+    out = {"op": MNT_OP_NAMES.get(op, op), "status": "ok" if status == OK else mnt_status(status)}
+    if status != OK or res is None:
+        return out
+    if op == MNT_OP_DELETE_CONTACTS and len(res) >= 4:
+        out.update(deleted=res[0], not_found=res[1], ambiguous=res[2], skipped=res[3])
+    elif op == MNT_OP_PRUNE and len(res) >= 6:
+        d, kept, left = struct.unpack("<HHH", res[:6])
+        out.update(deleted=d, kept_favourites=kept, contacts_left=left)
+    elif op == MNT_OP_ADD_CONTACT and res:
+        out.update(result="updated" if res[0] else "added")
+    elif op == MNT_OP_FORMAT_EXTRAFS and len(res) >= 6:
+        cb, cs = struct.unpack("<HH", res[:4])
+        out.update(contacts_before=cb, contacts_stored=cs, channels_before=res[4], channels_stored=res[5])
+    return out
+
+
+def show_status(st, name):
+    fs = st["fs"]
+    def kb(f):
+        return "none" if f is None else f"{f['used_kb']}/{f['total_kb']} KB"
+    flags = [k for k in ("fw_pending", "ota_busy", "settings_busy", "working", "reboot_due") if st[k]]
+    print(f"{name}: {st['role']}, {st['fw']} (board {st['board']}), up {fmt_secs(st['uptime_s'])}, {st['batt_mv']} mV")
+    print(f"  storage: primary {kb(fs['primary'])}, ExtraFS {kb(fs['extrafs'])}")
+    if st["contacts"] is not None:
+        print(f"  contacts {st['contacts']}/{st['contacts_max']} ({st['favourites']} favourites), "
+              f"channels {st['channels']}")
+    print(f"  settings v{st['settings_version']}, last maintenance command {st['maint_counter']}"
+          + (f"; in flight: {', '.join(flags)}" if flags else ""))
+
+
+def resolve_prefixes(names, listing):
+    """hex prefixes (>= 12 digits) or contact names (unique on the node) -> prefix bytes"""
+    out = []
+    for n in names:
+        try:
+            b = bytes.fromhex(n)
+            if len(b) >= MNT_MIN_PREFIX:
+                out.append(b)
+                continue
+        except ValueError:
+            pass
+        hits = [c for c in listing if c.get("name") == n]
+        if len(hits) != 1:
+            raise OtaError(f"{n!r}: {'no' if not hits else len(hits)} contact(s) by that name on the node; "
+                           f"give a key prefix ({MNT_MIN_PREFIX * 2}+ hex digits)")
+        out.append(bytes.fromhex(hits[0]["prefix"]))
+    return out
+
+
+def load_contact_json(path):
+    """a contact as JSON: our own form or the meshcore lib's (adv_name, last_advert, ...)"""
+    c = json.load(open(path))
+    if isinstance(c, dict) and "public_key" not in c and len(c) == 1:   # {pubkey: {...}} as the lib keeps them
+        c = next(iter(c.values()))
+    return {"public_key": c["public_key"], "name": c.get("name", c.get("adv_name")), "type": c.get("type", 1),
+            "flags": c.get("flags", 0), "out_path_len": c.get("out_path_len", -1), "out_path": c.get("out_path", ""),
+            "last_advert": c.get("last_advert", 0)}
+
+
+async def maint_session(a):
+    mc = await connect(a.companion)
+    try:
+        await mc.ensure_contacts()
+        ct = find_contact(mc, a.target)
+        adm = None
+        if ct.get("type") in (2, 3):   # repeaters and room servers: as an admin
+            if not a.password_file:
+                raise OtaError("a repeater or room server target needs --password-file (its admin password)")
+            adm = Admin(mc, a.target, open(a.password_file).read().strip())
+            await adm.login()
+    except BaseException:
+        await mc.disconnect()
+        raise
+    return mc, ct, MaintSender(CompanionLink(mc, ct))
+
+
+async def maint_do(a, ms, name, node_key):
+    """one maint op on a connected MaintSender -> what to print (dict / list)"""
+    op = a.maint_cmd
+    if op == "status":
+        st = await ms.status()
+        return st, lambda: show_status(st, name), None
+    if op == "files":
+        fss = [a.fs] if a.fs is not None else [0, 1]
+        res = {}
+        for f in fss:
+            try:
+                res["primary" if f == 0 else "extrafs"] = await ms.files(f, a.path)
+            except OtaError as e:
+                if f == 1 and a.fs is None and "no such" in str(e):
+                    continue   # no ExtraFS on this node
+                raise
+        def pr():
+            for k, v in res.items():
+                print(f"{k}{'' if a.path == '/' else ':' + a.path}:")
+                for e in v:
+                    print(f"  {'[dir] ' if e['dir'] else '      '}{e['name']}" + ("" if e["dir"] else f"  ({e['size']} bytes)"))
+        return res, pr, None
+    if op == "contacts":
+        lst, total = await ms.contacts(parse_types(a.types) if a.types else 0, nonfav=a.non_favourites, names=not a.no_names)
+        def pr():
+            print(f"{name}: {total} contacts" + (f", {len(lst)} listed" if len(lst) != total else ""))
+            for c in lst:
+                print(f"  {c['prefix']}  {ADV_NAMES.get(c['type'], c['type']):8} {'*' if c['flags'] & 1 else ' '} "
+                      f"{c.get('name', '')}")
+        return {"total": total, "contacts": lst}, pr, None
+    if op == "channels":
+        chs = await ms.channels()
+        def pr():
+            for c in chs:
+                print(f"  {c['index']:2}  {c['name']}" + ("…  (hashtag: the name is its key, shown cut)" if c["name_keyed"] else ""))
+        return chs, pr, None
+
+    # ---- signed commands
+    if op == "prune" and a.dry_run:
+        mask = parse_types(a.types)
+        lst, total = await ms.contacts(mask, nonfav=True)
+        def pr():
+            print(f"{name}: prune would delete {len(lst)} of {total} contacts (favourites always stay):")
+            for c in lst:
+                print(f"  {c['prefix']}  {ADV_NAMES.get(c['type'], c['type']):8} {c.get('name', '')}")
+        return {"would_delete": lst, "total": total}, pr, None
+    st = await ms.status()
+    if st["maint_counter"] >= 0xFFFFFFFF:
+        raise OtaError(f"{name} took a command with the last possible counter: it can take no more (reflash over USB)")
+    counter = max(int(time.time()), st["maint_counter"] + 1)
+    target = parse_target(a.bundle_target) if a.bundle_target else (1, node_key[:8])
+    if op == "delete-contact":
+        is_hex = lambda x: len(x) >= MNT_MIN_PREFIX * 2 and all(ch in "0123456789abcdefABCDEF" for ch in x)
+        listing = [] if all(is_hex(x) for x in a.contact) else (await ms.contacts())[0]
+        pre = resolve_prefixes(a.contact, listing)
+        args = maint_args(MNT_OP_DELETE_CONTACTS, prefixes=pre, force=a.force)
+        opc = MNT_OP_DELETE_CONTACTS
+    elif op == "prune":
+        opc, args = MNT_OP_PRUNE, maint_args(MNT_OP_PRUNE, types=parse_types(a.types))
+    elif op == "favourite":
+        listing, _ = await ms.contacts()
+        opc, args = MNT_OP_FAVOURITE, maint_args(MNT_OP_FAVOURITE, prefix=resolve_prefixes([a.contact], listing)[0],
+                                                on=not a.off)
+    elif op == "add-contact":
+        opc, args = MNT_OP_ADD_CONTACT, maint_args(MNT_OP_ADD_CONTACT, contact=load_contact_json(a.from_json))
+    elif op == "format-extrafs":
+        if not st["has_extrafs"]:
+            raise OtaError(f"{name} has no ExtraFS")
+        opc, args = MNT_OP_FORMAT_EXTRAFS, b""
+    elif op == "delete-file":
+        p, fs = a.path, a.fs or 0
+        if p.startswith("ExtraFS/"):
+            p, fs = p[7:], 1
+        elif p.startswith("UserData/"):
+            p = p[8:]
+        opc, args = MNT_OP_DELETE_FILE, maint_args(MNT_OP_DELETE_FILE, path=p, fs=fs)
+    elif op == "reboot":
+        opc, args = MNT_OP_REBOOT, b""
+    else:
+        raise OtaError(f"unknown maint op {op}")
+    blob = make_command(opc, args, target, counter, load_key(a.key))
+    status, cnt, rop, res = await ms.run(blob)
+    out = mnt_result(opc, status, res)
+    out["counter"] = counter
+    if opc == MNT_OP_FORMAT_EXTRAFS and status == OK:
+        out["after"] = await ms.status()
+    def pr():
+        extra = ", ".join(f"{k} {v}" for k, v in out.items() if k not in ("op", "status", "counter", "after"))
+        print(f"{name}: {out['op']}: {out['status']}" + (f" ({extra})" if extra else ""))
+        if opc == MNT_OP_REBOOT and status == OK:
+            print(f"  the node reboots ~{MNT_REBOOT_SECS} s after this reply")
+        if "after" in out:
+            show_status(out["after"], name)
+    return out, pr, (None if status == OK else f"{out['op']} refused: {out['status']}")
+
+
+async def cmd_maint(a):
+    mc, ct, ms = await maint_session(a)
+    try:
+        data, pr, err = await maint_do(a, ms, ct["adv_name"], bytes.fromhex(ct["public_key"]))
+    finally:
+        await mc.disconnect()
+    if a.json:
+        print(json.dumps(data, indent=2))
+    else:
+        pr()
+    if err:
+        raise OtaError(err)
+
+
 async def cancellable(coro):
     """SIGINT/SIGTERM cancel the transfer ONCE, so its finally (radio restore) runs to the end."""
     task = asyncio.ensure_future(coro)
@@ -1411,6 +1861,42 @@ def main():
             p.add_argument("--version", type=int, help="default: the current unix time")
             p.add_argument("--bundle-target", help="target in the bundle (default: the node's 8-byte key prefix)")
             p.add_argument("-o", "--output", required=True)
+    mt = sub.add_parser("maint", help="maintenance over LoRa: read-only status/listings, signed commands (README: Maintenance)")
+    msub = mt.add_subparsers(dest="maint_cmd", required=True)
+    for name in ("status", "files", "contacts", "channels", "delete-contact", "prune", "favourite", "add-contact",
+                 "format-extrafs", "delete-file", "reboot"):
+        p = msub.add_parser(name)
+        p.add_argument("--companion", required=True)
+        p.add_argument("--target", required=True)
+        p.add_argument("--password-file", help="the target's admin password (repeater and room server targets)")
+        p.add_argument("--json", action="store_true", help="machine-readable output")
+        if name not in ("status", "files", "contacts", "channels"):
+            p.add_argument("--key", default=argparse.SUPPRESS, help=f"signing key (default {DEFAULT_KEY})")
+            p.add_argument("--bundle-target", help="target in the signed command (default: the node's 8-byte key "
+                                                   "prefix); board:TAG for every node of a board")
+        if name == "files":
+            p.add_argument("--fs", type=int, choices=(0, 1), help="0 primary, 1 ExtraFS (default: both)")
+            p.add_argument("path", nargs="?", default="/")
+        if name == "contacts":
+            p.add_argument("--types", help="only these types: chat,repeater,room,sensor")
+            p.add_argument("--non-favourites", action="store_true")
+            p.add_argument("--no-names", action="store_true", help="prefix/type/flags only (fewer round trips)")
+        if name == "delete-contact":
+            p.add_argument("contact", nargs="+", help="key prefix (12+ hex digits) or a contact name unique on the node")
+            p.add_argument("--force", action="store_true", help="also delete favourites (never your own radio)")
+        if name == "prune":
+            p.add_argument("--types", required=True, help="e.g. repeater,sensor: every contact of these types that "
+                                                          "is not a favourite goes")
+            p.add_argument("--dry-run", action="store_true", help="list what would go (read-only, nothing signed)")
+        if name == "favourite":
+            p.add_argument("contact")
+            p.add_argument("--off", action="store_true")
+        if name == "add-contact":
+            p.add_argument("--from-json", required=True, help="public_key, name, type, flags, out_path_len, "
+                                                               "out_path, last_advert (meshcore lib form too)")
+        if name == "delete-file":
+            p.add_argument("--fs", type=int, choices=(0, 1), default=None)
+            p.add_argument("path", help="/name on the primary FS, or ExtraFS/name")
     a = ap.parse_args()
     if a.cmd == "push" and not a.slow and (a.duty or a.pace or a.resume or a.hops is not None):
         ap.error("--duty/--pace/--hops/--resume go with --slow")
@@ -1429,6 +1915,7 @@ def main():
         elif a.cmd == "settings" and a.settings_cmd == "diff": asyncio.run(cmd_settings_diff(a))
         elif a.cmd == "settings" and a.settings_cmd == "push": asyncio.run(cancellable(cmd_settings_push(a)))
         elif a.cmd == "settings": asyncio.run(cmd_settings_ctrl(a))
+        elif a.cmd == "maint": asyncio.run(cancellable(cmd_maint(a)))
         else: asyncio.run(cmd_cli(a, f"ota {a.cmd}"))
     except OtaError as e:
         print(f"error: {e}", file=sys.stderr)
