@@ -147,6 +147,11 @@ bool LoraOTAService::handleCommand(const char* command, char* reply) {
     }
     return true;
   }
+  if (_maint && strcmp(command, "maint") == 0) {   // ota maint: the last signed maintenance command
+    sprintf(reply, "maint: last command %lu%s%s", (unsigned long)_maint->counter(), _maint->working() ? ", working" : "",
+            _maint->rebootDue() ? ", reboot due" : "");
+    return true;
+  }
   if (strcmp(command, "rollback") == 0) {
     if (!_pending) {
       strcpy(reply, "ERR: only a pending image can roll back");

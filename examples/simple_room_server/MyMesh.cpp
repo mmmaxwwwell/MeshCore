@@ -1,4 +1,5 @@
 #include "MyMesh.h"
+#include <helpers/LoraOTAMaintFs.h>
 
 #define REPLY_DELAY_MILLIS          1500
 #define PUSH_NOTIFY_DELAY_MILLIS    2000
@@ -158,6 +159,20 @@ public:
   void otaRestoreRadio() override { radio_driver.setParams(_p->freq, _p->bw, _p->sf, _p->cr); }
 };
 static LoraOTAService ota_service;
+
+// maintenance over LoRa (LoraOTAMaint.h): admins only (see handleRequest); every change is a command
+// the owner signed. Here: status, file list, delete a non-protected file, reboot (the admin CLI
+// already covers the rest over LoRa)
+class RoomMaintTarget : public LoraOTAMaintFsTarget {
+  const uint8_t* _self;
+public:
+  RoomMaintTarget(FILESYSTEM* fs, const uint8_t* self) : LoraOTAMaintFsTarget(fs, NULL), _self(self) { }
+  lora_ota_maint::Role role() override { return lora_ota_maint::ROOM_SERVER; }
+  const char* fwVersion() override { return FIRMWARE_VERSION; }
+  uint16_t battMilliVolts() override { return board.getBattMilliVolts(); }
+  const uint8_t* selfPubKey() override { return _self; }
+  void reboot() override { board.reboot(); }   // prefs are saved as they change
+};
 #endif
 
 int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t *payload,
@@ -167,7 +182,7 @@ int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t
   memcpy(reply_data, &sender_timestamp, 4); // reflect sender_timestamp back in response packet (kind of like a 'tag')
 
 #ifdef LORA_OTA_ENABLED
-  if (lora_ota::Receiver::isOtaReq(payload[0])) {
+  if (lora_ota::Receiver::isOtaReq(payload[0]) || lora_ota_maint::Maint::isMaintReq(payload[0])) {   // firmware, maintenance
     if (!sender->isAdmin()) return 0;
     int n = ota_service.handleRequest(payload, payload_len, &reply_data[4], getRNG()->nextInt(1, 0x7FFFFFFF));
     return n > 0 ? 4 + n : 0;
@@ -723,6 +738,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
   _fs = fs;
 #ifdef LORA_OTA_ENABLED
   ota_service.begin(*new RoomOtaRadio(&_prefs));   // first: arms the rollback deadline if this image is unconfirmed
+  ota_service.beginMaint(*new RoomMaintTarget(_fs, self_id.pub_key));
 #endif
   // load persisted prefs
   _cli.loadPrefs(_fs);

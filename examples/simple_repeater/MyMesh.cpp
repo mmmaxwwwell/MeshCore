@@ -1,4 +1,5 @@
 #include "MyMesh.h"
+#include <helpers/LoraOTAMaintFs.h>
 #include <algorithm>
 
 /* ------------------------------ Config -------------------------------- */
@@ -218,6 +219,20 @@ public:
   void otaRestoreRadio() override { radio_driver.setParams(_p->freq, _p->bw, _p->sf, _p->cr); }
 };
 static LoraOTAService ota_service;
+
+// maintenance over LoRa (LoraOTAMaint.h): admins only (see handleRequest); every change is a command
+// the owner signed. Here: status, file list, delete a non-protected file, reboot (the admin CLI
+// already covers the rest over LoRa)
+class RepeaterMaintTarget : public LoraOTAMaintFsTarget {
+  const uint8_t* _self;
+public:
+  RepeaterMaintTarget(FILESYSTEM* fs, const uint8_t* self) : LoraOTAMaintFsTarget(fs, NULL), _self(self) { }
+  lora_ota_maint::Role role() override { return lora_ota_maint::REPEATER; }
+  const char* fwVersion() override { return FIRMWARE_VERSION; }
+  uint16_t battMilliVolts() override { return board.getBattMilliVolts(); }
+  const uint8_t* selfPubKey() override { return _self; }
+  void reboot() override { board.reboot(); }   // prefs are saved as they change
+};
 
 // signed settings over LoRa (LoraOTASettings.h): the repeater's prefs, region table and radio
 #define OTA_SETTINGS_FILE      "/ota_settings"
@@ -1141,6 +1156,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
   updateFloodAdvertTimer();
 #ifdef LORA_OTA_ENABLED
   ota_service.beginSettings(*new RepeaterSettingsTarget(this));   // after prefs + regions: a bundle left on probation reverts here
+  ota_service.beginMaint(*new RepeaterMaintTarget(_fs, self_id.pub_key));
 #endif
 
   board.setAdcMultiplier(_prefs.adc_multiplier);

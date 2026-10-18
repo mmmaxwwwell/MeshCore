@@ -9,6 +9,7 @@
 #include <SHA256.h>
 #include <helpers/OverlayPolicy.h>
 #endif
+#include <helpers/LoraOTAMaintFs.h>
 
 #define CMD_APP_START                 1
 #define CMD_SEND_TXT_MSG              2
@@ -853,13 +854,123 @@ public:
 };
 #endif
 
+#ifdef LORA_OTA_ENABLED
+// maintenance over LoRa (LoraOTAMaint.h): from a favourite only (onContactRequest); every change is a
+// command the owner signed. Contacts and channels live in RAM here and on the secondary FS
+// (/contacts3, /channels2); identity, prefs and both replay counters on the primary FS.
+#define MAINT_CONTACT_REC 152   // DataStore's /contacts3 record
+#define MAINT_CHANNEL_REC 68    // ... and /channels2's
+class CompanionMaintTarget : public LoraOTAMaintFsTarget {
+  MyMesh* _m;
+  // contacts[] is BaseChatMesh's own: read a copy by index, change it through its key
+  ContactInfo* live(int i) {
+    static ContactInfo x;   // static: poll() runs on the 4 KB nRF52 loop stack
+    if (i < 0 || i >= _m->getNumContacts() || !_m->getContactByIdx(MAX_ANON_CONTACTS + i, x)) return NULL;
+    return _m->lookupContactByPubKey(x.id.pub_key, PUB_KEY_SIZE);
+  }
+public:
+  CompanionMaintTarget(MyMesh* m) : LoraOTAMaintFsTarget(m->_store->getPrimaryFS(), m->_store->getSecondaryFS()), _m(m) { }
+  lora_ota_maint::Role role() override { return lora_ota_maint::COMPANION; }
+  const char* fwVersion() override { return FIRMWARE_VERSION; }
+  uint16_t battMilliVolts() override { return board.getBattMilliVolts(); }
+  const uint8_t* selfPubKey() override { return _m->self_id.pub_key; }
+  void reboot() override {
+    if (_m->dirty_contacts_expiry) _m->saveContacts();   // as CMD_REBOOT
+    board.reboot();
+  }
+
+  int contactCount() override { return _m->getNumContacts(); }
+  int contactMax() override { return MAX_CONTACTS; }
+  bool contactAt(int i, lora_ota_maint::ContactRec& c) override {
+    const ContactInfo* x = live(i);
+    if (!x) return false;
+    memcpy(c.pub_key, x->id.pub_key, 32);
+    memcpy(c.name, x->name, sizeof(c.name));
+    c.type = x->type; c.flags = x->flags; c.out_path_len = x->out_path_len;
+    memcpy(c.out_path, x->out_path, sizeof(c.out_path));
+    c.last_advert = x->last_advert_timestamp;
+    return true;
+  }
+  bool contactRemoveAt(int i) override {   // as CMD_REMOVE_CONTACT
+    ContactInfo* x = live(i);
+    if (!x) return false;
+    uint8_t key[PUB_KEY_SIZE];
+    memcpy(key, x->id.pub_key, PUB_KEY_SIZE);
+    if (!_m->removeContact(*x)) return false;
+    _m->_store->deleteBlobByKey(key, PUB_KEY_SIZE);
+    return true;
+  }
+  bool contactSetFlags(int i, uint8_t flags) override {
+    ContactInfo* x = live(i);
+    if (!x) return false;
+    x->flags = flags;
+    return true;
+  }
+  int contactPut(const lora_ota_maint::ContactRec& c) override {   // as CMD_ADD_UPDATE_CONTACT
+    ContactInfo* x = _m->lookupContactByPubKey(c.pub_key, PUB_KEY_SIZE);
+    bool update = x != NULL;
+    ContactInfo fresh;
+    if (!update) {
+      memset(&fresh, 0, sizeof(fresh));
+      fresh.id = mesh::Identity(c.pub_key);
+      x = &fresh;
+    }
+    memcpy(x->name, c.name, sizeof(x->name));
+    x->name[sizeof(x->name) - 1] = 0;
+    x->type = c.type; x->flags = c.flags; x->out_path_len = c.out_path_len;
+    memcpy(x->out_path, c.out_path, sizeof(x->out_path));
+    x->last_advert_timestamp = c.last_advert;
+    x->lastmod = _m->getRTCClock()->getCurrentTime();
+    if (update) return 1;
+    return _m->addContact(fresh) ? 0 : -1;
+  }
+  void contactsChanged() override { _m->dirty_contacts_expiry = _m->futureMillis(LAZY_CONTACTS_WRITE_DELAY); }
+  bool contactsSave() override {
+    _m->saveContacts();
+    _m->dirty_contacts_expiry = 0;
+    return true;
+  }
+#ifdef MAX_GROUP_CHANNELS
+  int channelCount() override { return MAX_GROUP_CHANNELS; }
+  bool channelAt(int i, char name[32], uint8_t secret[32]) override {
+    ChannelDetails ch;
+    if (!_m->getChannel(i, ch)) return false;
+    memcpy(name, ch.name, 32);
+    memcpy(secret, ch.channel.secret, 32);
+    memset(&ch, 0, sizeof(ch));
+    return true;
+  }
+  bool channelsSave() override {
+    _m->saveChannels();
+    return true;
+  }
+#endif
+  bool formatSecondary() override { return _m->_store->formatSecondaryFS(); }
+  bool storedCounts(int& contacts, int& channels) override {
+    FILESYSTEM* fs = _fs[1] ? _fs[1] : _fs[0];
+    File f = openRead(fs, "/contacts3");
+    contacts = f ? (int)(f.size() / MAINT_CONTACT_REC) : 0;
+    if (f) f.close();
+    channels = 0;
+    f = openRead(fs, "/channels2");
+    if (f) {
+      uint8_t rec[MAINT_CHANNEL_REC];
+      while (f.read(rec, sizeof(rec)) == sizeof(rec)) if (rec[4]) channels++;   // a named slot
+      memset(rec, 0, sizeof(rec));
+      f.close();
+    }
+    return true;
+  }
+};
+#endif
+
 uint8_t MyMesh::onContactRequest(const ContactInfo &contact, uint32_t sender_timestamp, const uint8_t *data,
                                  uint8_t len, uint8_t *reply) {
 #ifdef LORA_OTA_ENABLED
   if (LoraOTAService::isRequest(data[0])) {
     if (!(contact.flags & 1)) return 0;   // favourites only
     memcpy(reply, &sender_timestamp, 4);
-    int n = ota_service.handleRequest(data, len, &reply[4], getRNG()->nextInt(1, 0x7FFFFFFF));
+    int n = ota_service.handleRequest(data, len, &reply[4], getRNG()->nextInt(1, 0x7FFFFFFF), contact.id.pub_key);
     return n > 0 ? 4 + n : 0;
   }
 #endif
@@ -1244,6 +1355,7 @@ void MyMesh::begin() {
   radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
 #ifdef LORA_OTA_ENABLED
   ota_service.beginSettings(*new CompanionSettingsTarget(this));   // after the prefs: a bundle left on probation reverts here
+  ota_service.beginMaint(*new CompanionMaintTarget(this));         // after contacts + channels are loaded
 #endif
 
   board.attachDynamicPrefs(_prefs.getCustom());
