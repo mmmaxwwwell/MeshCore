@@ -9,6 +9,7 @@
 #include <Arduino.h>
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
+#include <esp_task_wdt.h>
 
 // Arduino's initArduino() marks the running image valid unless this says
 // otherwise; we keep a new image PENDING_VERIFY until it is confirmed.
@@ -49,11 +50,16 @@ public:
   lora_ota::Flash* flash() override { return &_flash; }
   bool begin() override {
     esp_ota_img_states_t st;
-    if (esp_ota_get_state_partition(esp_ota_get_running_partition(), &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY) {
-      enableLoopWDT();   // a hung new image resets, and the bootloader rolls back
-      return true;
-    }
-    return false;
+    return esp_ota_get_state_partition(esp_ota_get_running_partition(), &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY;
+  }
+  void startProbation() override {
+    // a hung new image resets, and the bootloader rolls back. Armed on the first loop pass,
+    // not in setup(): companion setup alone can take ~20 s, past the default 5 s.
+    esp_task_wdt_init(30, true);
+    enableLoopWDT();
+  }
+  bool runningSha(uint8_t sha[32]) override {
+    return esp_partition_get_sha256(esp_ota_get_running_partition(), sha) == ESP_OK;
   }
   bool confirm() override {
     if (esp_ota_mark_app_valid_cancel_rollback() != ESP_OK) return false;

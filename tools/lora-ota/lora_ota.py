@@ -188,20 +188,27 @@ class OtaSender:
             await self.link.request(bytes([REQ_ABORT]) + self.sess, True, self.status_timeout)
 
 
-async def confirm_new_image(link, since, log=print, window=REBOOT_SECS + CONFIRM_SECS):
-    """Send CONFIRM until the REBOOTED node answers (uptime shorter than the
-    time since `since`, a monotonic timestamp taken when it said rebooting).
-    An answer from the old image, before its reboot, does not count."""
+async def confirm_new_image(link, since, log=print, window=REBOOT_SECS + CONFIRM_SECS, sha=None):
+    """Send CONFIRM until the NEW image answers. The reply's sha256[0:8] must be
+    the image we sent: after a rollback the old image answers too, with a short
+    uptime, so uptime alone proves nothing (seen on Rhea 2026-10-18)."""
     while time.monotonic() - since < window:
         r = await link.request(bytes([REQ_CONFIRM]), True, 3.0)
-        if r and len(r) >= 6:
+        if r and len(r) >= 14:
             up = struct.unpack("<I", r[2:6])[0]
-            if r[0] == OK and up < time.monotonic() - since:
+            running = r[6:14]
+            if r[0] != OK:
+                raise OtaError(f"confirm failed on the node: {STATUS_NAMES.get(r[0], r[0])}")
+            if sha is not None and running != sha[:8]:
+                if up < time.monotonic() - since:
+                    raise OtaError(f"the node rebooted into a DIFFERENT image (sha {running.hex()}, up {up} s): "
+                                   "the new one was rolled back")
+                await asyncio.sleep(1)   # still the old image, before its reboot
+                continue
+            if up < time.monotonic() - since:
                 log(f"node: new image confirmed ({up} s after boot)" if r[1] else
                     f"node: new image already confirmed ({up} s after boot)")
                 return True
-            if r[0] != OK:
-                raise OtaError(f"confirm failed on the node: {STATUS_NAMES.get(r[0], r[0])}")
         else:
             await asyncio.sleep(1)
     return False
@@ -369,7 +376,7 @@ async def cmd_push(a):
             print(f"not confirming: the node rolls back {CONFIRM_SECS} s after it boots")
             return
         window = REBOOT_SECS + INSTALL_SECS + CONFIRM_SECS
-        if not await confirm_new_image(link, rebooting, window=window):
+        if not await confirm_new_image(link, rebooting, window=window, sha=bytes.fromhex(m["sha256"])):
             raise OtaError(f"no answer from the new image within {CONFIRM_SECS} s of its boot: "
                            "it rolls back to the old image by itself")
         if adm:
@@ -385,7 +392,10 @@ async def cmd_push(a):
                 await mc.commands.set_radio(*restore[:4], repeat=restore[6])
                 await mc.commands.set_tuning(*restore[4:6])
                 print(f"companion back on its radio settings; the target drops back within {RADIO_IDLE_SECS} s")
-            await mc.disconnect()
+            try:
+                await mc.disconnect()
+            except Exception:
+                pass   # BlueZ sometimes drops the D-Bus reply on disconnect; nothing to undo
         await asyncio.shield(cleanup())   # a Ctrl-C mid-transfer must still put the companion back
 
 
@@ -406,7 +416,7 @@ async def cmd_confirm(a):
                 up = struct.unpack("<I", r[2:6])[0]
                 if r[0] != OK:
                     raise OtaError(f"confirm failed: {STATUS_NAMES.get(r[0], r[0])}")
-                print(("confirmed" if r[1] else "nothing pending") + f" (node up {up} s)")
+                print(("confirmed" if r[1] else "nothing pending") + f" (node up {up} s, image sha {r[6:14].hex()}...)")
                 return
         raise OtaError("no answer (if it had an unconfirmed image, it rolls back by itself)")
     finally:

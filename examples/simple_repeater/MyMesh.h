@@ -35,6 +35,7 @@
 #include <helpers/TxtDataHelpers.h>
 #include <helpers/RegionMap.h>
 #include <helpers/RoutingPolicy.h>
+#include <helpers/LoraOTAService.h>
 #include "RateLimiter.h"
 
 #ifdef WITH_BRIDGE

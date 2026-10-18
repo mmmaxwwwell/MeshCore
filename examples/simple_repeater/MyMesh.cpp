@@ -208,10 +208,30 @@ uint8_t MyMesh::handleAnonClockReq(const mesh::Identity& sender, uint32_t sender
   return 0;
 }
 
+#ifdef LORA_OTA_ENABLED
+// firmware over LoRa: admins only (see handleRequest); the image itself must be signed (LORA_OTA_PUBKEY)
+class RepeaterOtaRadio : public LoraOTARadio {
+  NodePrefs* _p;
+public:
+  RepeaterOtaRadio(NodePrefs* p) : _p(p) { }
+  void otaTempRadio(float freq, float bw, uint8_t sf, uint8_t cr) override { radio_driver.setParams(freq, bw, sf, cr); }
+  void otaRestoreRadio() override { radio_driver.setParams(_p->freq, _p->bw, _p->sf, _p->cr); }
+};
+static LoraOTAService ota_service;
+#endif
+
 int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t *payload, size_t payload_len) {
   // uint32_t now = getRTCClock()->getCurrentTimeUnique();
   // memcpy(reply_data, &now, 4);   // response packets always prefixed with timestamp
   memcpy(reply_data, &sender_timestamp, 4); // reflect sender_timestamp back in response packet (kind of like a 'tag')
+
+#ifdef LORA_OTA_ENABLED
+  if (lora_ota::Receiver::isOtaReq(payload[0])) {
+    if (!sender->isAdmin()) return 0;
+    int n = ota_service.handleRequest(payload, payload_len, &reply_data[4], getRNG()->nextInt(1, 0x7FFFFFFF));
+    return n > 0 ? 4 + n : 0;
+  }
+#endif
 
   if (payload[0] == REQ_TYPE_GET_STATUS) {  // guests can also access this now
     RepeaterStats stats;
@@ -677,6 +697,11 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
       int reply_len = handleRequest(client, timestamp, &data[4], len - 4);
       if (reply_len == 0) return; // invalid command
 
+#ifdef LORA_OTA_ENABLED
+      // OTA tags run far ahead of real time (one per chunk); recording one
+      // would lock out the real-time-stamped CLI and logins
+      if (!lora_ota::Receiver::isOtaReq(data[4]))
+#endif
       client->last_timestamp = timestamp;
       client->last_activity = getRTCClock()->getCurrentTime();
 
@@ -945,6 +970,9 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
 void MyMesh::begin(FILESYSTEM *fs) {
   mesh::Mesh::begin();
   _fs = fs;
+#ifdef LORA_OTA_ENABLED
+  ota_service.begin(*new RepeaterOtaRadio(&_prefs));   // first: arms the rollback deadline if this image is unconfirmed
+#endif
   // load persisted prefs
   _cli.loadPrefs(_fs);
   acl.load(_fs, self_id);
@@ -1281,6 +1309,10 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
       sendNodeDiscoverReq();
       strcpy(reply, "OK - Discover sent");
     }
+#ifdef LORA_OTA_ENABLED
+  } else if (memcmp(command, "ota ", 4) == 0 && ota_service.handleCommand(&command[4], reply)) {
+    // ota status | confirm | rollback
+#endif
   } else{
     _cli.handleCommand(sender_timestamp, command, reply);  // common CLI commands
   }
@@ -1292,6 +1324,9 @@ void MyMesh::loop() {
 #endif
 
   mesh::Mesh::loop();
+#ifdef LORA_OTA_ENABLED
+  ota_service.loop();
+#endif
 
   if (next_flood_advert && millisHasNowPassed(next_flood_advert)) {
     mesh::Packet *pkt = createSelfAdvert();
@@ -1335,6 +1370,9 @@ void MyMesh::loop() {
 bool MyMesh::hasPendingWork() const {
 #if defined(WITH_BRIDGE)
   if (bridge.isRunning()) return true;  // bridge needs WiFi radio, can't sleep
+#endif
+#ifdef LORA_OTA_ENABLED
+  if (ota_service.hasPendingWork()) return true;   // mid-transfer, temp radio, or awaiting confirm
 #endif
   return _mgr->getOutboundTotal() > 0;
 }

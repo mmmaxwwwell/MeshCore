@@ -162,20 +162,32 @@ def main():
 
     # confirm after reboot: only an answer from the REBOOTED image counts
     class FakeNode:
-        def __init__(self, boots_after, replies=True):
-            self.t0, self.boots_after, self.replies = time.monotonic(), boots_after, replies
+        """before boots_after: the old image; after: the new one (or the old again: a rollback)"""
+        def __init__(self, boots_after, replies=True, rolled_back=False):
+            self.t0, self.boots_after, self.replies, self.rolled_back = time.monotonic(), boots_after, replies, rolled_back
         async def request(self, payload, want_reply, timeout):
             assert payload == bytes([L.REQ_CONFIRM])
             await asyncio.sleep(0.01)
             if not self.replies:
                 return None
             age = time.monotonic() - self.t0
-            up = int(age - self.boots_after) if age >= self.boots_after else 3600   # old image: long uptime
-            return bytes([L.OK, 1 if age >= self.boots_after else 0]) + struct.pack("<I", max(up, 0))
+            booted = age >= self.boots_after
+            up = int(age - self.boots_after) if booted else 3600
+            sha = NEW_SHA if booted and not self.rolled_back else OLD_SHA
+            return bytes([L.OK, 1 if booted and not self.rolled_back else 0]) + struct.pack("<I", up) + sha[:8]
+    NEW_SHA, OLD_SHA = hashlib.sha256(b"new").digest(), hashlib.sha256(b"old").digest()
     q = lambda *_: None
-    check("confirm waits for the rebooted image", asyncio.run(L.confirm_new_image(FakeNode(0.3), time.monotonic(), q, window=2)))
-    check("old image's answer never counts", not asyncio.run(L.confirm_new_image(FakeNode(99), time.monotonic(), q, window=0.5)))
-    check("silent node -> not confirmed", not asyncio.run(L.confirm_new_image(FakeNode(0, replies=False), time.monotonic(), q, window=0.5)))
+    check("confirm waits for the rebooted image",
+          asyncio.run(L.confirm_new_image(FakeNode(0.3), time.monotonic(), q, window=2, sha=NEW_SHA)))
+    check("old image's answer never counts",
+          not asyncio.run(L.confirm_new_image(FakeNode(99), time.monotonic(), q, window=0.5, sha=NEW_SHA)))
+    check("silent node -> not confirmed",
+          not asyncio.run(L.confirm_new_image(FakeNode(0, replies=False), time.monotonic(), q, window=0.5, sha=NEW_SHA)))
+    try:
+        asyncio.run(L.confirm_new_image(FakeNode(0.3, rolled_back=True), time.monotonic(), q, window=2, sha=NEW_SHA))
+        check("a rollback is reported, not taken for success", False)
+    except L.OtaError as e:
+        check("a rollback is reported, not taken for success", "rolled back" in str(e), str(e))
 
     # nRF52 staging: littlefs v1 file -> physical extents -> raw writes (LoraOTALfs.h)
     lfs_dir = None

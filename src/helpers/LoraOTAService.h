@@ -26,6 +26,8 @@ public:
   virtual bool confirm() = 0;                 // keep the running image
   virtual void rollback() = 0;                // boot the previous image; returns only on failure
   virtual void install() = 0;                 // boot the staged (activated) image; returns only on failure
+  virtual void startProbation() { }          // first loop pass of an unconfirmed image (not in setup)
+  virtual bool runningSha(uint8_t sha[32]) = 0;   // SHA-256 of the running image, as signed
   virtual void feedWatchdog() { }
   virtual const char* describe() = 0;         // running slot etc., for `ota status`
 };
@@ -42,7 +44,7 @@ class LoraOTAService {
   LoraOTAPlatform* _platform;
   LoraOTARadio* _radio;
   lora_ota::Receiver* _rx;
-  bool _pending;
+  bool _pending, _probation_started;
   unsigned long _confirm_by, _reboot_at;
   // temporary radio settings: applied after the reply, dropped when OTA traffic stops
   float _t_freq, _t_bw;
@@ -54,7 +56,7 @@ class LoraOTAService {
   void touchRadio();
 
 public:
-  LoraOTAService() : _platform(NULL), _radio(NULL), _rx(NULL), _pending(false), _confirm_by(0), _reboot_at(0),
+  LoraOTAService() : _platform(NULL), _radio(NULL), _rx(NULL), _pending(false), _probation_started(false), _confirm_by(0), _reboot_at(0),
                      _t_apply_at(0), _t_last(0), _t_active(false) { }
   void begin(LoraOTARadio& radio);
   // reply body for an OTA REQ (no tag); 0 = no reply

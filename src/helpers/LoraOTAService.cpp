@@ -23,15 +23,19 @@ int LoraOTAService::handleRequest(const uint8_t* req, size_t len, uint8_t* reply
   if (!_platform || len < 1) return 0;
   touchRadio();
 
-  if (req[0] == LORA_OTA_REQ_CONFIRM) {   // -> status, was_pending, uptime_s u32
-    bool was = _pending;                 // uptime lets the sender tell the new image from the old
+  if (req[0] == LORA_OTA_REQ_CONFIRM) {   // -> status, was_pending, uptime_s u32, running sha256[0:8]
+    // the sha tells the sender WHICH image answered: after a rollback the old one answers too
+    bool was = _pending;
     uint32_t up = millis() / 1000;
     bool ok = !_pending || _platform->confirm();
     if (ok) _pending = false;
     reply[0] = ok ? lora_ota::OK : lora_ota::FLASH_ERROR;
     reply[1] = was;
     memcpy(&reply[2], &up, 4);
-    return 6;
+    uint8_t sha[32];
+    if (!_platform->runningSha(sha)) memset(sha, 0, sizeof(sha));
+    memcpy(&reply[6], sha, 8);
+    return 14;
   }
 
   if (req[0] == LORA_OTA_REQ_RADIO) {     // freq_khz u32, bw_hz u32, sf, cr, idle_s u16 -> status
@@ -101,6 +105,10 @@ bool LoraOTAService::handleCommand(const char* command, char* reply) {
 
 void LoraOTAService::loop() {
   if (!_platform) return;
+  if (_pending && !_probation_started) {   // not in setup(): the rest of it may run long
+    _probation_started = true;
+    _platform->startProbation();
+  }
   _platform->feedWatchdog();
   unsigned long now = millis();
   if (_rx) _rx->loop(now);

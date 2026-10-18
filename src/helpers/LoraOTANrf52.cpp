@@ -28,6 +28,7 @@
 #include <nrf.h>
 #include <nrf_sdm.h>
 #include <Adafruit_LittleFS.h>
+#include <SHA256.h>
 
 #ifndef QSPIFLASH
   #error "LoRa OTA on nRF52 stages the image on the QSPI LittleFS (QSPIFLASH)"
@@ -343,6 +344,13 @@ public:
     }
     QSPIFlash._unlockFS();
     if (ok) installNow(&new_map, &old_map);
+  }
+
+  bool runningSha(uint8_t sha[32]) override {
+    SHA256 h;
+    h.update((const void*)APP_START, runningImageSize());
+    h.finalize(sha, 32);
+    return true;
   }
 
   void feedWatchdog() override {
