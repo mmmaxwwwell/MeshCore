@@ -33,9 +33,13 @@ Receiver::Receiver(Flash& flash, const uint8_t pubkey[32], const char* board) : 
   _chunk = LORA_OTA_CHUNK;
   _result = OK;
   _last_ms = 0;
+  _flags = 0;
+  _resumed = _save_fresh = false;
+  _unsaved = 0;
+  _unsaved_since = 0;
   _dstore = NULL;
   _dec = NULL;
-  _delta = _decoded = false;
+  _decoded = false;
   _decoding = 0;
   _xfer = 0;
   memset(_base8, 0, sizeof(_base8));
@@ -44,6 +48,80 @@ Receiver::Receiver(Flash& flash, const uint8_t pubkey[32], const char* board) : 
 void Receiver::setDelta(DeltaStore* store) {
   _dstore = store;
   if (store && !_dec) _dec = new DeltaDecoder();
+}
+
+// ---------------------------------------------------------------- LONG sessions: the persisted record
+
+#define SESS_MAGIC 0x3253434D   // "MCS2"
+#define SESS_HDR   56           // magic u32, size u32, chunk u8, flags u8, pad u16, sha256[32],
+                                // DELTA: patch size u32, base sha256[0:8] (else 0)
+
+bool NorSessionStore::save(const uint8_t* hdr, size_t hlen, const uint8_t* bitmap, size_t blen, bool fresh) {
+  if (hlen + blen > sessSize()) return false;
+  if (fresh && (!sessErase() || !sessWrite(0, hdr, hlen))) return false;
+  uint8_t inv[64];
+  for (size_t off = 0; off < blen; off += sizeof(inv)) {
+    size_t n = blen - off < sizeof(inv) ? blen - off : sizeof(inv);
+    for (size_t i = 0; i < n; i++) inv[i] = ~bitmap[off + i];
+    if (!sessWrite(hlen + off, inv, n)) return false;
+  }
+  return true;
+}
+
+bool NorSessionStore::load(uint8_t* hdr, size_t hlen, uint8_t* bitmap, size_t blen) {
+  if (hlen + blen > sessSize() || !sessRead(0, hdr, hlen) || !sessRead(hlen, bitmap, blen)) return false;
+  for (size_t i = 0; i < blen; i++) bitmap[i] = ~bitmap[i];
+  return true;
+}
+
+void NorSessionStore::clear() {
+  uint8_t hdr[4];
+  if (sessRead(0, hdr, 4) && rd32(hdr) == 0xFFFFFFFF) return;   // nothing there (erased)
+  static const uint8_t zero[4] = {0, 0, 0, 0};
+  sessWrite(0, zero, 4);   // magic 0: no record (no erase needed)
+}
+
+void Receiver::saveSession(bool fresh) {
+  uint8_t hdr[SESS_HDR];
+  memset(hdr, 0, sizeof(hdr));
+  wr32(hdr, SESS_MAGIC);
+  wr32(&hdr[4], _size);
+  hdr[8] = _chunk;
+  hdr[9] = _flags;
+  memcpy(&hdr[12], _sha, 32);
+  if (isDelta()) {   // the bitmap then names PATCH chunks: bind it to that patch and base
+    wr32(&hdr[44], _xfer);
+    memcpy(&hdr[48], _base8, 8);
+  }
+  _flash->saveSession(hdr, sizeof(hdr), _bitmap, (_chunks + 7) / 8, fresh);   // a failed save only costs a resend
+  _unsaved = 0;
+  _save_fresh = false;
+}
+
+// PREPARING a LONG session: an earlier session of this same image (same size, chunk
+// size and SHA-256, so the same signature checked just now) left a record: take its
+// chunks instead of erasing. The flash holds every chunk the record names, since the
+// record is saved only after the chunks are written. A DELTA record names patch
+// chunks, so it must also be for the same patch (size) against the same base;
+// the image area holds no chunks then and is erased afresh for the decode.
+bool Receiver::restoreSession() {
+  uint8_t hdr[SESS_HDR];
+  uint16_t chunks = (_xfer + _chunk - 1) / _chunk;
+  if (!_flash->loadSession(hdr, sizeof(hdr), _bitmap, (chunks + 7) / 8)) return false;
+  if (rd32(hdr) != SESS_MAGIC || rd32(&hdr[4]) != _size || hdr[8] != _chunk || memcmp(&hdr[12], _sha, 32) != 0) return false;
+  if ((hdr[9] ^ _flags) & LORA_OTA_FLAG_DELTA) return false;
+  if (isDelta()) {
+    if (rd32(&hdr[44]) != _xfer || memcmp(&hdr[48], _base8, 8) != 0) return false;
+    if (!_flash->erase(_size) || !_dstore->patchReattach(_size, _xfer)) return false;
+  } else if (!_flash->reattach(_size)) return false;
+  memset(&_bitmap[(chunks + 7) / 8], 0, sizeof(_bitmap) - (chunks + 7) / 8);
+  if (chunks % 8) _bitmap[chunks / 8] &= (1 << (chunks % 8)) - 1;
+  _chunks = chunks;
+  _received = 0;
+  for (uint16_t i = 0; i < _chunks; i++) {
+    if (hasChunk(i)) _received++;
+  }
+  return true;
 }
 
 uint16_t Receiver::firstMissing() const {
@@ -65,6 +143,7 @@ int Receiver::handle(const uint8_t* req, size_t len, uint8_t* reply, uint32_t no
     case LORA_OTA_REQ_ABORT:
       if (len < 4 || _state == IDLE || rd32(p) != _session) { reply[0] = BAD_SESSION; return 1; }
       if (_state == RECEIVING || _state == PREPARING) _state = IDLE;   // an activated image stays activated
+      // a LONG record stays (no flash work in the receive path): the next BEGIN of another image clears it
       reply[0] = _state == IDLE ? OK : BAD_STATE;
       return 1;
   }
@@ -72,22 +151,22 @@ int Receiver::handle(const uint8_t* req, size_t len, uint8_t* reply, uint32_t no
 }
 
 // BEGIN: size u32, sha256[32], sig[64] [, chunk u8 [, flags u8 [, base_sha8[8], patch_size u32]]]
-//   -> status, session u32, chunk u8, chunks u16
+//   -> status, session u32, chunk u8, chunks u16, flags u8
 // size/sha/sig always describe the NEW image. With LORA_OTA_FLAG_DELTA the
 // DATA chunks carry patch_size bytes of patch against the running image,
 // which must be the one named by base_sha8 (else BASE_MISMATCH).
 // A new image answers WORKING; poll() checks the signature and prepares the
 // staging area, and a repeated BEGIN then gets OK + session (or the error).
 int Receiver::begin(const uint8_t* p, size_t len, uint8_t* reply, uint32_t now_ms, uint32_t random32, bool pending) {
-  memset(reply, 0, 8);
+  memset(reply, 0, 9);
   if (len < 4 + 32 + 64) { reply[0] = BAD_ARG; return 1; }
   uint32_t size = rd32(p);
   const uint8_t* sha = &p[4];
   const uint8_t* sig = &p[36];
   uint8_t chunk = len > 100 ? p[100] : LORA_OTA_CHUNK;
+  uint8_t flags = (len > 101 ? p[101] : 0) & (LORA_OTA_FLAG_LONG | LORA_OTA_FLAG_DELTA);   // the flags this receiver knows
   if (chunk > LORA_OTA_CHUNK) chunk = LORA_OTA_CHUNK;
   if (chunk < LORA_OTA_CHUNK_MIN) { reply[0] = BAD_ARG; return 1; }
-  uint8_t flags = len > 101 ? p[101] : 0;   // requests arrive zero padded: absent = 0
   bool delta = flags & LORA_OTA_FLAG_DELTA;
   uint32_t xfer = size;
   const uint8_t* base8 = NULL;
@@ -97,7 +176,8 @@ int Receiver::begin(const uint8_t* p, size_t len, uint8_t* reply, uint32_t now_m
     xfer = rd32(&p[110]);
   }
 
-  bool same = size == _size && chunk == _chunk && memcmp(sha, _sha, 32) == 0 && delta == _delta &&
+  // LONG may change within a session; DELTA and its patch may not
+  bool same = size == _size && chunk == _chunk && memcmp(sha, _sha, 32) == 0 && delta == isDelta() &&
               (!delta || (xfer == _xfer && memcmp(base8, _base8, 8) == 0));
   if (same && _state == PREPARING) { reply[0] = WORKING; return 1; }
   if (same && _state == IDLE && _result != OK) {   // the preparation failed: report it once
@@ -109,17 +189,23 @@ int Receiver::begin(const uint8_t* p, size_t len, uint8_t* reply, uint32_t now_m
   if (_state != IDLE && same) {
     // a retry (lost reply) or a resume of the same image: same session, keep chunks
     _last_ms = now_ms;
+    if ((flags ^ _flags) & LORA_OTA_FLAG_LONG) {   // e.g. a fast transfer resumed slowly over the mesh
+      // to LONG: loop() writes a record of what is here; from LONG: the record just stops
+      // growing (an older record names fewer chunks, never wrong ones)
+      _save_fresh = _state == RECEIVING && (flags & LORA_OTA_FLAG_LONG);
+      _flags = (_flags & ~LORA_OTA_FLAG_LONG) | (flags & LORA_OTA_FLAG_LONG);
+    }
   } else {
     if (pending) { reply[0] = PENDING_VERIFY; return 1; }   // confirm the running image first
     if (_state == DONE || _state == VERIFYING) { reply[0] = BAD_STATE; return 1; }
     if (size == 0 || xfer == 0 || (xfer + chunk - 1) / chunk > LORA_OTA_MAX_CHUNKS) { reply[0] = TOO_BIG; return 1; }
     _size = size;
     _xfer = xfer;
-    _delta = delta;
     if (delta) memcpy(_base8, base8, 8);
     _chunk = chunk;
     memcpy(_sha, sha, 32);
     memcpy(_sig, sig, 64);
+    _flags = flags;
     _session = random32 ? random32 : 1;
     _result = OK;
     _state = PREPARING;
@@ -131,7 +217,8 @@ int Receiver::begin(const uint8_t* p, size_t len, uint8_t* reply, uint32_t now_m
   wr32(&reply[1], _session);
   reply[5] = _chunk;
   wr16(&reply[6], _chunks);
-  return 8;
+  reply[8] = _flags;   // accepted flags (an older receiver's 8-byte reply reads as 0: none)
+  return 9;
 }
 
 // DATA: session u32, index u16, bytes. Never replies.
@@ -143,10 +230,11 @@ int Receiver::data(const uint8_t* p, size_t len, uint32_t now_ms) {
   if (len - 6 < want) return 0;   // datagrams arrive zero-padded to the AES block size
   _last_ms = now_ms;
   if (hasChunk(idx)) return 0;   // duplicate: flash bits only go 1 -> 0, never rewrite
-  bool ok = _delta ? _dstore->patchWrite((size_t)idx * _chunk, &p[6], want) : _flash->write((size_t)idx * _chunk, &p[6], want);
+  bool ok = isDelta() ? _dstore->patchWrite((size_t)idx * _chunk, &p[6], want) : _flash->write((size_t)idx * _chunk, &p[6], want);
   if (!ok) return 0;
   _bitmap[idx >> 3] |= 1 << (idx & 7);
   _received++;
+  if (isLong() && _unsaved++ == 0) _unsaved_since = now_ms;   // saved from loop(), not the receive path
   return 0;
 }
 
@@ -207,7 +295,7 @@ int Receiver::finish(const uint8_t* p, size_t len, uint8_t* reply) {
   }
   if (_received != _chunks) { reply[0] = INCOMPLETE; return 1; }
   _state = VERIFYING;
-  _decoding = (_delta && !_decoded) ? 1 : 0;   // a patch: poll() decodes it into the image first
+  _decoding = (isDelta() && !_decoded) ? 1 : 0;   // a patch: poll() decodes it into the image first
   reply[0] = WORKING;
   return 1;
 }
@@ -216,9 +304,10 @@ int Receiver::finish(const uint8_t* p, size_t len, uint8_t* reply) {
 Status Receiver::restage() {
   _decoded = false;
   _decoding = 0;
+  _flash->clearSession();   // before the erase: a record must never name erased chunks
   if (_dstore) _dstore->patchDone();   // a stale patch must not eat the room the image needs
   if (!_flash->erase(_size)) return FLASH_ERROR;
-  return _delta ? _dstore->patchPrepare(_size, _xfer) : OK;
+  return isDelta() ? _dstore->patchPrepare(_size, _xfer) : OK;
 }
 
 Status Receiver::prepare() {
@@ -226,11 +315,14 @@ Status Receiver::prepare() {
   buildManifest(manifest, _board, _size, _sha);
   if (_size > _flash->capacity()) return TOO_BIG;
   if (!ed25519_verify(_sig, manifest, sizeof(manifest), _pubkey)) return BAD_SIGNATURE;
-  if (_delta) {
+  if (isDelta()) {
     uint8_t running[8];
     if (!_dstore->baseSha8(running) || memcmp(running, _base8, 8) != 0) return BASE_MISMATCH;
   }
-  return restage();
+  _decoded = false;
+  _decoding = 0;
+  _resumed = isLong() && restoreSession();   // chunks of an earlier session of this image
+  return _resumed ? OK : restage();
 }
 
 // a slice of the patch decode: WORKING = more to do, OK = the image is written
@@ -254,9 +346,13 @@ void Receiver::poll(uint32_t now_ms) {
       _result = s;
       return;
     }
-    _chunks = (_xfer + _chunk - 1) / _chunk;
-    _received = 0;
-    memset(_bitmap, 0, sizeof(_bitmap));
+    if (!_resumed) {
+      _chunks = (_xfer + _chunk - 1) / _chunk;
+      _received = 0;
+      memset(_bitmap, 0, sizeof(_bitmap));
+      if (isLong()) saveSession(true);
+    }
+    _unsaved = 0;
     _state = RECEIVING;
     _last_ms = now_ms;
   } else if (_state == VERIFYING) {
@@ -266,10 +362,11 @@ void Receiver::poll(uint32_t now_ms) {
       return;
     }
     if (s == OK) s = verifyImage();
-    if (s == OK && _delta) _dstore->patchDone();   // free its room before the install needs it
+    if (s == OK && isDelta()) _dstore->patchDone();   // free its room before the install needs it
     if (s == OK && !_flash->activate(_size)) s = ACTIVATE_FAILED;
     if (s == OK) {
       _state = DONE;
+      _flash->clearSession();
       return;
     }
     _result = s;   // the next FINISH reports it
@@ -279,13 +376,20 @@ void Receiver::poll(uint32_t now_ms) {
       memset(_bitmap, 0, sizeof(_bitmap));   // start over within the same session
       _received = 0;
       if (restage() != OK) _state = IDLE;
+      else if (isLong()) saveSession(true);
     }
   }
 }
 
 void Receiver::loop(uint32_t now_ms) {
-  if (_state == RECEIVING && (uint32_t)(now_ms - _last_ms) > LORA_OTA_IDLE_MS) {
-    _state = IDLE;
+  if (_state != RECEIVING) return;
+  if (isLong() && (_save_fresh || _unsaved >= LORA_OTA_SAVE_CHUNKS ||
+                   (_unsaved && (uint32_t)(now_ms - _unsaved_since) >= LORA_OTA_SAVE_MS))) {
+    saveSession(_save_fresh);
+  }
+  if ((uint32_t)(now_ms - _last_ms) > (isLong() ? LORA_OTA_LONG_IDLE_MS : LORA_OTA_IDLE_MS)) {
+    if (isLong() && _unsaved) saveSession(false);
+    _state = IDLE;   // a LONG session's record stays: a BEGIN of the same image picks it up again
   }
 }
 

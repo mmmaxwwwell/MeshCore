@@ -27,6 +27,9 @@ public:
   // room for a patch of patch_size next to a new image of new_size (already
   // erased in the Flash), erased: OK, TOO_BIG or FLASH_ERROR
   virtual Status patchPrepare(size_t new_size, size_t patch_size) = 0;
+  // LONG sessions: re-open the patch area of an earlier session WITHOUT erasing
+  // it (a persisted record names the chunks it holds); false = start over
+  virtual bool patchReattach(size_t new_size, size_t patch_size) { return false; }
   virtual bool patchWrite(size_t off, const uint8_t* src, size_t len) = 0;
   virtual bool patchRead(size_t off, uint8_t* dest, size_t len) = 0;
   virtual void patchDone() { }                   // decoded (or failed): the room may be freed

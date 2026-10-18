@@ -15,15 +15,20 @@
 // otherwise; we keep a new image PENDING_VERIFY until it is confirmed.
 extern "C" bool verifyRollbackLater() { return true; }
 
-class EspOtaFlash : public lora_ota::Flash {
+// The last 4 KB sector of the staging partition holds a LONG session's record
+// (lora_ota::NorSessionStore), so the image may use all but that sector.
+#define SESS_SECTOR 0x1000
+
+class EspOtaFlash : public lora_ota::Flash, public lora_ota::NorSessionStore {
   const esp_partition_t* _part;
+  size_t imageRoom() const { return _part && _part->size > SESS_SECTOR ? _part->size - SESS_SECTOR : 0; }
 public:
   EspOtaFlash() { _part = esp_ota_get_next_update_partition(NULL); }
-  size_t capacity() override { return _part ? _part->size : 0; }
+  size_t capacity() override { return imageRoom(); }
   bool erase(size_t len) override {
-    if (!_part) return false;
+    if (!_part || len > imageRoom()) return false;
     size_t end = (len + 0xFFFF) & ~(size_t)0xFFFF;   // whole 64 KB blocks
-    if (end > _part->size) end = (len + 0xFFF) & ~(size_t)0xFFF;
+    if (end > imageRoom()) end = (len + 0xFFF) & ~(size_t)0xFFF;   // never into the session sector
     for (size_t off = 0; off < end; ) {
       size_t n = (off % 0x10000 == 0 && end - off >= 0x10000) ? 0x10000 : 0x1000;
       if (esp_partition_erase_range(_part, off, n) != ESP_OK) return false;
@@ -33,7 +38,7 @@ public:
     return true;
   }
   bool write(size_t off, const uint8_t* src, size_t len) override {
-    return _part && esp_partition_write(_part, off, src, len) == ESP_OK;
+    return _part && off + len <= imageRoom() && esp_partition_write(_part, off, src, len) == ESP_OK;
   }
   bool read(size_t off, uint8_t* dest, size_t len) override {
     return _part && esp_partition_read(_part, off, dest, len) == ESP_OK;
@@ -41,10 +46,25 @@ public:
   bool activate(size_t len) override {
     return _part && esp_ota_set_boot_partition(_part) == ESP_OK;   // runs IDF's image verify
   }
+
+  // LONG sessions: the partition keeps its chunks across a reboot
+  bool reattach(size_t len) override { return _part && len <= imageRoom(); }
+  bool saveSession(const uint8_t* h, size_t hl, const uint8_t* b, size_t bl, bool fresh) override { return save(h, hl, b, bl, fresh); }
+  bool loadSession(uint8_t* h, size_t hl, uint8_t* b, size_t bl) override { return load(h, hl, b, bl); }
+  void clearSession() override { clear(); }
+  bool sessErase() override { return _part && esp_partition_erase_range(_part, imageRoom(), SESS_SECTOR) == ESP_OK; }
+  bool sessWrite(size_t off, const uint8_t* src, size_t len) override {
+    return _part && off + len <= SESS_SECTOR && esp_partition_write(_part, imageRoom() + off, src, len) == ESP_OK;
+  }
+  bool sessRead(size_t off, uint8_t* dest, size_t len) override {
+    return _part && off + len <= SESS_SECTOR && esp_partition_read(_part, imageRoom() + off, dest, len) == ESP_OK;
+  }
+  size_t sessSize() override { return _part ? SESS_SECTOR : 0; }
 };
 
 // delta updates: the base is the running partition; the patch is staged at
-// the END of the spare partition, past the 64 KB blocks the new image erases
+// the end of the spare partition (below the LONG session sector), past the
+// 64 KB blocks the new image erases
 class EspDeltaStore : public lora_ota::DeltaStore {
   const esp_partition_t* _part;
   size_t _off, _len;
@@ -60,21 +80,31 @@ public:
   bool readBase(size_t off, uint8_t* dest, size_t len) override {
     return esp_partition_read(esp_ota_get_running_partition(), off, dest, len) == ESP_OK;
   }
-  lora_ota::Status patchPrepare(size_t new_size, size_t patch_size) override {
+  // the patch sits right below the session sector, after the 64 KB blocks the image erases
+  size_t patchEnd() const { return _part && _part->size > SESS_SECTOR ? _part->size - SESS_SECTOR : 0; }
+  bool place(size_t new_size, size_t patch_size) {
     _len = 0;
-    if (!_part || patch_size > _part->size) return lora_ota::TOO_BIG;
-    size_t off = (_part->size - patch_size) & ~(size_t)0xFFF;
-    if (off < ((new_size + 0xFFFF) & ~(size_t)0xFFFF)) return lora_ota::TOO_BIG;   // EspOtaFlash::erase's blocks
-    for (size_t a = off; a < _part->size; ) {
-      size_t n = (a % 0x10000 == 0 && _part->size - a >= 0x10000) ? 0x10000 : 0x1000;
-      if (esp_partition_erase_range(_part, a, n) != ESP_OK) return lora_ota::FLASH_ERROR;
+    size_t end = patchEnd();
+    if (!_part || patch_size > end) return false;
+    size_t off = (end - patch_size) & ~(size_t)0xFFF;
+    if (off < ((new_size + 0xFFFF) & ~(size_t)0xFFFF)) return false;   // EspOtaFlash::erase's blocks
+    _off = off;
+    _len = patch_size;
+    return true;
+  }
+  lora_ota::Status patchPrepare(size_t new_size, size_t patch_size) override {
+    if (!place(new_size, patch_size)) return lora_ota::TOO_BIG;
+    size_t end = patchEnd();
+    for (size_t a = _off; a < end; ) {
+      size_t n = (a % 0x10000 == 0 && end - a >= 0x10000) ? 0x10000 : 0x1000;
+      if (esp_partition_erase_range(_part, a, n) != ESP_OK) { _len = 0; return lora_ota::FLASH_ERROR; }
       a += n;
       delay(1);
     }
-    _off = off;
-    _len = patch_size;
     return lora_ota::OK;
   }
+  // a LONG delta session after a reboot: same sizes = same place, nothing erased
+  bool patchReattach(size_t new_size, size_t patch_size) override { return place(new_size, patch_size); }
   bool patchWrite(size_t off, const uint8_t* src, size_t len) override {
     return off + len <= _len && esp_partition_write(_part, _off + off, src, len) == ESP_OK;
   }

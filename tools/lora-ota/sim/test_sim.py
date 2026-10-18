@@ -37,10 +37,25 @@ def build(out):
 
 
 class SimLink:
-    def __init__(self, sim, args, out, cut_after=None):
+    def __init__(self, sim, args, out, cut_after=None, events=None, clock=None):
         self.p = subprocess.Popen([sim, "--board", BOARD, "--out", out, *args],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         self.cut_after, self.data_sent, self.frames = cut_after, 0, 0
+        self.events = dict(events or {})   # DATA count -> ("gap", seconds) | ("reboot",): what happens to the target then
+        self.clock = clock                 # a VClock: the sender's paced gaps pass on the target too
+        self.log = []                      # (sender time, type, STATUS base)
+
+    def control(self, frame):
+        self.p.stdin.write(struct.pack("<H", len(frame)) + frame)
+        self.p.stdin.flush()
+        assert self.p.stdout.read(2) == b"\0\0"
+
+    def advance(self, secs):
+        """time passes on the target (it runs its main loop meanwhile)"""
+        self.control(b"\xf0" + struct.pack("<I", int(secs * 1000)))
+
+    def reboot(self):
+        self.control(b"\xf1")
 
     async def request(self, payload, want_reply, timeout):
         # what a stock companion accepts: CMD_SEND_BINARY_REQ + 32-byte pubkey + payload in one frame
@@ -49,6 +64,15 @@ class SimLink:
             self.data_sent += 1
             if self.cut_after is not None and self.data_sent > self.cut_after:
                 raise ConnectionError("link cut")
+            ev = self.events.pop(self.data_sent, None)
+            if ev and ev[0] == "gap":
+                if self.clock:
+                    self.clock.t += ev[1]
+                self.advance(ev[1])
+            elif ev and ev[0] == "reboot":
+                self.reboot()
+        self.log.append((self.clock.t if self.clock else 0, payload[0],
+                         struct.unpack("<H", payload[5:7])[0] if payload[0] == L.REQ_STATUS else None))
         self.frames += 1
         # MeshCore encrypts tag + payload in 16-byte AES blocks: the target sees zero padding
         payload = payload + b"\0" * ((-(4 + len(payload))) % 16)
@@ -61,6 +85,20 @@ class SimLink:
     def close(self):
         self.p.stdin.close()
         self.p.wait()
+
+
+class VClock:
+    """The paced sender's clock: its sleeps pass instantly here and on the target."""
+    def __init__(self):
+        self.t, self.link = 0.0, None
+
+    def clock(self):
+        return self.t
+
+    async def sleep(self, dt):
+        self.t += dt
+        if self.link:
+            self.link.advance(dt)
 
 
 def make_image(size, marker=True, seed=7):
@@ -81,12 +119,20 @@ def sign(img, key, board=BOARD, check_marker=True):
     return {"size": len(img), "sha256": sha.hex(), "sig": key.sign(L.manifest_message(board, len(img), sha)).hex()}
 
 
-def run(sim, tmp, img, m, args=(), cut_after=None, link=None, **kw):
+def run(sim, tmp, img, m, args=(), cut_after=None, link=None, slow=None, events=None, state=None, resume=None, **kw):
+    """slow: Pacer kwargs (duty/pace) for a --slow sender on a virtual clock; kw: OtaSender's (patch, base_sha8)"""
     out = os.path.join(tmp, "flash.out")
-    if link is None and os.path.exists(out):
+    if os.path.exists(out) and link is None:
         os.unlink(out)
-    link = link or SimLink(sim, list(args), out, cut_after)
-    s = L.OtaSender(link, img, m, log=lambda *_: None, status_timeout=0, retries=8, **kw)
+    pacer = None
+    if slow is not None:
+        vc = link.clock if link and link.clock else VClock()
+        pacer = L.Pacer(**slow, sleep=vc.sleep, clock=vc.clock)
+    link = link or SimLink(sim, list(args), out, cut_after, events, vc if pacer else None)
+    if pacer:
+        link.clock.link = link
+    s = L.OtaSender(link, img, m, log=lambda *_: None, status_timeout=0, retries=8,
+                    pacer=pacer, state_file=state, resume=resume, **kw)
     err = None
     try:
         asyncio.run(s.run())
@@ -199,6 +245,28 @@ def delta_tests(sim, tmp, key, pub, base, check):
     check("delta: resume mid-delta", got(link, out, err, big_new) and s2.session == s1.session, str(err))
     check("delta: resume sends only what is missing", resent < s2.chunks * 0.6, f"{resent} DATA frames, {s2.chunks} chunks")
 
+    # DELTA + LONG (both flag bits): a paced delta over the mesh; the persisted bitmap names PATCH chunks
+    slow_new = realistic_change(base, 500_000, 60_000, 900, seed=21)
+    sm2 = sign(slow_new, key)
+    sp = D.make_patch(base, slow_new)
+    sent = {}
+    for persist in (True, False):
+        args = darg + ([] if persist else ["--no-persist"])
+        link, s, out, err = run(sim, tmp, slow_new, sm2, args, slow={"pace": 30}, events={300: ("reboot",)},
+                                patch=sp, base_sha8=base8)
+        sent[persist] = link.data_sent
+        ok = got(link, out, err, slow_new)
+        check(f"delta+LONG: target reboot mid-patch{'' if persist else ' (no session store)'}, finishes",
+              ok and s.long_ok and s.delta and s.rebegins == 1 and s.chunks == -(-len(sp) // s.chunk), f"{err}")
+    check("delta+LONG: the reboot resumes from the persisted patch bitmap", sent[True] < sent[False] - 200,
+          f"{sent[True]} vs {sent[False]} DATA")
+    # a LONG delta record is never taken by a full-image session of the same image (other chunks)
+    link, s, out, err = run(sim, tmp, slow_new, sm2, darg, slow={"pace": 30}, cut_after=300, patch=sp, base_sha8=base8)
+    link.cut_after = None
+    link.reboot()
+    link, s, out, err = run(sim, tmp, slow_new, sm2, link=link, slow={"pace": 30})
+    check("delta+LONG: a full push of the same image ignores the delta's record", got(link, out, err, slow_new), str(err))
+
     # the firmware decoder on its own: odd step budgets, sanitizers, fuzzed patches
     exe, sanitized = build_delta_test(tmp)
     pairs = [("synthetic", base, new), ("synthetic big", base, big_new), ("from nothing", b"", new[:200_000])]
@@ -300,6 +368,72 @@ def main():
     check("resume after a dropped link", finished_ok(link, out, err) and s2.session == session, str(err))
     check("resume sends only what is missing", frames < s2.chunks - 3500, f"{frames} frames")
 
+    # ---------------------------------------------------------------- --slow: paced LONG sessions
+    simg = make_image(300_000, seed=11)   # 2206 chunks: three STATUS windows
+    sm = sign(simg, key)
+
+    def slow_ok(link, out, err):
+        link.close()
+        return err is None and os.path.exists(out) and open(out, "rb").read() == simg
+
+    link, s, out, err = run(sim, tmp, simg, sm, ["--pubkey", pub, "--drop", "15", "--seed", "5"], slow={"duty": 2})
+    t_end, airtime = link.clock.t, s.pacer.airtime
+    times = [t for t, typ, _ in link.log]
+    gaps = [b - a for a, b in zip(times, times[1:])]
+    data_gap = s.pacer.gap(7 + L.CHUNK)
+    check("paced transfer, 15% loss", slow_ok(link, out, err) and s.long_ok, str(err))
+    check("paced: about the asked share of airtime", 0.015 < airtime / t_end < 0.025, f"{100 * airtime / t_end:.2f}%")
+    check("paced: never two packets closer than the gap minus jitter",
+          min(gaps) >= (1 - L.JITTER) * min(data_gap, s.pacer.gap(7)) - 1e-6, f"min gap {min(gaps):.2f} s")
+    check("paced: STATUS polls are paced too (each one's airtime, reply included, buys its own gap)",
+          any(ty == L.REQ_STATUS for _, ty, _ in link.log) and
+          all(g >= (1 - L.JITTER) * s.pacer.gap(7, L.REPLY_LEN[L.REQ_STATUS]) - 1e-6
+              for (t0, ty0, _), g in zip(link.log, gaps) if ty0 == L.REQ_STATUS),
+          "a packet went out too soon after a STATUS")
+    eta = L.slow_eta(len(simg), L.Pacer(duty=2))
+    check("ETA within 30% of a 15%-loss run", eta < t_end < eta * 1.6, f"eta {eta:.0f} s, took {t_end:.0f} s")
+
+    # resume from the sender's state file: the sender dies, the target's session lives on
+    st = os.path.join(tmp, "push-state.json")
+    link, s1, out, err = run(sim, tmp, simg, sm, ["--pubkey", pub], cut_after=1500, slow={"duty": 2}, state=st)
+    saved = __import__("json").load(open(st))
+    link.cut_after, link.frames, link.log = None, 0, []
+    link, s2, out, err = run(sim, tmp, simg, sm, link=link, slow={"duty": 2}, state=st, resume=saved)
+    resent = link.data_sent - 1501
+    polled = {base for _, typ, base in link.log if typ == L.REQ_STATUS}
+    check("resume from the state file: same session, finishes", slow_ok(link, out, err) and s2.session == s1.session,
+          str(err))
+    check("resume: window 0 (acked in the file) is never polled again", 0 not in polled, f"polled {sorted(polled)}")
+    check("resume: sends only what the file lacks", resent < s2.chunks - 1500 + 300, f"{resent} chunks resent")
+    check("resume: state file gone after FINISH", not os.path.exists(st))
+
+    # a long gap: under the LONG idle timeout the session stays, past it the target drops it
+    link, s, out, err = run(sim, tmp, simg, sm, ["--pubkey", pub], slow={"pace": 30},
+                            events={700: ("gap", 5 * 3600)})
+    check("LONG: a 5 h silence keeps the session", slow_ok(link, out, err) and s.rebegins == 0, f"{err}, {s.rebegins}")
+    link, s, out, err = run(sim, tmp, simg, sm, ["--pubkey", pub], slow={"pace": 30},
+                            events={700: ("gap", 7 * 3600)})
+    sent = link.data_sent
+    check("LONG: a 7 h silence drops the session; BEGIN again keeps the chunks",
+          slow_ok(link, out, err) and s.rebegins == 1 and sent < s.chunks + L.SLOW_ROUND,   # the rest of that round
+          f"{err}, {s.rebegins}, {sent} DATA")                                               # went to the old session
+
+    # the target reboots mid-transfer: the persisted bitmap (saved every 16 chunks) survives
+    link, s, out, err = run(sim, tmp, simg, sm, ["--pubkey", pub], slow={"pace": 30}, events={1300: ("reboot",)})
+    sent = link.data_sent
+    check("LONG: target reboot resumes from the persisted bitmap",
+          slow_ok(link, out, err) and s.rebegins == 1 and sent < s.chunks + L.SLOW_ROUND,
+          f"{err}, {s.rebegins}, {sent} DATA")
+    link, s, out, err = run(sim, tmp, simg, sm, ["--pubkey", pub, "--no-persist"], slow={"pace": 30},
+                            events={1300: ("reboot",)})
+    sent = link.data_sent
+    check("LONG without a session store: a reboot restarts, still finishes",
+          slow_ok(link, out, err) and sent >= s.chunks + 1000, f"{err}, {sent} DATA")
+
+    # a fast (not LONG) session still drops after 5 min, and a fast sender gives up
+    link, s, out, err = run(sim, tmp, simg, sm, ["--pubkey", pub], events={700: ("gap", 6 * 60)}); link.close()
+    check("fast session: 6 min of silence still drops it", err is not None and "bad session" in str(err), str(err))
+
     # confirm after reboot: only an answer from the REBOOTED image counts
     class FakeNode:
         """before boots_after: the old image; after: the new one (or the old again: a rollback)"""
@@ -363,15 +497,26 @@ def main():
     exe = os.path.join(tmp, "service_test")
     ed = os.path.join(REPO, "lib/ed25519")
     subprocess.check_call(["c++", "-O2", "-ffast-math", "-w", "-DLORA_OTA_ENABLED", "-DLORA_OTA_HOST_TEST",
-                           '-DLORA_OTA_PUBKEY="' + "00" * 32 + '"', '-DLORA_OTA_BOARD="test"',
+                           '-DLORA_OTA_PUBKEY="' + pub + '"', '-DLORA_OTA_BOARD="test"',
                            "-I", os.path.join(HERE, "stubs"), "-I", os.path.join(REPO, "src/helpers"), "-I", ed, "-I", crypto,
                            os.path.join(HERE, "service_test.cpp"), os.path.join(REPO, "src/helpers/LoraOTAService.cpp"),
+                           os.path.join(REPO, "src/helpers/LoraOTASettings.cpp"),
                            os.path.join(REPO, "src/helpers/LoraOTA.cpp"), os.path.join(REPO, "src/helpers/LoraOTADelta.cpp"),
                            *[os.path.join(crypto, f) for f in ("SHA256.cpp", "Hash.cpp", "Crypto.cpp")],
                            *[os.path.join(ed, f) for f in sorted(os.listdir(ed)) if f.endswith(".c")], "-o", exe])
-    r = subprocess.run([exe], capture_output=True, text=True)
+    svc = make_image(50_000, seed=3)
+    sm = sign(svc, key, board="test")
+    begin = (bytes([L.REQ_BEGIN]) + struct.pack("<I", len(svc)) + bytes.fromhex(sm["sha256"]) +
+             bytes.fromhex(sm["sig"]) + bytes([L.CHUNK]))
+    r = subprocess.run([exe, begin.hex(), (begin + bytes([L.FLAG_LONG])).hex()], capture_output=True, text=True)
     check("service: 500 kHz switch, idle drop-back, probation after setup, confirm sha, rollback at 60 s",
           r.returncode == 0, r.stdout.strip())
+    check("service: a LONG session lets the node sleep, a fast one does not; LONG idle timeout",
+          r.returncode == 0 and "all passed" in r.stdout, r.stdout.strip())
+
+    # signed settings (LoraOTASettings.cpp): settings_tests.py
+    from settings_tests import run_settings_tests
+    run_settings_tests(check, tmp, crypto)
 
     print(f"\n{len(failures)} failed" if failures else "\nall passed")
     sys.exit(1 if failures else 0)

@@ -7,6 +7,7 @@
 
 #include "LoraOTA.h"
 #include "LoraOTADelta.h"
+#include "LoraOTASettings.h"
 
 #ifdef LORA_OTA_ENABLED
 
@@ -54,6 +55,7 @@ class LoraOTAService {
   LoraOTAPlatform* _platform;
   LoraOTARadio* _radio;
   lora_ota::Receiver* _rx;
+  lora_ota_settings::Settings* _settings;   // signed settings (LoraOTASettings.h); NULL = app did not wire it
   bool _pending, _probation_started;
   unsigned long _confirm_by, _reboot_at;
   // temporary radio settings: applied after the reply, dropped when OTA traffic stops
@@ -66,16 +68,24 @@ class LoraOTAService {
   void touchRadio();
 
 public:
-  LoraOTAService() : _platform(NULL), _radio(NULL), _rx(NULL), _pending(false), _probation_started(false), _confirm_by(0), _reboot_at(0),
+  LoraOTAService() : _platform(NULL), _radio(NULL), _rx(NULL), _settings(NULL), _pending(false), _probation_started(false), _confirm_by(0), _reboot_at(0),
                      _t_apply_at(0), _t_last(0), _t_active(false) { }
   void begin(LoraOTARadio& radio);
+  // signed settings: after the app loaded its prefs (a bundle left on probation by a reboot reverts here)
+  void beginSettings(lora_ota_settings::Target& target);
+  static bool isRequest(uint8_t type) {
+    return lora_ota::Receiver::isOtaReq(type) || lora_ota_settings::Settings::isSettingsReq(type);
+  }
   // reply body for an OTA REQ (no tag); 0 = no reply
   int handleRequest(const uint8_t* req, size_t len, uint8_t* reply, uint32_t random32);
   // `ota ...` (command points past "ota "); false = not ours
   bool handleCommand(const char* command, char* reply);
   void loop();
+  // A LONG session (slow, over the mesh) between packets is NOT pending work: it lasts
+  // hours, and the node must keep sleeping between packets (a packet wakes it).
   bool hasPendingWork() const {
-    return _pending || _reboot_at || _t_apply_at || _t_active || (_rx && _rx->receiving());
+    return _pending || _reboot_at || _t_apply_at || _t_active || (_rx && _rx->receiving() && !_rx->idleLong()) ||
+           (_settings && _settings->busy());
   }
 };
 

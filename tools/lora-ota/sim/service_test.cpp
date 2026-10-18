@@ -57,7 +57,16 @@ static void run(LoraOTAService& s, unsigned long ms) {
   for (unsigned long t = 0; t < ms; t += 100) { fake_millis += 100; s.loop(); }
 }
 
-int main() {
+static std::vector<uint8_t> fromHex(const char* h) {
+  std::vector<uint8_t> v;
+  for (size_t i = 0; h[i] && h[i + 1]; i += 2) {
+    auto nib = [](char c) { return c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10; };
+    v.push_back(nib(h[i]) << 4 | nib(h[i + 1]));
+  }
+  return v;
+}
+
+int main(int argc, char** argv) {
   uint8_t reply[200];
   { // fast radio: accepted at the default 919 MHz / 500 kHz / SF5, applied after the reply, dropped when quiet
     FakeRadio radio; LoraOTAService s; s.begin(radio);
@@ -105,6 +114,33 @@ int main() {
     run(s, 4000);
     CHECK(plat.rolled_back, "never rolled back");
   }
+  // argv: a signed BEGIN without flags, and the same with LONG (test_sim.py signs them)
+  for (int long_session = 0; argc > 2 && long_session < 2; long_session++) {
+    plat = FakePlatform();
+    FakeRadio radio; LoraOTAService s; s.begin(radio);
+    auto b = fromHex(argv[1 + long_session]);
+    int n = s.handleRequest(b.data(), b.size(), reply, 7);
+    CHECK(n == 1 && reply[0] == lora_ota::WORKING, "BEGIN %d: status %d", long_session, reply[0]);
+    run(s, 200);   // the signature check and staging run from loop()
+    n = s.handleRequest(b.data(), b.size(), reply, 7);
+    CHECK(n == 9 && reply[0] == lora_ota::OK, "BEGIN %d again: n=%d status %d", long_session, n, reply[0]);
+    CHECK(reply[8] == (long_session ? LORA_OTA_FLAG_LONG : 0), "BEGIN %d: accepted flags %02x", long_session, reply[8]);
+    CHECK(s.hasPendingWork() == !long_session, "%s",
+          long_session ? "a LONG session keeps the node awake (no sleep for a day)" : "a fast session lets the node sleep");
+    CHECK(radio.log.empty(), "a session changed the radio settings");
+    run(s, 10 * 60 * 1000);   // 10 min of silence: a fast session is gone, a LONG one is not
+    char st[160];
+    s.handleCommand("status", st);
+    bool receiving = strncmp(st, "receiving", 9) == 0;
+    CHECK(receiving == (bool)long_session, "after 10 min idle (%s): %s", long_session ? "LONG" : "fast", st);
+    if (long_session) {
+      CHECK(!s.hasPendingWork(), "LONG session awake after an idle stretch");
+      run(s, LORA_OTA_LONG_IDLE_MS - 9 * 60 * 1000UL);
+      s.handleCommand("status", st);
+      CHECK(strncmp(st, "idle", 4) == 0, "LONG session still open past its idle timeout: %s", st);
+    }
+  }
+  if (argc <= 2) { printf("FAIL no signed BEGINs given\n"); fails++; }
   printf(fails ? "%d FAILED\n" : "all passed\n", fails);
   return fails ? 1 : 0;
 }
