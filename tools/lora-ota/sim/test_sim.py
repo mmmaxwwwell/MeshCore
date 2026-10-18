@@ -189,6 +189,12 @@ def main():
     except L.OtaError as e:
         check("a rollback is reported, not taken for success", "rolled back" in str(e), str(e))
 
+    body = make_image(70000)
+    body = body[:23] + b"\x01" + body[24:]   # header: "hash appended"
+    esp = body + hashlib.sha256(body).digest()
+    check("ESP32 running sha = esptool's appended hash", L.running_sha(esp) == hashlib.sha256(esp[:-32]).digest())
+    check("other images: the file's sha", L.running_sha(b"\x00" * 100) == hashlib.sha256(b"\x00" * 100).digest())
+
     # nRF52 staging: littlefs v1 file -> physical extents -> raw writes (LoraOTALfs.h)
     lfs_dir = None
     for d in sorted(os.listdir(os.path.expanduser("~/.platformio/packages"))):

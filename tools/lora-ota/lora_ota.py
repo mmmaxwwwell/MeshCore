@@ -100,6 +100,16 @@ def load_signed(path):
     return image, m
 
 
+def running_sha(image: bytes) -> bytes:
+    """What the target reports for this image once it runs it (CONFIRM's sha):
+    ESP32 reports the SHA-256 esptool appends to the image (byte 23 of the
+    header says one is appended), which covers everything but those last 32
+    bytes; nRF52 hashes the app image itself."""
+    if image[:1] == b"\xe9" and len(image) > 64 and image[23] == 1:
+        return image[-32:]
+    return hashlib.sha256(image).digest()
+
+
 # ---------------------------------------------------------------- protocol
 
 class OtaSender:
@@ -376,7 +386,7 @@ async def cmd_push(a):
             print(f"not confirming: the node rolls back {CONFIRM_SECS} s after it boots")
             return
         window = REBOOT_SECS + INSTALL_SECS + CONFIRM_SECS
-        if not await confirm_new_image(link, rebooting, window=window, sha=bytes.fromhex(m["sha256"])):
+        if not await confirm_new_image(link, rebooting, window=window, sha=running_sha(image)):
             raise OtaError(f"no answer from the new image within {CONFIRM_SECS} s of its boot: "
                            "it rolls back to the old image by itself")
         if adm:
