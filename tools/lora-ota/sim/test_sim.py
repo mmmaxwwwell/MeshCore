@@ -224,12 +224,17 @@ def main():
                            '-DLORA_OTA_PUBKEY="' + "00" * 32 + '"', '-DLORA_OTA_BOARD="test"',
                            "-I", os.path.join(HERE, "stubs"), "-I", os.path.join(REPO, "src/helpers"), "-I", ed, "-I", crypto,
                            os.path.join(HERE, "service_test.cpp"), os.path.join(REPO, "src/helpers/LoraOTAService.cpp"),
+                           os.path.join(REPO, "src/helpers/LoraOTASettings.cpp"),
                            os.path.join(REPO, "src/helpers/LoraOTA.cpp"),
                            *[os.path.join(crypto, f) for f in ("SHA256.cpp", "Hash.cpp", "Crypto.cpp")],
                            *[os.path.join(ed, f) for f in sorted(os.listdir(ed)) if f.endswith(".c")], "-o", exe])
     r = subprocess.run([exe], capture_output=True, text=True)
     check("service: 500 kHz switch, idle drop-back, probation after setup, confirm sha, rollback at 60 s",
           r.returncode == 0, r.stdout.strip())
+
+    # signed settings (LoraOTASettings.cpp): settings_tests.py
+    from settings_tests import run_settings_tests
+    run_settings_tests(check, tmp, crypto)
 
     print(f"\n{len(failures)} failed" if failures else "\nall passed")
     sys.exit(1 if failures else 0)

@@ -218,6 +218,128 @@ public:
   void otaRestoreRadio() override { radio_driver.setParams(_p->freq, _p->bw, _p->sf, _p->cr); }
 };
 static LoraOTAService ota_service;
+
+// signed settings over LoRa (LoraOTASettings.h): the repeater's prefs, region table and radio
+#define OTA_SETTINGS_FILE      "/ota_settings"
+#define OTA_SETTINGS_REGIONS   "/ota_set_regions"
+static File otaSettingsOpenWrite(FILESYSTEM* fs, const char* filename) {
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  fs->remove(filename);
+  return fs->open(filename, FILE_O_WRITE);
+#elif defined(RP2040_PLATFORM)
+  return fs->open(filename, "w");
+#else
+  return fs->open(filename, "w", true);
+#endif
+}
+static uint32_t toMilli(float f) { return (uint32_t)(f * 1000.0f + 0.5f); }
+
+class RepeaterSettingsTarget : public lora_ota_settings::Target {
+  MyMesh* _m;
+public:
+  RepeaterSettingsTarget(MyMesh* m) : _m(m) { }
+  uint32_t supported() override { return (1u << lora_ota_settings::K_COUNT) - 1; }
+  void read(lora_ota_settings::Values& v) override {
+    NodePrefs& p = _m->_prefs;
+    v.freq_khz = toMilli(p.freq); v.bw_hz = toMilli(p.bw); v.sf = p.sf; v.cr = p.cr;
+    v.tx = p.tx_power_dbm;
+    v.af_milli = toMilli(p.airtime_factor);
+    v.rxdelay_milli = toMilli(p.rx_delay_base);
+    v.txdelay_milli = toMilli(p.tx_delay_factor);
+    v.direct_txdelay_milli = toMilli(p.direct_tx_delay_factor);
+    v.multi_acks = p.multi_acks;
+    v.path_hash_mode = p.path_hash_mode;
+    v.int_thresh = p.interference_threshold;
+    v.agc_reset_secs = p.agc_reset_interval * 4;
+    v.rxgain = p.rx_boosted_gain;
+    v.flood_max = p.flood_max;
+    v.flood_max_unscoped = p.flood_max_unscoped;
+    v.flood_max_advert = p.flood_max_advert;
+    v.advert_interval_min = p.advert_interval * 2;
+    v.flood_advert_interval_h = p.flood_advert_interval;
+    v.loop_detect = p.loop_detect;
+    v.repeat = p.disable_fwd ? 0 : 1;
+  }
+  bool write(const lora_ota_settings::Values& v, uint32_t m) override {
+    using namespace lora_ota_settings;
+    NodePrefs& p = _m->_prefs;
+    if (m & (1u << K_RADIO)) { p.freq = v.freq_khz / 1000.0f; p.bw = v.bw_hz / 1000.0f; p.sf = v.sf; p.cr = v.cr; }
+    if (m & (1u << K_TX)) p.tx_power_dbm = v.tx;
+    if (m & (1u << K_AF)) p.airtime_factor = v.af_milli / 1000.0f;
+    if (m & (1u << K_RXDELAY)) p.rx_delay_base = v.rxdelay_milli / 1000.0f;
+    if (m & (1u << K_TXDELAY)) p.tx_delay_factor = v.txdelay_milli / 1000.0f;
+    if (m & (1u << K_DIRECT_TXDELAY)) p.direct_tx_delay_factor = v.direct_txdelay_milli / 1000.0f;
+    if (m & (1u << K_MULTI_ACKS)) p.multi_acks = v.multi_acks;
+    if (m & (1u << K_PATH_HASH_MODE)) p.path_hash_mode = v.path_hash_mode;
+    if (m & (1u << K_INT_THRESH)) p.interference_threshold = v.int_thresh;
+    if (m & (1u << K_AGC_RESET_INTERVAL)) p.agc_reset_interval = v.agc_reset_secs / 4;
+    if (m & (1u << K_RXGAIN)) p.rx_boosted_gain = v.rxgain;
+    if (m & (1u << K_FLOOD_MAX)) p.flood_max = v.flood_max;
+    if (m & (1u << K_FLOOD_MAX_UNSCOPED)) p.flood_max_unscoped = v.flood_max_unscoped;
+    if (m & (1u << K_FLOOD_MAX_ADVERT)) p.flood_max_advert = v.flood_max_advert;
+    if (m & (1u << K_ADVERT_INTERVAL)) p.advert_interval = v.advert_interval_min / 2;
+    if (m & (1u << K_FLOOD_ADVERT_INTERVAL)) p.flood_advert_interval = v.flood_advert_interval_h;
+    if (m & (1u << K_LOOP_DETECT)) p.loop_detect = v.loop_detect;
+    if (m & (1u << K_REPEAT)) p.disable_fwd = v.repeat ? 0 : 1;
+    if (m & (1u << K_ADVERT_INTERVAL)) _m->updateAdvertTimer();
+    if (m & (1u << K_FLOOD_ADVERT_INTERVAL)) _m->updateFloodAdvertTimer();
+    return _m->_cli.savePrefs(_m->_fs);
+  }
+  void applyRadio() override {
+    NodePrefs& p = _m->_prefs;
+    radio_driver.setParams(p.freq, p.bw, p.sf, p.cr);
+    radio_driver.setTxPower(p.tx_power_dbm);
+    radio_driver.setRxBoostedGainMode(p.rx_boosted_gain);
+  }
+  int8_t maxTxPower() override {
+#ifdef MAX_LORA_TX_POWER
+    return MAX_LORA_TX_POWER;
+#else
+    return LORA_TX_POWER;   // never above what the board was built for
+#endif
+  }
+  const uint8_t* selfPubKey() override { return _m->self_id.pub_key; }
+  int loadState(uint8_t* buf, size_t max) override {
+    if (!_m->_fs->exists(OTA_SETTINGS_FILE)) return 0;
+#if defined(RP2040_PLATFORM)
+    File f = _m->_fs->open(OTA_SETTINGS_FILE, "r");
+#else
+    File f = _m->_fs->open(OTA_SETTINGS_FILE);
+#endif
+    if (!f) return 0;
+    int n = f.read(buf, max);
+    f.close();
+    return n;
+  }
+  bool saveState(const uint8_t* buf, size_t len) override {
+    File f = otaSettingsOpenWrite(_m->_fs, OTA_SETTINGS_FILE);
+    if (!f) return false;
+    bool ok = f.write(buf, len) == len;
+    f.close();
+    return ok;
+  }
+  bool regionsSnapshot() override { return _m->region_map.save(_m->_fs, OTA_SETTINGS_REGIONS); }
+  bool regionsApply(const char* names) override {   // "ct,northeast,*": each exists (under *) with flood allowed
+    RegionMap& rm = _m->region_map;
+    char tmp[LORA_OTA_SET_MAX_BUNDLE];
+    StrHelper::strncpy(tmp, names, sizeof(tmp));
+    for (char* tok = strtok(tmp, ","); tok; tok = strtok(NULL, ",")) {
+      RegionEntry* r = strcmp(tok, "*") == 0 ? &rm.getWildcard() : rm.findByName(tok);
+      if (!r) r = rm.putRegion(tok, 0);
+      if (!r) return false;   // table full
+      r->flags &= ~REGION_DENY_FLOOD;
+    }
+    return rm.save(_m->_fs);
+  }
+  bool regionsRestore() override {
+    return _m->region_map.load(_m->_fs, OTA_SETTINGS_REGIONS) && _m->region_map.save(_m->_fs);
+  }
+  int regionsExport(char* out, int max) override {
+    int n = _m->region_map.exportNamesTo(out, max, REGION_DENY_FLOOD);
+    if (n >= 0 && n < max) out[n] = 0;
+    return n;
+  }
+};
 #endif
 
 int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t *payload, size_t payload_len) {
@@ -226,7 +348,7 @@ int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t
   memcpy(reply_data, &sender_timestamp, 4); // reflect sender_timestamp back in response packet (kind of like a 'tag')
 
 #ifdef LORA_OTA_ENABLED
-  if (lora_ota::Receiver::isOtaReq(payload[0])) {
+  if (LoraOTAService::isRequest(payload[0])) {
     if (!sender->isAdmin()) return 0;
     int n = ota_service.handleRequest(payload, payload_len, &reply_data[4], getRNG()->nextInt(1, 0x7FFFFFFF));
     return n > 0 ? 4 + n : 0;
@@ -700,7 +822,7 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
 #ifdef LORA_OTA_ENABLED
       // OTA tags run far ahead of real time (one per chunk); recording one
       // would lock out the real-time-stamped CLI and logins
-      if (!lora_ota::Receiver::isOtaReq(data[4]))
+      if (!LoraOTAService::isRequest(data[4]))
 #endif
       client->last_timestamp = timestamp;
       client->last_activity = getRTCClock()->getCurrentTime();
@@ -1016,6 +1138,9 @@ void MyMesh::begin(FILESYSTEM *fs) {
 
   updateAdvertTimer();
   updateFloodAdvertTimer();
+#ifdef LORA_OTA_ENABLED
+  ota_service.beginSettings(*new RepeaterSettingsTarget(this));   // after prefs + regions: a bundle left on probation reverts here
+#endif
 
   board.setAdcMultiplier(_prefs.adc_multiplier);
 
@@ -1224,6 +1349,14 @@ void MyMesh::clearStats() {
 }
 
 void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply) {
+#if defined(LORA_OTA_ENABLED) && defined(LORA_OTA_SETTINGS_SIGNED_ONLY)
+  // signed-only (build flag, off by default): over LoRa the whitelisted settings change only by
+  // a signed bundle. Serial and ethernet (sender_timestamp 0) are the recovery path and stay open.
+  if (sender_timestamp != 0 && lora_ota_settings::isUnsignedSettingsCommand(command)) {
+    strcpy(reply, "Err - signed settings only (use a signed bundle, or USB serial)");
+    return;
+  }
+#endif
   if (region_load_active) {
     if (StrHelper::isBlank(command)) {  // empty/blank line, signal to terminate 'load' operation
       region_map = temp_map;  // copy over the temp instance as new current map
