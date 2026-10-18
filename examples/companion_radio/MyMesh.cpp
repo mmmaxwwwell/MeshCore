@@ -1057,6 +1057,9 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
       _serial(NULL), telemetry(MAX_PACKET_PAYLOAD - 4), _store(&store), _listener(NULL), _iter(0) {
   _iter_started = false;
   _cli_rescue = false;
+#ifdef BOOT_INTO_CLI_RESCUE
+  _cli_rescue = true;   // maintenance build: the USB serial rescue CLI from boot, no long-press needed
+#endif
   cli_command[0] = 0;
   offline_queue_len = 0;
   app_target_ver = 0;
