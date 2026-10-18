@@ -284,7 +284,7 @@ absent = 0; both may be set):
 
 The reply's flags byte echoes the flags the target accepted. An older target
 sends no such byte, which reads as 0. Status codes 16-23 belong to signed
-settings.
+settings, 24-28 to maintenance (0x6A-0x6C, "Maintenance" below).
 
 The running sha is what the chip reports. On ESP32 that's the hash esptool
 appends to the image; on nRF52 it's the SHA-256 of the app image.
@@ -556,6 +556,206 @@ repeat with it and leaves no copy of the region name once confirmed,
 `reboot=1` reboots exactly once ~6 s after the CONFIRM (also with a radio
 change) and never after a revert, REVERT or replay; `diff` keeps only the
 changed keys, and the bundle it makes applies.
+
+## Maintenance
+
+All maintenance of a node over LoRa, through any companion, over any number
+of hops: read its state, and change it with commands the owner signs.
+Source: `src/helpers/LoraOTAMaint.{h,cpp}` (platform-neutral) and
+`LoraOTAMaintFs.h` (the apps' filesystem half). Every `*_lora_ota` build has
+it: companions fully, repeaters and room servers the parts that apply to
+them.
+
+### Security model
+
+- **Who can ask.** Requests are REQ datagrams, encrypted end to end with the
+  sender/target shared secret, like OTA and settings. A companion answers
+  only radios it has **favourited**; a repeater or room server only a
+  logged-in **admin**.
+- **Read-only requests** (`MNT_READ`) change nothing, and that gate is all
+  they need. They return public data only:
+  - status: firmware version, uptime, battery, storage, counts, what is in
+    flight;
+  - file lists: **names and sizes**, never contents;
+  - contacts: key prefix, name, type, flags, last advert;
+  - channels: index and name.
+  Never returned: the private key, passwords, channel secrets, the overlay
+  name, the contents of any file. A **hashtag channel**'s secret is
+  SHA-256 of its name, so its name IS its key: it is listed with only its
+  first 3 characters and a flag saying so.
+- **Everything that changes or deletes anything is a signed command:**
+  - **Signature:** ed25519 with the compiled-in `LORA_OTA_PUBKEY` (the
+    firmware and settings key) over `"MCMNT1" || body`. Firmware signs
+    `"MCOTA1"` and settings `"MCSET1"`, so no signature passes for another
+    kind. The node checks the signature before it reads anything else in the
+    body. There is no way to change the key at runtime.
+  - **Target:** the command names one node (public key prefix, at least 6
+    bytes) or one board tag (`LORA_OTA_BOARD`). Anything else is refused.
+  - **Replay:** a counter (the sender uses the unix time, or the node's last
+    + 1 if that is higher). The node refuses anything not newer and saves
+    the counter in `/ota_maint` on its **primary** filesystem **before** the
+    command runs, so a command never runs twice, even across a power cut. A
+    refusal that changed nothing (BUSY, NOT_SUPPORTED, a malformed command)
+    does not spend the counter.
+  - No signature, another key, a body altered after signing, another node,
+    an old counter: refused, nothing changes.
+- **Guard rails on top of the signature:**
+  - The requester's own contact is never deleted or un-favourited (that
+    would cut off the radio asking). The node's own key is never added as a
+    contact.
+  - Format and reboot wait (BUSY) while a firmware image is unconfirmed,
+    a firmware transfer is in progress, or a settings bundle is on
+    probation: the firmware's rollback copy and staging files live on the
+    ExtraFS of an nRF52 companion.
+  - Protected files are never deleted: identity (`*.id`, `/identity/...`),
+    prefs (`prefs.json`, `new_prefs`, `com_prefs`), both replay counters and
+    the settings probation copies (`ota_settings`, `ota_set_*`,
+    `ota_maint`), firmware rollback and staging (`ota-state`, `ota-old.bin`,
+    `ota-new.bin`, `ota-session`, `ota-patch.bin`), `overlay`, `posrep`,
+    the contact and channel tables (`contacts3`, `channels2`), and the
+    repeater/room ACL and regions (`s_contacts`, `regions2`). Paths with `.`
+    or `..` components and directories are refused too.
+  - Work that touches many contacts or flash runs from the main loop, a
+    slice per pass (prune: 8 contacts), never in the receive path; EXEC
+    answers WORKING meanwhile. Buffers are static (nRF52 loop stack: 4 KB).
+
+### Operations
+
+| Op | Signed | Companion | Repeater / room |
+|---|---|---|---|
+| `status` | no | yes | yes |
+| `files [--fs 0\|1] [DIR]` | no | both filesystems | primary |
+| `contacts [--types T] [--non-favourites] [--no-names]` | no | yes | (none) |
+| `channels` | no | yes | (none) |
+| `delete-contact PREFIX\|NAME... [--force]` | yes | yes | |
+| `prune --types repeater,sensor [--dry-run]` | yes | yes | |
+| `favourite PREFIX\|NAME [--off]` | yes | yes | |
+| `add-contact --from-json F` | yes | yes | |
+| `format-extrafs` | yes | nRF52 with an ExtraFS | |
+| `delete-file [--fs 0\|1] PATH` | yes | yes | yes |
+| `reboot` | yes | yes | yes |
+
+- **delete-contact:** by key prefix (12+ hex digits) or by a name that is
+  unique on the node. Favourites stay unless `--force`. A prefix that
+  matches two contacts deletes neither. Reports deleted / not found /
+  ambiguous / skipped.
+- **prune:** deletes every contact of the given types that is **not a
+  favourite**: the fleet's "no strangers' repeaters" policy is
+  `prune --types repeater,sensor`. People and rooms stay unless named.
+  `--dry-run` lists what would go (a read, nothing signed). The contacts
+  file is then written by the companion's usual lazy save (5 s).
+- **favourite:** sets or clears the favourite flag.
+- **add-contact:** a full public record: `public_key`, `name` (1-31 bytes),
+  `type` (1 chat, 2 repeater, 3 room, 4 sensor), `flags`, `out_path_len`
+  (-1 = flood), `out_path` (hex), `last_advert`. The meshcore lib's contact
+  form (`adv_name`, ...) is read too. A known key is updated. A full table
+  answers FULL.
+- **format-extrafs:** for the nRF52 companions whose contacts and channels
+  live on the QSPI ExtraFS. The companion holds both in RAM, so: format the
+  secondary FS only, save contacts and channels back from RAM, then count
+  what the files hold and compare with RAM (STORE_ERROR if they differ).
+  Identity, prefs, the overlay and both replay counters live on the primary
+  FS and are not touched. Advert blobs and leftover OTA files on the ExtraFS
+  are gone afterwards. The sender prints the node's status after it.
+- **delete-file:** `/name` on the primary FS, `ExtraFS/name` (or `--fs 1`)
+  on the secondary one. Files only, never the protected ones.
+- **reboot:** 6 s after the reply. Contacts not saved yet are saved first.
+
+```sh
+lora_ota.py maint status --companion ... --target Wayfarer
+lora_ota.py maint contacts --companion ... --target Wayfarer --types repeater,sensor --non-favourites
+lora_ota.py maint prune --companion ... --target Wayfarer --types repeater,sensor --dry-run
+lora_ota.py maint prune --companion ... --target Wayfarer --types repeater,sensor
+lora_ota.py maint format-extrafs --companion ... --target Wayfarer
+lora_ota.py maint files --companion ... --target Quartz --password-file <admin pw>
+lora_ota.py --key other.key maint reboot --companion ... --target Quartz --password-file <admin pw>
+lora_ota.py maint status --json ...        # every op: --json for machines
+```
+
+- The signing key is `~/.config/meshcore/ota-signing.key` (`--key` to use
+  another). A command is made and signed on the fly for the node's 8-byte
+  key prefix (`--bundle-target board:TAG` for a board-wide one).
+- Over hops it rides the contact's path like any REQ: no fast channel, a
+  command is one DATA plus a few EXEC round trips. A full contact listing
+  of 350 contacts is ~70 round trips with names, ~35 without
+  (`--no-names`); `prune --dry-run` asks only for the matching ones.
+- `ota maint` on the node's CLI prints the last command's counter.
+
+### Protocol (REQ payload, little endian; replies after the 4-byte tag)
+
+| Type | Request | Reply |
+|---|---|---|
+| `0x6A` MNT_READ | op u8, args | status, data (op 0-3 below) |
+| `0x6B` MNT_DATA | total u16, offset u16, n u8, bytes | status, have u16 (contiguous bytes held) |
+| `0x6C` MNT_EXEC | total u16, sha256(command)[0:8] | WORKING (12) while it checks and runs; then status, counter u32, op u8, result |
+
+MNT_READ ops (replies at most 128 bytes; a page ends where the next entry
+would not fit):
+- `0` STATUS -> role u8 (0 companion, 1 repeater, 2 room), flags u8 (1 image
+  unconfirmed, 2 OTA transfer, 4 settings on probation, 8 command running,
+  16 reboot due, 32 has ExtraFS), uptime u32, battery mV u16, primary
+  used/total KB u32 u32, ExtraFS used/total KB u32 u32 (0xFFFFFFFF none),
+  contacts u16 (0xFFFF none), max u16, favourites u16, channels u8 (0xFF
+  none), settings version u32, last maintenance counter u32, fw len u8 +
+  fw, board len u8 + board.
+- `1` FILES: fs u8, start u16, dir (to the end; default `/`) -> next u16
+  (0xFFFF end), entries: kind u8 (1 = dir), size u32, len u8, name.
+- `2` CONTACTS: start u16, types u8 (bit per ADV type, 0 = all), flags u8
+  (1 not favourites only, 2 no names) -> total u16, next u16 (0xFFFF end),
+  entries: key prefix[6], type u8, flags u8, last advert u32 [, len u8,
+  name].
+- `3` CHANNELS: start u8 -> next u8 (0xFF end), entries: index u8, kind u8
+  (1 = name-keyed: name cut to 3 characters), len u8, name.
+
+A signed command is `body || sig[64]`, at most 256 bytes; body = counter
+u32, target kind u8 (1 = key prefix, 2 = board tag), target len u8, target,
+op u8, args:
+
+| Op | Args | Result |
+|---|---|---|
+| `0x10` DELETE_CONTACTS | flags u8 (1 = also favourites), prefix len u8 (6-32), n u8, n prefixes | deleted, not found, ambiguous, skipped (u8 each) |
+| `0x11` PRUNE | types u8 (bit per ADV type 1-7) | deleted u16, favourites kept u16, contacts left u16 |
+| `0x12` FAVOURITE | on u8, prefix len u8, prefix | - |
+| `0x13` ADD_CONTACT | key[32], type u8, flags u8, out_path_len u8, last advert u32, path bytes, name | 0 added / 1 updated |
+| `0x14` FORMAT_EXTRAFS | - | contacts before u16, stored u16, channels before u8, stored u8 |
+| `0x15` DELETE_FILE | fs u8, path | - |
+| `0x16` REBOOT | - | - |
+
+Status codes 24+: 24 not found, 25 protected (a protected file, the node
+itself, or your own contact), 26 contact table full, 27 busy (an image,
+transfer or settings bundle in flight), 28 prefix matches more than one
+contact. Reused: 3 bad signature, 6 incomplete, 7 hash mismatch, 11 bad
+argument, 12 working, 16 counter not newer (replay), 17 another node/board,
+20 does not parse, 22 not on this node, 23 could not save. While a command
+runs, an OTA BEGIN is refused with 10 (one thing at a time).
+
+### Tests
+
+`test_sim.py` builds `LoraOTAMaint.cpp` behind a fake companion or repeater
+(`sim/maint_sim.cpp`: two filesystems as path -> bytes, the contact and
+channel tables and their files, an identity and prefs full of secret
+markers) and drives it with the real sender (`sim/maint_tests.py`):
+- every mutating op refused unsigned, signed by another key, altered after
+  signing, signed as a settings bundle or a firmware manifest, for another
+  node or board, replayed, or older, each changing nothing; the owner's
+  command runs; the counter survives a power cycle; a counter that cannot be
+  saved refuses the command;
+- no reply ever holds a secret marker, a channel secret or a hashtag name;
+  read requests change nothing; bad paths are refused;
+- 350 contacts page through completely, with and without names;
+- delete (favourites, `--force`, the requester, ambiguous prefixes), prune
+  of 350 (favourites, people and rooms stay; at most 8 removals per loop
+  pass; WORKING meanwhile), favourite, add / update / full / own key,
+  malformed records;
+- format: refused while an image / transfer / settings bundle is in flight
+  without spending the counter, then the same command runs; same contacts
+  and channels stored, identity and primary FS untouched, everything else
+  gone, the same tables after a power cycle; not supported without ExtraFS;
+- delete-file against every protected name and traversal trick; reboot
+  once, 6 s after the reply, refused while settings are on probation;
+- a repeater; 20% packet loss; and the CLI's own logic (`maint_do`: dry
+  run, by name, a contact from the meshcore lib's JSON, fresh counters).
+`service_test.cpp` also runs maintenance through `LoraOTAService`.
 
 ## The first LoRa-OTA image
 

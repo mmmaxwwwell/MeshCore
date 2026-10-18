@@ -41,7 +41,7 @@ COMPANION_FRAME = 176   # a stock companion's max command frame (BaseSerialInter
 CHUNK = COMPANION_FRAME - 1 - 32 - 7   # minus CMD_SEND_BINARY_REQ + pubkey, DATA's type + session + index
 STATUS_NAMES = {0: "ok", 1: "bad state", 2: "bad session", 3: "bad signature (or image for another board)",
                 4: "too big", 5: "flash error", 6: "incomplete", 7: "hash mismatch", 8: "no LoRa-OTA marker",
-                9: "activate failed", 10: "running image (or a settings bundle) not confirmed yet ('ota confirm' first)", 11: "bad argument",
+                9: "activate failed", 10: "running image (or a settings bundle) not confirmed yet ('ota confirm' first), or a maintenance command running", 11: "bad argument",
                 12: "working", 13: "the target does not run the base image of this delta"}
 OK, BAD_SESSION, INCOMPLETE, HASH_MISMATCH, WORKING = 0, 2, 6, 7, 12
 BAD_ARG, BASE_MISMATCH = 11, 13
@@ -1682,6 +1682,8 @@ async def maint_do(a, ms, name, node_key):
                 print(f"  {c['prefix']}  {ADV_NAMES.get(c['type'], c['type']):8} {c.get('name', '')}")
         return {"would_delete": lst, "total": total}, pr, None
     st = await ms.status()
+    if st["maint_counter"] >= 0xFFFFFFFF:
+        raise OtaError(f"{name} took a command with the last possible counter: it can take no more (reflash over USB)")
     counter = max(int(time.time()), st["maint_counter"] + 1)
     target = parse_target(a.bundle_target) if a.bundle_target else (1, node_key[:8])
     if op == "delete-contact":
