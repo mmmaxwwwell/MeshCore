@@ -265,6 +265,30 @@ public:
   bool activate(size_t len) override { return len == new_map.size; }   // install() does the rest
 
 private:
+  // QSPI DMA takes word-aligned RAM buffers, word-aligned flash addresses and
+  // whole words; a chunk sits anywhere in a packet. So everything goes through
+  // an aligned bounce buffer, padded with 0xFF (programming 0xFF over erased
+  // flash changes nothing; read padding is dropped).
+  static bool qspiIO(uint32_t addr, uint8_t* buf, uint32_t n, bool write) {
+    static uint32_t bounce[66];
+    uint8_t* b = (uint8_t*)bounce;
+    while (n) {
+      uint32_t a = addr & ~3u, lead = addr - a;
+      uint32_t take = n < 256 - lead ? n : 256 - lead;
+      uint32_t total = (lead + take + 3) & ~3u;
+      if (write) {
+        memset(b, 0xFF, total);
+        memcpy(b + lead, buf, take);
+        if (!QSPIFlash.rawWrite(a, b, total)) return false;
+      } else {
+        if (!QSPIFlash.rawRead(a, b, total)) return false;
+        memcpy(buf, b + lead, take);
+      }
+      addr += take; buf += take; n -= take;
+    }
+    return true;
+  }
+
   bool rawIO(size_t off, uint8_t* buf, size_t len, bool write) {
     QSPIFlash._lockFS();
     bool ok = true;
@@ -273,7 +297,7 @@ private:
       const Extent& x = new_map.ext[e];
       if (off < pos + x.len) {
         uint32_t in = off - pos, n = x.len - in < len ? x.len - in : len;
-        ok = write ? QSPIFlash.rawWrite(x.addr + in, buf, n) : QSPIFlash.rawRead(x.addr + in, buf, n);
+        ok = qspiIO(x.addr + in, buf, n, write);
         buf += n; off += n; len -= n;
       }
       pos += x.len;

@@ -10,6 +10,9 @@ static uint32_t rd32(const uint8_t* p) { return p[0] | (p[1] << 8) | (p[2] << 16
 void LoraOTAService::touchRadio() { _t_last = millis(); }
 
 void LoraOTAService::begin(LoraOTARadio& radio) {
+#ifdef LORA_OTA_DEBUG
+  Serial.begin(115200);
+#endif
   _radio = &radio;
   _platform = &loraOtaPlatform();
   uint8_t pubkey[32];
