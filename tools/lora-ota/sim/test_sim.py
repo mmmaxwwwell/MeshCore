@@ -514,6 +514,55 @@ def main():
     check("service: a LONG session lets the node sleep, a fast one does not; LONG idle timeout",
           r.returncode == 0 and "all passed" in r.stdout, r.stdout.strip())
 
+    # a lost FINISH reply (Scout, 2026-10-18): the node set the image and rebooted onto the mesh
+    # settings, so FINISH goes unanswered. Few retries, then FinishUnanswered so push CONFIRMs.
+    class Silent:
+        n = 0
+        async def request(self, payload, want_reply, timeout):
+            Silent.n += 1
+            return None
+    class Timed(Silent):
+        async def request(self, payload, want_reply, timeout):
+            Timed.seen.append(timeout)
+            return None
+    Timed.seen = []
+    snd = L.OtaSender(Timed(), img, m, log=lambda *a: None, retries=6, status_timeout=8.0)
+    snd.sess, snd.chunks = b"\0" * 4, 1
+    try:
+        asyncio.run(asyncio.wait_for(snd.finish(), 0.5))
+    except (asyncio.TimeoutError, L.OtaError):
+        pass
+    check("sender: FINISH on the fast channel waits FINISH_FAST_TIMEOUT per try, not the 8 s STATUS timeout",
+          Timed.seen and all(t == L.FINISH_FAST_TIMEOUT for t in Timed.seen), str(Timed.seen))
+    snd = L.OtaSender(Silent(), img, m, log=lambda *a: None, retries=6, status_timeout=0.01)
+    snd.sess, snd.chunks = b"\0" * 4, 1
+    t0 = time.monotonic()
+    try:
+        asyncio.run(snd.finish())
+        raised = None
+    except L.FinishUnanswered as e:
+        raised = e
+    check("sender: an unanswered FINISH ends in FinishUnanswered after a few retries, with its start time",
+          raised is not None and Silent.n == 6 and t0 <= raised.since <= time.monotonic(),
+          f"{raised!r} after {Silent.n}")
+
+    class Booted:   # CONFIRM answered by the NEW image, booted after the first FINISH
+        def __init__(self, since, sha8, up):
+            self.since, self.sha8, self.up = since, sha8, up
+        async def request(self, payload, want_reply, timeout):
+            up = int(time.monotonic() - self.since) - 7 + self.up
+            return bytes([L.OK, 1]) + struct.pack("<I", max(up, 0)) + self.sha8
+    sha = L.running_sha(img)
+    since = time.monotonic() - 40   # the first FINISH went out 40 s ago; the node booted ~7 s after
+    ok = asyncio.run(L.confirm_new_image(Booted(since, sha[:8], 0), since, log=lambda *a: None, window=60, sha=sha))
+    check("sender: CONFIRM after a lost FINISH accepts the new image that booted since the first FINISH", ok)
+    try:
+        res = asyncio.run(L.confirm_new_image(Booted(since - 3600, b"\x11" * 8, 0), since, log=lambda *a: None,
+                                              window=3, sha=sha))
+    except L.OtaError as e:
+        res = e
+    check("sender: ... and an old image up for an hour (never installed) is not taken for it", res is False, repr(res))
+
     # signed settings (LoraOTASettings.cpp): settings_tests.py
     from settings_tests import run_settings_tests
     run_settings_tests(check, tmp, crypto)

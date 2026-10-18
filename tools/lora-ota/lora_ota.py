@@ -45,11 +45,26 @@ FLAG_DELTA = 0x01  # DATA carries a patch against the running image; base sha8 @
 FLAG_LONG = 0x02   # slow session, long idle timeout, persisted bitmap
 LONG_IDLE_SECS = 6 * 3600   # firmware LORA_OTA_LONG_IDLE_MS
 STATE_DIR = os.path.expanduser("~/.local/state/meshcore-lora-ota")
+FINISH_FAST_TIMEOUT = 3.0   # s per FINISH try on the fast channel (a reply takes < 1 s there): a lost
+                            # reply must not eat the new image's 60 s window before push CONFIRMs
 WORK_SECS = 240   # longest a BEGIN (erase/stage) or FINISH (verify) may take on the target
 
 
 class OtaError(Exception):
     pass
+
+
+class NoReply(OtaError):
+    """a request went unanswered through every retry"""
+
+
+class FinishUnanswered(OtaError):
+    """FINISH got no reply. The node may have set the image and rebooted with its OK reply
+    lost (seen on Scout 2026-10-18: six FINISH retries on the fast channel while the new
+    image ran on the mesh settings), so the caller goes on to CONFIRM, judged by the sha."""
+    def __init__(self, since):
+        super().__init__("FINISH: target not answering")
+        self.since = since   # monotonic time of the first FINISH: the node cannot have rebooted before it
 
 
 class DeltaRefused(OtaError):
@@ -589,19 +604,19 @@ class OtaSender:
             await self.pacer.before(payload)
         return await self.link.request(payload, want_reply, timeout)
 
-    async def ask(self, payload, what):
+    async def ask(self, payload, what, timeout=None):
         for attempt in range(self.retries):
-            r = await self.tx(payload, True, self.status_timeout)
+            r = await self.tx(payload, True, timeout or self.status_timeout)
             if r:
                 return r
             self.log(f"  {what}: no reply (attempt {attempt + 1})")
-        raise OtaError(f"{what}: target not answering")
+        raise NoReply(f"{what}: target not answering")
 
-    async def ask_done(self, payload, what):
+    async def ask_done(self, payload, what, timeout=None):
         """BEGIN/FINISH answer WORKING while the target prepares/verifies: ask again."""
         t0 = time.monotonic()
         while True:
-            r = await self.ask(payload, what)
+            r = await self.ask(payload, what, timeout)
             if r[0] != WORKING:
                 return r
             if time.monotonic() - t0 > WORK_SECS:
@@ -713,7 +728,13 @@ class OtaSender:
     async def finish(self):
         """FINISH: True = image set; False = send more (what is missing was re-polled)."""
         self.log(f"node: got all {self.chunks} chunks; checking the SHA-256")
-        r = await self.ask_done(bytes([REQ_FINISH]) + self.sess, "FINISH")
+        since = time.monotonic()
+        try:
+            # fast mode: short tries, the new image's 60 s window may already be running
+            r = await self.ask_done(bytes([REQ_FINISH]) + self.sess, "FINISH",
+                                    None if self.long else min(self.status_timeout, FINISH_FAST_TIMEOUT))
+        except NoReply:
+            raise FinishUnanswered(since)
         if r[0] == OK:
             self.log(f"node: checksum good, image set, rebooting in {REBOOT_SECS} s")
             if self.state_file and os.path.exists(self.state_file):
@@ -1044,8 +1065,15 @@ async def cmd_push(a):
         t0 = time.monotonic()
         # no ABORT on failure: the target drops a silent session after 5 min by itself (a --slow
         # LONG one after 6 h, keeping its chunks), and until then a new push of the same image resumes it
-        await send_image(link, image, m, plan, **kw)
-        rebooting = time.monotonic()
+        try:
+            await send_image(link, image, m, plan, **kw)
+            rebooting = time.monotonic()
+        except FinishUnanswered as e:
+            if a.no_confirm:
+                raise
+            print("node: no answer to FINISH; it may have set the image and rebooted (reply lost): "
+                  "checking with CONFIRM")
+            rebooting = e.since
         print(f"transfer took {fmt_secs(rebooting - t0)}"
               + (f", {pacer.packets} packets, {pacer.airtime:.0f} s of channel airtime" if pacer else ""))
         if restore:   # the new image boots on the node's own radio settings
