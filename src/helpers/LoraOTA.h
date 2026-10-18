@@ -28,6 +28,13 @@
 #define LORA_OTA_MAX_CHUNKS     16384                  // 2.5 MB
 #define LORA_OTA_BITMAP_REPLY   128                    // chunks per STATUS = 1024
 #define LORA_OTA_IDLE_MS        (5 * 60 * 1000UL)      // abandon a silent session
+#define LORA_OTA_LONG_IDLE_MS   (6 * 60 * 60 * 1000UL) // ... a silent LONG session (slow, over the mesh)
+#define LORA_OTA_SAVE_CHUNKS    16                     // LONG: persist the bitmap every this many new chunks
+#define LORA_OTA_SAVE_MS        (5 * 60 * 1000UL)      // ... or this long after the first unsaved one
+
+// BEGIN flags (payload offset 101, after the chunk byte); the reply echoes the accepted ones
+#define LORA_OTA_FLAG_LONG      0x02   // slow transfer over the mesh: long idle timeout, persisted bitmap
+                                       // (0x01 is reserved: delta images)
 #define LORA_OTA_BOARD_LEN      32
 
 // Every LoRa-OTA-capable image carries this string; FINISH refuses an image
@@ -59,6 +66,30 @@ public:
   virtual bool write(size_t off, const uint8_t* src, size_t len) = 0;
   virtual bool read(size_t off, uint8_t* dest, size_t len) = 0;
   virtual bool activate(size_t len) = 0;  // make it the next boot image
+
+  // LONG sessions: re-open the staging area of an earlier session without erasing it
+  // (it already holds `len` bytes' worth of chunks), and a small persistent record of
+  // that session. Optional: a Flash without them restarts a LONG transfer after a reboot.
+  virtual bool reattach(size_t len) { return false; }
+  // the record: hdr (fixed size) + bitmap, which within one record only ever GAINS bits,
+  // so a NOR store may program it again in place. fresh = a new record (erase first).
+  virtual bool saveSession(const uint8_t* hdr, size_t hlen, const uint8_t* bitmap, size_t blen, bool fresh) { return false; }
+  virtual bool loadSession(uint8_t* hdr, size_t hlen, uint8_t* bitmap, size_t blen) { return false; }
+  virtual void clearSession() { }
+};
+
+// A session record on raw NOR flash (one erase sector of its own). The bitmap is
+// stored inverted (erased 0xFF = missing), so saving more chunks only clears bits:
+// no erase per save, and a save cut by a power loss is still a correct (older) record.
+class NorSessionStore {
+public:
+  virtual bool sessErase() = 0;   // the record's sector
+  virtual bool sessWrite(size_t off, const uint8_t* src, size_t len) = 0;
+  virtual bool sessRead(size_t off, uint8_t* dest, size_t len) = 0;
+  virtual size_t sessSize() = 0;
+  bool save(const uint8_t* hdr, size_t hlen, const uint8_t* bitmap, size_t blen, bool fresh);
+  bool load(uint8_t* hdr, size_t hlen, uint8_t* bitmap, size_t blen);
+  void clear();
 };
 
 // signed message: "MCOTA1" || board[32] (NUL padded) || size u32 LE || sha256
@@ -84,6 +115,15 @@ class Receiver {
   uint8_t _sha[32];
   uint32_t _last_ms;
   uint8_t _bitmap[LORA_OTA_MAX_CHUNKS / 8];
+  uint8_t _flags;          // accepted BEGIN flags of this session
+  bool _resumed;           // PREPARING may reattach a persisted LONG session instead of erasing
+  bool _save_fresh;        // LONG: the persisted record must be (re)started
+  uint16_t _unsaved;       // LONG: chunks received since the last save
+  uint32_t _unsaved_since;
+
+  bool isLong() const { return _flags & LORA_OTA_FLAG_LONG; }
+  bool restoreSession();
+  void saveSession(bool fresh);
 
   bool hasChunk(uint16_t i) const { return _bitmap[i >> 3] & (1 << (i & 7)); }
   uint16_t firstMissing() const;
@@ -102,12 +142,14 @@ public:
   // its length; 0 = send nothing (DATA). reply needs 5 + LORA_OTA_BITMAP_REPLY bytes.
   int handle(const uint8_t* req, size_t len, uint8_t* reply, uint32_t now_ms, uint32_t random32, bool pending_verify);
 
-  void loop(uint32_t now_ms);           // drops a session idle for LORA_OTA_IDLE_MS
+  void loop(uint32_t now_ms);           // drops a session idle for LORA_OTA_IDLE_MS (LONG: _LONG_IDLE_MS); LONG saves
   void poll(uint32_t now_ms);           // the heavy part of BEGIN/FINISH; call from the main loop
   void reset() { _state = IDLE; _size = 0; }   // e.g. the install of an activated image failed
   bool working() const { return _state == PREPARING || _state == VERIFYING; }
   bool receiving() const { return _state == RECEIVING || working(); }
   bool activated() const { return _state == DONE; }
+  // a LONG session between packets: nothing to do until the next one, so the node may sleep
+  bool idleLong() const { return _state == RECEIVING && isLong(); }
   uint16_t received() const { return _received; }
   uint16_t chunks() const { return _chunks; }
 };

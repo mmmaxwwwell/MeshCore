@@ -72,8 +72,10 @@ public:
   // `ota ...` (command points past "ota "); false = not ours
   bool handleCommand(const char* command, char* reply);
   void loop();
+  // A LONG session (slow, over the mesh) between packets is NOT pending work: it lasts
+  // hours, and the node must keep sleeping between packets (a packet wakes it).
   bool hasPendingWork() const {
-    return _pending || _reboot_at || _t_apply_at || _t_active || (_rx && _rx->receiving());
+    return _pending || _reboot_at || _t_apply_at || _t_active || (_rx && _rx->receiving() && !_rx->idleLong());
   }
 };
 

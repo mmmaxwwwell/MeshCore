@@ -5,6 +5,8 @@
   lora_ota.py pubkey                       print it for -D LORA_OTA_PUBKEY
   lora_ota.py sign IMAGE --board TAG       write IMAGE.mcota (manifest + signature)
   lora_ota.py push  --companion C --target T [--password-file F] IMAGE
+  lora_ota.py push  --slow [--duty PCT | --pace S] [--resume] ...  over the mesh, a little at a time
+  lora_ota.py eta   IMAGE [--duty PCT | --pace S] [--hops N]           how long a --slow push takes
   lora_ota.py status|confirm --companion C --target T --password-file F
 
 C is a companion radio: a /dev/... serial path or a BLE address.
@@ -29,7 +31,11 @@ STATUS_NAMES = {0: "ok", 1: "bad state", 2: "bad session", 3: "bad signature (or
                 4: "too big", 5: "flash error", 6: "incomplete", 7: "hash mismatch", 8: "no LoRa-OTA marker",
                 9: "activate failed", 10: "running image not confirmed yet ('ota confirm' first)", 11: "bad argument",
                 12: "working"}
-OK, INCOMPLETE, HASH_MISMATCH, WORKING = 0, 6, 7, 12
+OK, BAD_SESSION, INCOMPLETE, HASH_MISMATCH, WORKING = 0, 2, 6, 7, 12
+FLAG_LONG = 0x02   # BEGIN flags byte (payload offset 101): slow session, long idle timeout, persisted bitmap
+                   # (0x01 is reserved for delta images)
+LONG_IDLE_SECS = 6 * 3600   # firmware LORA_OTA_LONG_IDLE_MS
+STATE_DIR = os.path.expanduser("~/.local/state/meshcore-lora-ota")
 WORK_SECS = 240   # longest a BEGIN (erase/stage) or FINISH (verify) may take on the target
 
 
@@ -112,6 +118,98 @@ def running_sha(image: bytes) -> bytes:
     return hashlib.sha256(image).digest()
 
 
+# ---------------------------------------------------------------- airtime and pacing (--slow)
+
+MESH_PRESET = (62.5, 7, 5)   # bw kHz, SF, CR 4/x: the US/CT Mesh MeshCore preset
+PREAMBLE = 16                # MeshCore's preamble length (CustomSX1262 begin)
+DUTY_DEFAULT = 2.0           # % of the channel's airtime the transfer may use, relays included
+FLOOD_TX = 10                # transmissions per packet assumed for a flood (unknown repeater count)
+JITTER = 0.25                # +-25 % on every gap: never lock step with another periodic sender
+SLOW_ROUND = 256             # --slow: DATA chunks between STATUS polls (progress lands in the state file)
+REPLY_LEN = {REQ_BEGIN: 9, REQ_STATUS: 5 + 128, REQ_FINISH: 1, REQ_ABORT: 1, REQ_CONFIRM: 14}
+
+
+def lora_airtime(pl, bw_khz=MESH_PRESET[0], sf=MESH_PRESET[1], cr=MESH_PRESET[2], preamble=PREAMBLE):
+    """Time on air (s) of a pl-byte LoRa packet: explicit header, CRC on (Semtech AN1200.13)."""
+    tsym = (1 << sf) / (bw_khz * 1000.0)
+    de = 1 if tsym > 0.016 else 0   # low data rate optimisation
+    n = 8 + max(math.ceil((8 * pl - 4 * sf + 28 + 16) / (4 * (sf - 2 * de))) * cr, 0)
+    return (preamble + 4.25) * tsym + n * tsym
+
+
+def datagram_len(body, path_bytes=0):
+    """On-air bytes of a REQ/RESPONSE datagram carrying `body` (the 4-byte tag added):
+    header + path_len + path + dest/src hash + MAC + AES-padded ciphertext."""
+    return 1 + 1 + path_bytes + 1 + 1 + 2 + 16 * math.ceil((4 + body) / 16)
+
+
+class Pacer:
+    """Spaces every transmission of a --slow push: either a fixed --pace (s between
+    packets) or a --duty share of the channel's airtime, counting each relay's
+    re-send of the packet and the target's reply. sleep/clock are injectable (sim)."""
+
+    def __init__(self, duty=None, pace=None, hops=0, hash_size=1, flood=False, jitter=JITTER,
+                 sleep=asyncio.sleep, clock=time.monotonic, rng=random.random):
+        if pace is None and duty is None:
+            duty = DUTY_DEFAULT
+        self.duty, self.pace, self.jitter = duty, pace, jitter
+        self.hops, self.flood = hops, flood
+        self.tx = FLOOD_TX if flood else hops + 1   # transmissions of each packet on the channel
+        self.path_bytes = 0 if flood else hops * hash_size
+        self.sleep, self.clock, self.rng = sleep, clock, rng
+        self.next = None
+        self.airtime = 0.0   # channel seconds spent so far
+        self.packets = 0
+
+    def cost(self, req_len, reply_len=0):
+        t = lora_airtime(datagram_len(req_len, self.path_bytes))
+        if reply_len:
+            t += lora_airtime(datagram_len(reply_len, self.path_bytes))
+        return t * self.tx
+
+    def gap(self, req_len, reply_len=0):
+        return self.pace if self.pace is not None else self.cost(req_len, reply_len) / (self.duty / 100.0)
+
+    async def before(self, payload):
+        reply = REPLY_LEN.get(payload[0], 0)
+        now = self.clock()
+        if self.next is not None and now < self.next:
+            await self.sleep(self.next - now)
+        g = self.gap(len(payload), reply) * (1 + self.jitter * (2 * self.rng() - 1))
+        self.next = self.clock() + g
+        self.airtime += self.cost(len(payload), reply)
+        self.packets += 1
+
+    def describe(self):
+        how = f"one packet per {self.pace:g} s" if self.pace is not None else f"{self.duty:g}% of the channel's airtime"
+        route = "FLOOD" if self.flood else ("direct" if self.hops == 0 else f"{self.hops} hop(s)")
+        return f"{how}, {route} ({self.tx} transmission(s) per packet)"
+
+
+def slow_eta(size, pacer, chunk=CHUNK):
+    """Seconds a lossless --slow push takes: DATA plus the STATUS polls between rounds."""
+    n = math.ceil(size / chunk)
+    data = n * pacer.gap(1 + 6 + chunk)
+    polls = math.ceil(n / SLOW_ROUND) + math.ceil(n / BITMAP_CHUNKS) + 2   # rounds + the final sweep + BEGIN/FINISH
+    return data + polls * pacer.gap(7, REPLY_LEN[REQ_STATUS])
+
+
+def fmt_secs(t):
+    return f"{t / 3600:.1f} h" if t >= 5400 else f"{t / 60:.0f} min"
+
+
+def save_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=1)
+    os.replace(tmp, path)   # a crash mid-write keeps the previous state
+
+
+def state_path(target_pubkey, sha_hex):
+    return os.path.join(STATE_DIR, f"{target_pubkey[:12]}-{sha_hex[:16]}.json")
+
+
 # ---------------------------------------------------------------- protocol
 
 class OtaSender:
@@ -119,17 +217,32 @@ class OtaSender:
          async request(payload, want_reply, timeout) -> reply body | None
        (None = no reply in time). Transport-agnostic: radio or simulator."""
 
-    def __init__(self, link, image, manifest, log=print, status_timeout=8.0, retries=6, keepalive=None, chunk=CHUNK):
+    def __init__(self, link, image, manifest, log=print, status_timeout=8.0, retries=6, keepalive=None, chunk=CHUNK,
+                 pacer=None, state_file=None, resume=None, target=""):
         self.link, self.image, self.m, self.log = link, image, manifest, log
         self.keepalive = keepalive   # async callable, run before each round
         self.status_timeout, self.retries = status_timeout, retries
         self.want_chunk = chunk
         self.work_poll = 1.0 if status_timeout else 0
         self.session = self.chunk = self.chunks = None
+        # --slow: every transmission paced, a LONG session on the target, progress in a state file
+        self.pacer, self.state_file, self.target = pacer, state_file, target
+        self.long = pacer is not None
+        self.flags = FLAG_LONG if self.long else 0
+        self.round = SLOW_ROUND if self.long else None
+        self.acked = None        # bytearray bitmap: chunks the target has confirmed (STATUS) this session
+        self.resume_state = resume   # a loaded state file (dict) to continue from
+        self.rebegins = 0
+        self.long_ok = None      # did the target accept LONG?
+
+    async def tx(self, payload, want_reply, timeout):
+        if self.pacer:
+            await self.pacer.before(payload)
+        return await self.link.request(payload, want_reply, timeout)
 
     async def ask(self, payload, what):
         for attempt in range(self.retries):
-            r = await self.link.request(payload, True, self.status_timeout)
+            r = await self.tx(payload, True, self.status_timeout)
             if r:
                 return r
             self.log(f"  {what}: no reply (attempt {attempt + 1})")
@@ -149,57 +262,133 @@ class OtaSender:
     async def begin(self):
         p = (bytes([REQ_BEGIN]) + struct.pack("<I", self.m["size"]) + bytes.fromhex(self.m["sha256"]) +
              bytes.fromhex(self.m["sig"]) + bytes([self.want_chunk]))
+        if self.flags:
+            p += bytes([self.flags])
         r = await self.ask_done(p, "BEGIN")
         if r[0] != OK:
             raise OtaError(f"BEGIN refused: {STATUS_NAMES.get(r[0], r[0])}")
+        old = self.session
         self.session, self.chunk, self.chunks = struct.unpack("<IBH", r[1:8])
         self.sess = struct.pack("<I", self.session)
+        if self.long:
+            accepted = r[8] if len(r) > 8 else 0   # an older target sends 8 bytes (+ zero padding)
+            if self.long_ok is None and not accepted & FLAG_LONG:
+                self.log("WARNING: the target does not know LONG sessions: it drops the session after "
+                         "5 min of silence and a reboot restarts the transfer")
+            self.long_ok = bool(accepted & FLAG_LONG)
+        prev = self.resume_state
+        if prev and prev.get("session") == self.session and prev.get("chunk") == self.chunk and self.acked is None:
+            self.acked = bytearray.fromhex(prev["acked"])   # the same live session: what it had, it still has
+            self.log(f"resuming session {self.session:08x}: {self.count_acked()}/{self.chunks} chunks already acked")
+        elif old != self.session or self.acked is None:
+            self.acked = bytearray((self.chunks + 7) // 8)   # a new session (or the target restored one): ask
+        self.resume_state = None
+        self.save_state()
 
-    async def missing(self):
-        """Ask the target which chunks it lacks, one STATUS per 1024 chunks."""
+    def count_acked(self):
+        return sum(bin(b).count("1") for b in self.acked) if self.acked else 0
+
+    def save_state(self):
+        if not self.state_file or self.session is None:
+            return
+        save_json(self.state_file, {
+            "format": "mcota-push1", "target": self.target, "size": self.m["size"], "sha256": self.m["sha256"],
+            "session": self.session, "chunk": self.chunk, "chunks": self.chunks, "acked": self.acked.hex(),
+            "duty": self.pacer.duty if self.pacer else None, "pace": self.pacer.pace if self.pacer else None,
+            "updated": int(time.time())})
+
+    def is_acked(self, i):
+        return self.acked[i >> 3] & (1 << (i & 7))
+
+    async def session_lost(self, what):
+        """LONG: the target dropped the session (idle past its timeout, or rebooted). BEGIN
+        again: it re-checks the signature and takes back whatever chunks it had persisted."""
+        self.rebegins += 1
+        if not self.long or self.rebegins > 20:
+            raise OtaError(f"{what}: {STATUS_NAMES[BAD_SESSION]}")
+        self.log(f"{what}: the target lost the session (idle timeout or reboot); BEGIN again")
+        await self.begin()
+        self.log(f"session {self.session:08x}: the target kept {await self.count_target()} chunks")
+
+    async def count_target(self):
+        return self.chunks - len(await self.missing(full=True))
+
+    async def missing(self, full=False, windows=None):
+        """Ask the target which chunks it lacks, one STATUS per 1024 chunks. Windows the
+        target has already acked in full (this session) are skipped unless full=True;
+        `windows` limits the poll to those window numbers (a --slow round's progress)."""
         out = []
-        for base in range(0, self.chunks, BITMAP_CHUNKS):
+        for w, base in enumerate(range(0, self.chunks, BITMAP_CHUNKS)):
+            span = range(base, min(base + BITMAP_CHUNKS, self.chunks))
+            if (windows is not None and w not in windows) or (not full and all(self.is_acked(i) for i in span)):
+                out += [i for i in span if not self.is_acked(i)]
+                continue
             r = await self.ask(bytes([REQ_STATUS]) + self.sess + struct.pack("<H", base), "STATUS")
+            if r[0] == BAD_SESSION:
+                await self.session_lost("STATUS")
+                return await self.missing(full=True)
             if r[0] != OK:
                 raise OtaError(f"STATUS: {STATUS_NAMES.get(r[0], r[0])}")
             bitmap = r[5:5 + 128]
-            for j in range(min(BITMAP_CHUNKS, self.chunks - base)):
-                if not bitmap[j >> 3] & (1 << (j & 7)):
-                    out.append(base + j)
+            for j, i in enumerate(span):
+                if bitmap[j >> 3] & (1 << (j & 7)):
+                    self.acked[i >> 3] |= 1 << (i & 7)
+                else:
+                    self.acked[i >> 3] &= ~(1 << (i & 7)) & 0xFF
+                    out.append(i)
+        self.save_state()
         return out
 
     async def send(self, indices):
         t0, n = time.monotonic(), len(indices)
+        every = 20 if self.long else 200
         for k, i in enumerate(indices):
             if self.keepalive and k % 1000 == 999:
                 await self.keepalive()
             data = self.image[i * self.chunk:(i + 1) * self.chunk]
-            await self.link.request(bytes([REQ_DATA]) + self.sess + struct.pack("<H", i) + data, False, 0)
-            if k % 200 == 199 or k == n - 1:
-                rate = (k + 1) * self.chunk / max(time.monotonic() - t0, 1e-3)
-                self.log(f"  sent {k + 1}/{n} chunks, {rate / 1024:.1f} KiB/s")
+            await self.tx(bytes([REQ_DATA]) + self.sess + struct.pack("<H", i) + data, False, 0)
+            if k % every == every - 1 or k == n - 1:
+                if self.long:
+                    self.log(f"  sent {k + 1}/{n} chunks; channel airtime used {self.pacer.airtime:.0f} s")
+                else:
+                    rate = (k + 1) * self.chunk / max(time.monotonic() - t0, 1e-3)
+                    self.log(f"  sent {k + 1}/{n} chunks, {rate / 1024:.1f} KiB/s")
+
+    async def finish(self):
+        """FINISH: True = image set; False = send more (what is missing was re-polled)."""
+        self.log(f"node: got all {self.chunks} chunks; checking the SHA-256")
+        r = await self.ask_done(bytes([REQ_FINISH]) + self.sess, "FINISH")
+        if r[0] == OK:
+            self.log(f"node: checksum good, image set, rebooting in {REBOOT_SECS} s")
+            if self.state_file and os.path.exists(self.state_file):
+                os.unlink(self.state_file)
+            return True
+        if r[0] == HASH_MISMATCH and self.mismatches < 1:   # a bad flash write: once more
+            self.mismatches += 1
+            self.log("  FINISH: hash mismatch, resending everything")
+            return False
+        if r[0] == INCOMPLETE:
+            return False
+        if r[0] == BAD_SESSION:
+            await self.session_lost("FINISH")
+            return False
+        raise OtaError(f"FINISH refused: {STATUS_NAMES.get(r[0], r[0])}")
 
     async def run(self):
         await self.begin()
         self.log(f"session {self.session:08x}: {self.chunks} chunks of {self.chunk} bytes")
-        stalled, last_missing, mismatches = 0, None, 0
+        self.mismatches = 0
+        if self.long:
+            return await self.run_slow()
+        stalled, last_missing = 0, None
         while True:
             if self.keepalive:
                 await self.keepalive()
-            todo = await self.missing()
+            todo = await self.missing(full=True)
             if not todo:
-                self.log(f"node: got all {self.chunks} chunks; checking the SHA-256")
-                r = await self.ask_done(bytes([REQ_FINISH]) + self.sess, "FINISH")
-                if r[0] == OK:
-                    self.log(f"node: checksum good, image set, rebooting in {REBOOT_SECS} s")
+                if await self.finish():
                     return
-                if r[0] == HASH_MISMATCH and mismatches < 1:   # a bad flash write: once more
-                    mismatches += 1
-                    self.log("  FINISH: hash mismatch, resending everything")
-                    continue
-                if r[0] == INCOMPLETE:
-                    continue
-                raise OtaError(f"FINISH refused: {STATUS_NAMES.get(r[0], r[0])}")
+                continue
             stalled = stalled + 1 if last_missing is not None and len(todo) >= last_missing else 0
             if stalled >= 4:
                 raise OtaError(f"no progress: {len(todo)} chunks still missing")
@@ -207,9 +396,31 @@ class OtaSender:
             self.log(f"{len(todo)} chunks to send")
             await self.send(todo)
 
+    async def run_slow(self):
+        """--slow: rounds of SLOW_ROUND chunks, each followed by a STATUS of just the
+        windows it touched, so progress reaches the state file every few hours at most."""
+        todo = await self.missing()   # windows a resumed session already acked in full are skipped
+        stalled = 0
+        while True:
+            if self.keepalive:
+                await self.keepalive()
+            if not todo:
+                if await self.finish():
+                    return
+                todo = await self.missing(full=True)
+                continue
+            batch = todo[:self.round]
+            before = self.count_acked()
+            self.log(f"{len(todo)} chunks to send ({before}/{self.chunks} acked); this round {len(batch)}")
+            await self.send(batch)
+            todo = await self.missing(windows={i // BITMAP_CHUNKS for i in batch})
+            stalled = stalled + 1 if self.count_acked() <= before else 0
+            if stalled >= 10:
+                raise OtaError(f"no progress in 10 rounds: {len(todo)} chunks still missing")
+
     async def abort(self):
         if self.session is not None:
-            await self.link.request(bytes([REQ_ABORT]) + self.sess, True, self.status_timeout)
+            await self.tx(bytes([REQ_ABORT]) + self.sess, True, self.status_timeout)
 
 
 async def confirm_new_image(link, since, log=print, window=REBOOT_SECS + CONFIRM_SECS, sha=None):
@@ -396,13 +607,47 @@ async def cmd_push(a):
             print(f"on {fast[0]} MHz / {fast[1]} kHz / SF{fast[2]}; the target drops back "
                   f"by itself after {RADIO_IDLE_SECS} s without OTA traffic")
 
-        sender = OtaSender(link, image, m)
+        pacer = state_file = prev = None
+        if a.slow:
+            # over the mesh: through the contact's learned path, or a flood (every repeater re-sends it)
+            plen = ct.get("out_path_len", -1)
+            flood = plen is None or plen < 0
+            hops = 0 if flood else plen & 0x3F
+            hsz = 1 if flood else max(ct.get("out_path_hash_mode", 0), 0) + 1
+            if a.hops is not None:
+                hops, flood = a.hops, False
+            elif flood:
+                print(f"WARNING: no learned path to {ct['adv_name']}: every packet FLOODS the mesh and every "
+                      f"repeater in reach re-sends it. Pacing assumes {FLOOD_TX} transmissions per packet. "
+                      "Get a path first (message the target and wait for the reply), or give --hops.")
+            pacer = Pacer(duty=a.duty, pace=a.pace, hops=hops, hash_size=hsz, flood=flood)
+            state_file = a.state or state_path(ct["public_key"], m["sha256"])
+            if a.resume:
+                if not os.path.exists(state_file):
+                    raise OtaError(f"--resume: no state file {state_file}")
+                prev = json.load(open(state_file))
+                if prev.get("sha256") != m["sha256"] or prev.get("target") != ct["public_key"]:
+                    raise OtaError(f"{state_file} is for another image or target")
+                if a.duty is None and a.pace is None:   # keep the pacing the push started with
+                    pacer.duty, pacer.pace = prev.get("duty"), prev.get("pace")
+                    if pacer.duty is None and pacer.pace is None:
+                        pacer.duty = DUTY_DEFAULT
+            elif os.path.exists(state_file):
+                print(f"note: {state_file} exists from an earlier push; starting over (--resume continues it)")
+            print(f"slow push: {pacer.describe()}")
+            print(f"ETA: {len(image) / 1024:.0f} KiB -> ~{fmt_secs(slow_eta(len(image), pacer))} without losses "
+                  f"(DATA {lora_airtime(datagram_len(1 + 6 + CHUNK, pacer.path_bytes)) * 1000:.0f} ms on air per "
+                  f"transmission); progress saved to {state_file}")
+        sender = OtaSender(link, image, m, pacer=pacer, state_file=state_file, resume=prev,
+                           target=ct["public_key"], retries=20 if a.slow else 6,
+                           status_timeout=30.0 if a.slow else 8.0)
         t0 = time.monotonic()
-        # no ABORT on failure: the target drops a silent session after 5 min by itself,
-        # and until then a new push of the same image resumes it
+        # no ABORT on failure: the target drops a silent session after 5 min by itself (a --slow
+        # LONG one after 6 h, keeping its chunks), and until then a new push of the same image resumes it
         await sender.run()
         rebooting = time.monotonic()
-        print(f"transfer took {rebooting - t0:.0f} s")
+        print(f"transfer took {fmt_secs(rebooting - t0)}"
+              + (f", {pacer.packets} packets, {pacer.airtime:.0f} s of channel airtime" if pacer else ""))
         if restore:   # the new image boots on the node's own radio settings
             await mc.commands.set_radio(*restore[:4], repeat=restore[6])
             await mc.commands.set_tuning(*restore[4:6])
@@ -458,6 +703,14 @@ async def cmd_confirm(a):
         await mc.disconnect()
 
 
+def cmd_eta(a):
+    size = os.path.getsize(a.image) if os.path.exists(a.image) else int(a.image)
+    route = "flood" if a.flood else f"{a.hops} hop(s)"
+    for duty in ([a.duty] if a.duty else [0.5, 1, 2, 5]) if a.pace is None else [None]:
+        p = Pacer(duty=duty, pace=a.pace, hops=a.hops, flood=a.flood)
+        print(f"{size / 1024:.0f} KiB, {route}, {p.describe().split(',')[0]}: ~{fmt_secs(slow_eta(size, p))}")
+
+
 async def cmd_cli(a, cmd):
     mc = await connect(a.companion)
     try:
@@ -496,6 +749,12 @@ def main():
     s = sub.add_parser("sign")
     s.add_argument("image")
     s.add_argument("--board", required=True)
+    e = sub.add_parser("eta", help="how long a --slow push takes")
+    e.add_argument("image", help="image file, or a size in bytes")
+    e.add_argument("--duty", type=float)
+    e.add_argument("--pace", type=float)
+    e.add_argument("--hops", type=int, default=0)
+    e.add_argument("--flood", action="store_true")
     for name in ("push", "status", "confirm"):
         p = sub.add_parser(name)
         p.add_argument("--companion", required=True)
@@ -508,13 +767,24 @@ def main():
             p.add_argument("image")
             p.add_argument("--fast", default="919.0,500,5,5", help="freq,bw,sf,cr for the transfer")
             p.add_argument("--slow", action="store_true",
-                           help="stay on the mesh radio settings (hours on the shared channel)")
+                           help="stay on the mesh radio settings, paced: hours to days on the shared channel")
+            p.add_argument("--duty", type=float, help=f"--slow: %% of channel airtime to use, relays included "
+                                                      f"(default {DUTY_DEFAULT:g})")
+            p.add_argument("--pace", type=float, help="--slow: seconds between packets instead of --duty")
+            p.add_argument("--hops", type=int, help="--slow: hops to the target (default: the contact's learned path)")
+            p.add_argument("--state", help="--slow: progress file (default under ~/.local/state/meshcore-lora-ota)")
+            p.add_argument("--resume", action="store_true", help="--slow: continue from the progress file")
             p.add_argument("--no-confirm", action="store_true")
     a = ap.parse_args()
+    if a.cmd == "push" and not a.slow and (a.duty or a.pace or a.resume or a.hops is not None):
+        ap.error("--duty/--pace/--hops/--resume go with --slow")
+    if a.cmd == "push" and a.duty is not None and a.pace is not None:
+        ap.error("--duty or --pace, not both")
     try:
         if a.cmd == "keygen": cmd_keygen(a)
         elif a.cmd == "pubkey": cmd_pubkey(a)
         elif a.cmd == "sign": cmd_sign(a)
+        elif a.cmd == "eta": cmd_eta(a)
         elif a.cmd == "push": asyncio.run(cancellable(cmd_push(a)))
         elif a.cmd == "confirm": asyncio.run(cmd_confirm(a))
         else: asyncio.run(cmd_cli(a, f"ota {a.cmd}"))

@@ -209,6 +209,7 @@ static void installNow(const ImageMap* first, const ImageMap* fallback) {
 #define NEW_PATH   "/ota-new.bin"
 #define OLD_PATH   "/ota-old.bin"
 #define STATE_PATH "/ota-state"
+#define SESS_PATH  "/ota-session"   // a LONG session's record (lora_ota::Receiver)
 
 // ---------------------------------------------------------------- littlefs helpers
 
@@ -286,6 +287,57 @@ public:
   bool read(size_t off, uint8_t* dest, size_t len) override { return rawIO(off, dest, len, false); }
   bool activate(size_t len) override { return len == new_map.size; }   // install() does the rest
 
+  // LONG sessions: the staged file keeps its chunks across a reboot; the record is a file too
+  bool reattach(size_t len) override {
+    QSPIFlash._lockFS();
+    bool ok = fileSize(NEW_PATH) == len && mapFile(NEW_PATH, len, new_map);
+    QSPIFlash._unlockFS();
+    return ok;
+  }
+  bool saveSession(const uint8_t* hdr, size_t hlen, const uint8_t* bitmap, size_t blen, bool fresh) override {
+    static uint32_t words[64];   // word-aligned bounce, as lfsWriteFile
+    uint8_t* buf = (uint8_t*)words;
+    QSPIFlash._lockFS();
+    lfs_file_t f;
+    bool ok = lfs_file_open(lfs(), &f, SESS_PATH, LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC) >= 0;
+    if (ok) {
+      for (size_t pos = 0; pos < hlen + blen && ok; ) {
+        size_t n = hlen + blen - pos < sizeof(words) ? hlen + blen - pos : sizeof(words);
+        for (size_t i = 0; i < n; i++) buf[i] = pos + i < hlen ? hdr[pos + i] : bitmap[pos + i - hlen];
+        ok = lfs_file_write(lfs(), &f, buf, n) == (lfs_ssize_t)n;
+        pos += n;
+      }
+      ok = lfs_file_close(lfs(), &f) >= 0 && ok;
+    }
+    QSPIFlash._unlockFS();
+    return ok;
+  }
+  bool loadSession(uint8_t* hdr, size_t hlen, uint8_t* bitmap, size_t blen) override {
+    QSPIFlash._lockFS();
+    lfs_file_t f;
+    bool ok = fileSize(SESS_PATH) == hlen + blen && lfs_file_open(lfs(), &f, SESS_PATH, LFS_O_RDONLY) >= 0;
+    if (ok) {   // through a word-aligned bounce: littlefs may hand a big read straight to QSPI DMA
+      static uint32_t words[64];
+      uint8_t* buf = (uint8_t*)words;
+      for (size_t pos = 0; pos < hlen + blen && ok; ) {
+        size_t n = hlen + blen - pos < sizeof(words) ? hlen + blen - pos : sizeof(words);
+        ok = lfs_file_read(lfs(), &f, buf, n) == (lfs_ssize_t)n;
+        for (size_t i = 0; ok && i < n; i++) {
+          if (pos + i < hlen) hdr[pos + i] = buf[i]; else bitmap[pos + i - hlen] = buf[i];
+        }
+        pos += n;
+      }
+      lfs_file_close(lfs(), &f);
+    }
+    QSPIFlash._unlockFS();
+    return ok;
+  }
+  void clearSession() override {
+    QSPIFlash._lockFS();
+    if (fileSize(SESS_PATH)) lfs_remove(lfs(), SESS_PATH);
+    QSPIFlash._unlockFS();
+  }
+
 private:
   // QSPI DMA takes word-aligned RAM buffers, word-aligned flash addresses and
   // whole words; a chunk sits anywhere in a packet. So everything goes through
@@ -344,12 +396,14 @@ typedef QspiFileFlash StageFlash;
 #define RAW_OLD    LORA_OTA_RAW_SLOT
 #define RAW_STATE  (2 * LORA_OTA_RAW_SLOT)                     // one 4 KB sector
 #define RAW_NEEDED (RAW_STATE + PAGE)
+#define RAW_SESSION (RAW_STATE + PAGE)   // one more 4 KB sector: a LONG session's record, if the chip has it
 #define QSPI_PAGE  256
 
 struct RawState { OtaState st; uint32_t old_size; uint32_t spare; };   // whole words
 
 static bool raw_up = false, raw_failed = false;
 static uint32_t raw_old_size = 0;
+static uint32_t raw_chip_size = 0;
 static char raw_why[32] = "";   // why staging is unavailable, for `ota status`
 static uint32_t bounce[QSPI_PAGE / 4 + 2];   // QSPI DMA: word-aligned RAM only
 
@@ -426,6 +480,7 @@ static bool rawBegin() {
     snprintf(raw_why, sizeof(raw_why), "qspi id %02X%02X%02X", id[0], id[1], id[2]);
     return false;
   }
+  raw_chip_size = size;
   raw_up = true;
   raw_failed = false;
   return true;
@@ -518,7 +573,7 @@ static bool storeMapOld() {
 
 // ---------------------------------------------------------------- staging flash (raw slot)
 
-class QspiRawFlash : public lora_ota::Flash {
+class QspiRawFlash : public lora_ota::Flash, public lora_ota::NorSessionStore {
 public:
   size_t capacity() override {
     uint32_t app = APP_END - APP_START;
@@ -538,6 +593,25 @@ public:
     return off + len <= new_map.size && rawIO(RAW_NEW + off, dest, len, false);
   }
   bool activate(size_t len) override { return len == new_map.size; }   // install() does the rest
+
+  // LONG sessions: the slot keeps its chunks across a reboot; the record has a sector of its own
+  // (never the STATE sector: that one belongs to probation/rollback)
+  bool reattach(size_t len) override {
+    if (len > capacity()) return false;
+    setMap(new_map, RAW_NEW, len);
+    return true;
+  }
+  bool saveSession(const uint8_t* h, size_t hl, const uint8_t* b, size_t bl, bool fresh) override { return save(h, hl, b, bl, fresh); }
+  bool loadSession(uint8_t* h, size_t hl, uint8_t* b, size_t bl) override { return load(h, hl, b, bl); }
+  void clearSession() override { if (sessSize()) clear(); }
+  size_t sessSize() override { return raw_chip_size >= RAW_SESSION + PAGE ? PAGE : 0; }
+  bool sessErase() override { return sessSize() && rawErase(RAW_SESSION, PAGE); }
+  bool sessWrite(size_t off, const uint8_t* src, size_t len) override {
+    return off + len <= sessSize() && rawIO(RAW_SESSION + off, (uint8_t*)src, len, true);
+  }
+  bool sessRead(size_t off, uint8_t* dest, size_t len) override {
+    return off + len <= sessSize() && rawIO(RAW_SESSION + off, dest, len, false);
+  }
 };
 typedef QspiRawFlash StageFlash;
 

@@ -76,7 +76,7 @@ bool LoraOTAService::handleCommand(const char* command, char* reply) {
     } else if (_rx && _rx->activated()) {
       strcpy(reply, "image activated, rebooting");
     } else if (_rx && _rx->receiving()) {
-      sprintf(reply, "receiving %u/%u chunks", _rx->received(), _rx->chunks());
+      sprintf(reply, "receiving %u/%u chunks%s", _rx->received(), _rx->chunks(), _rx->idleLong() ? " (long session)" : "");
     } else {
       sprintf(reply, "idle, board %s, %s, %s", LORA_OTA_BOARD, _platform->describe(), LORA_OTA_MARKER);
     }

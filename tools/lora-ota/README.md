@@ -83,13 +83,14 @@ Notes:
   *receives*, the gateway can stay up; it reconnects after the reboot.
 - `--fast freq,bw,sf,cr` picks the transfer channel (default `919.0,500,5,5`,
   inside US 902–928 and clear of the MeshCore and Meshtastic presets).
-  `--slow` stays on the mesh settings and works across hops, but takes about
-  80 min of the shared channel for an ESP32 image.
+  `--slow` stays on the mesh settings, works across hops and is paced to a
+  small share of the shared channel: see "Slow mode" below.
 - The sender keeps the companion's own settings: radio, tuning, and the
   client-repeat flag. Note that `set_radio` without that flag turns repeat
   off and saves it. Ctrl-C restores them too.
 - An interrupted push can be re-run: it finds the target on the transfer
-  channel if it is still there, and resumes the same session within 5 min.
+  channel if it is still there, and resumes the same session within 5 min
+  (a `--slow` session: 6 h, and its chunks survive even after that).
 - `confirm [--wait 150]` keeps sending CONFIRM, which is how you confirm a
   first LoRa-OTA build installed by WiFi OTA.
 - Measured (2026-10-18), Wayfarer ↔ Rhea across the house:
@@ -103,17 +104,109 @@ Notes:
 Repeater CLI (admin): `ota status`, `ota confirm`, `ota rollback` (only while
 pending).
 
+## Slow mode: over the shared mesh, a little at a time
+
+`push --slow` sends the update through the normal mesh, on the normal radio
+settings, through repeaters, over hours to days, using only a small share of
+the channel's airtime: a polite neighbour on the shared CT Mesh channel. Every
+packet is an ordinary encrypted MeshCore REQ datagram, as in the fast mode.
+
+```sh
+lora_ota.py eta wayfarer.bin                      # how long, at 0.5/1/2/5 % (add --hops N)
+lora_ota.py push --slow --companion ... --target Wayfarer wayfarer.bin            # 2 % of airtime
+lora_ota.py push --slow --duty 1 ...              # a share of airtime, relays included
+lora_ota.py push --slow --pace 60 ...             # or: one packet per 60 s
+lora_ota.py push --slow --resume ...              # after Ctrl-C, a laptop sleep, a day later
+```
+
+- **Pacing.** Every transmission is paced, not just DATA: STATUS polls,
+  BEGIN/FINISH re-asks and retries too. After each packet the sender waits
+  `airtime / duty`, where airtime counts the packet, the target's reply (a
+  STATUS reply is about as long as a DATA) and **every relay's re-send**
+  (hops + 1 transmissions). ±25 % jitter on every gap, so it never runs in
+  lock step with someone else's periodic traffic. Default 2 %.
+- **Route.** It uses the contact's learned path (`out_path_len`), so a
+  packet costs hops + 1 transmissions. With no path it floods: every
+  repeater in reach re-sends every packet. The sender warns and paces as if
+  10 transmissions per packet. Better: message the target first so the path
+  is learned, or say `--hops N`.
+- **Rounds.** DATA goes out in rounds of 256 chunks, each followed by a
+  STATUS of just the 1024-chunk windows it touched. The acked bitmap goes to
+  the state file after every poll.
+- **State file** (`~/.local/state/meshcore-lora-ota/<target>-<sha>.json`,
+  or `--state`): target, image SHA-256, session, chunk size, acked bitmap,
+  pacing. `--resume` continues from it. If the target still has that
+  session, windows already acked in full are not polled again. If not
+  (dropped, rebooted), the sender polls everything once. Deleted after a
+  good FINISH.
+- **LONG sessions on the target.** BEGIN carries a flags byte. LONG (`0x02`)
+  raises the idle timeout from 5 min to 6 h for that session only. It also
+  keeps the receive bitmap in flash, saved every 16 new chunks or 5 min after
+  the first unsaved one, from the main loop (never the receive path). If the
+  session is dropped anyway (6 h of silence, or a reboot), the next BEGIN of
+  the **same** image (same size, chunk size and SHA-256) checks the
+  signature as always, then takes the saved chunks back instead of erasing.
+  The sender does that by itself on a `bad session` reply. A reboot costs at
+  most the ~16 unsaved chunks, plus whatever of the current round went to
+  the dead session.
+  - Why it is safe: the record is saved only after its chunks are written;
+    the staging area is NOR flash (bits only go 1 -> 0), so rewriting an
+    unsaved chunk with the same bytes is harmless; any BEGIN that erases
+    the staging area clears the record first; FINISH still re-hashes the
+    whole image against the signed SHA-256.
+  - Where: ESP32, the last 4 KB sector of the staging OTA partition (images
+    may use all but that sector). nRF52 raw slots, its own 4 KB sector after
+    the probation STATE sector (never that one). nRF52 LittleFS, the file
+    `/ota-session`. On NOR the bitmap is stored inverted, so a save only
+    clears bits: no erase per save, and a save cut by a power loss is an
+    older but still correct record.
+  - An older target ignores the flag (its BEGIN reply has no flags byte).
+    The sender then warns: 5-min idle timeout, and a reboot restarts the
+    transfer.
+- **The node keeps its job.** A LONG session never touches the radio
+  settings (no REQ_RADIO) and the node keeps relaying. Between packets it is
+  not "pending work", so ESP32 light sleep (repeater `powersaving on`) and
+  nRF52 sleep carry on. A packet wakes the node, and the 6 h timeout runs on
+  `millis()`, which keeps counting through light sleep.
+- **After FINISH** nothing changes: the node reboots into the new image, and
+  CONFIRM must land within 60 s of boot or it rolls back. Over several hops,
+  watch that round trip. The CONFIRM loop is not paced: it is a minute or
+  two of small packets.
+
+### Airtime and ETA
+
+Time on air per Semtech AN1200.13: explicit header, CRC on, preamble 16
+(MeshCore's), US preset SF7 / 62.5 kHz / CR 4/5. A DATA is 143 bytes of
+payload (7 + 136-byte chunk), plus the 4-byte tag, AES-padded to 160, plus
+header, path length, path, hashes and MAC: 166 bytes direct, **549 ms on
+air**. A STATUS is 130 ms out and 508 ms back.
+
+`slow_eta` without losses (add your loss rate on top). Duty counts relays:
+2 hops = 3 transmissions per packet.
+
+| Image | Chunks | DATA airtime | 1 % | 2 % | 5 % | 2 hops, 2 % | 2 hops, 5 % |
+|---|---|---|---|---|---|---|---|
+| nRF52 companion (Wayfarer), 422 KiB | 3178 | 29 min | 49 h | 24 h | 10 h | 75 h | 30 h |
+| ESP32 companion (Rhea), 664 KiB | 5000 | 46 min | 77 h | 38 h | 15 h | 117 h | 47 h |
+| ESP32 repeater (Heltec V3), 1.1 MiB | 8611 | 79 min | 132 h | 66 h | 26 h | 202 h | 81 h |
+
+`--pace 60` on the nRF52 image: about 53 h.
+
 ### Protocol (REQ payload, little endian; replies after the 4-byte tag)
 
 | Type | Request | Reply |
 |---|---|---|
-| `0x60` BEGIN | size u32, sha256[32], sig[64], chunk u8 | WORKING (12) while it checks the signature and stages; then status, session u32, chunk u8, chunks u16 |
+| `0x60` BEGIN | size u32, sha256[32], sig[64], chunk u8, [flags u8] | WORKING (12) while it checks the signature and stages; then status, session u32, chunk u8, chunks u16, accepted flags u8 |
 | `0x61` DATA | session u32, index u16, bytes | none |
 | `0x62` STATUS | session u32, from u16 | status, received u16, first_missing u16, bitmap[128] |
 | `0x63` FINISH | session u32 | WORKING while it re-hashes; then status (OK: reboots in 6 s) |
 | `0x64` ABORT | session u32 | status |
 | `0x65` CONFIRM | none | status, was_pending u8, uptime_s u32, running sha256[0:8] |
 | `0x66` RADIO | freq kHz u32, bw Hz u32, sf, cr, idle s u16 | status; applies 1.5 s later, reverts after `idle` s without OTA traffic |
+
+BEGIN flags (offset 101): `0x02` LONG (slow mode, above). `0x01` is
+reserved for delta images. The reply's flags byte echoes the flags the
+target accepted; an older target sends no such byte, which reads as 0.
 
 The running sha is what the chip reports. On ESP32 that's the hash esptool
 appends to the image; on nRF52 it's the SHA-256 of the app image.
@@ -159,5 +252,18 @@ board, no marker, an unconfirmed running image, too big, an image altered
 after signing, resume after a dropped link, the confirm timing (only an
 answer from the rebooted image counts, and a rollback is reported), plus the
 nRF52 littlefs staging and the service layer under `-ffast-math`.
+
+Slow mode, on a virtual clock that passes on the target too:
+- a paced transfer at 15 % loss: the airtime share it asked for, no two
+  packets too close, STATUS paced too, and the ETA within reach;
+- resume from the sender's state file after the sender dies;
+- a 5 h silence keeps a LONG session; a 7 h one drops it, and BEGIN again
+  takes the saved chunks back;
+- a target reboot mid-transfer resumes from the persisted bitmap, and
+  without a session store it restarts and still finishes;
+- a fast session still drops after 5 min;
+- in the service: a LONG session does not count as pending work (the node
+  sleeps) while a fast one does, it survives 10 min of silence, and it
+  drops after 6 h.
 Requests are padded and size-checked like a real companion's. It needs
 `.pio/libdeps` (build any env once) for the rweather Crypto sources.
