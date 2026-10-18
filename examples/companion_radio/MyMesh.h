@@ -68,6 +68,7 @@
 
 #include <helpers/BaseChatMesh.h>
 #include <helpers/TransportKeyStore.h>
+#include <helpers/LoraOTAService.h>
 
 /* -------------------------------------------------------------------------------------- */
 

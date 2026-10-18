@@ -683,8 +683,28 @@ void MyMesh::onChannelDataRecv(const mesh::GroupChannel &channel, mesh::Packet *
   }
 }
 
+#ifdef LORA_OTA_ENABLED
+// firmware over LoRa: only from a favourited contact; the image itself must be signed (LORA_OTA_PUBKEY)
+class CompanionOtaRadio : public LoraOTARadio {
+  NodePrefs* _p;
+public:
+  CompanionOtaRadio(NodePrefs* p) : _p(p) { }
+  void otaTempRadio(float freq, float bw, uint8_t sf, uint8_t cr) override { radio_driver.setParams(freq, bw, sf, cr); }
+  void otaRestoreRadio() override { radio_driver.setParams(_p->freq, _p->bw, _p->sf, _p->cr); }
+};
+static LoraOTAService ota_service;
+#endif
+
 uint8_t MyMesh::onContactRequest(const ContactInfo &contact, uint32_t sender_timestamp, const uint8_t *data,
                                  uint8_t len, uint8_t *reply) {
+#ifdef LORA_OTA_ENABLED
+  if (lora_ota::Receiver::isOtaReq(data[0])) {
+    if (!(contact.flags & 1)) return 0;   // favourites only
+    memcpy(reply, &sender_timestamp, 4);
+    int n = ota_service.handleRequest(data, len, &reply[4], getRNG()->nextInt(1, 0x7FFFFFFF));
+    return n > 0 ? 4 + n : 0;
+  }
+#endif
   if (data[0] == REQ_TYPE_GET_TELEMETRY_DATA) {
     uint8_t permissions = 0;
     uint8_t cp = contact.flags >> 1; // LSB used as 'favourite' bit (so only use upper bits)
@@ -991,6 +1011,9 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
 
 void MyMesh::begin() {
   BaseChatMesh::begin();
+#ifdef LORA_OTA_ENABLED
+  ota_service.begin(*new CompanionOtaRadio(&_prefs));   // first: arms the rollback deadline if this image is unconfirmed
+#endif
 
   if (!_store->loadMainIdentity(self_id)) {
     self_id = radio_new_identity(); // create new random identity
@@ -2705,6 +2728,9 @@ void MyMesh::checkSerialInterface() {
 
 void MyMesh::loop() {
   BaseChatMesh::loop();
+#ifdef LORA_OTA_ENABLED
+  ota_service.loop();
+#endif
 
   if (_cli_rescue) {
     checkCLIRescueCmd();
@@ -2745,5 +2771,8 @@ bool MyMesh::advert() {
 
 // To check if there is pending work
 bool MyMesh::hasPendingWork() const {
+#ifdef LORA_OTA_ENABLED
+  if (ota_service.hasPendingWork()) return true;   // mid-transfer, temp radio, or awaiting confirm
+#endif
   return _mgr->getOutboundTotal() > 0 || dirty_contacts_expiry != 0;
 }
