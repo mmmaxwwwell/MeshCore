@@ -215,6 +215,22 @@ def main():
         r = subprocess.run([exe], capture_output=True, text=True)
         check("nRF52 littlefs staging: extents, raw out-of-order writes, remount, backup", r.returncode == 0, r.stdout)
 
+    # LoraOTAService (radio switch, confirm window, rollback) with -ffast-math like the nRF52 build
+    crypto = next(os.path.join(REPO, ".pio/libdeps", d, "Crypto") for d in sorted(os.listdir(os.path.join(REPO, ".pio/libdeps")))
+                  if os.path.exists(os.path.join(REPO, ".pio/libdeps", d, "Crypto", "SHA256.cpp")))
+    exe = os.path.join(tmp, "service_test")
+    ed = os.path.join(REPO, "lib/ed25519")
+    subprocess.check_call(["c++", "-O2", "-ffast-math", "-w", "-DLORA_OTA_ENABLED", "-DLORA_OTA_HOST_TEST",
+                           '-DLORA_OTA_PUBKEY="' + "00" * 32 + '"', '-DLORA_OTA_BOARD="test"',
+                           "-I", os.path.join(HERE, "stubs"), "-I", os.path.join(REPO, "src/helpers"), "-I", ed, "-I", crypto,
+                           os.path.join(HERE, "service_test.cpp"), os.path.join(REPO, "src/helpers/LoraOTAService.cpp"),
+                           os.path.join(REPO, "src/helpers/LoraOTA.cpp"),
+                           *[os.path.join(crypto, f) for f in ("SHA256.cpp", "Hash.cpp", "Crypto.cpp")],
+                           *[os.path.join(ed, f) for f in sorted(os.listdir(ed)) if f.endswith(".c")], "-o", exe])
+    r = subprocess.run([exe], capture_output=True, text=True)
+    check("service: 500 kHz switch, idle drop-back, probation after setup, confirm sha, rollback at 60 s",
+          r.returncode == 0, r.stdout.strip())
+
     print(f"\n{len(failures)} failed" if failures else "\nall passed")
     sys.exit(1 if failures else 0)
 
