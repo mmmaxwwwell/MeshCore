@@ -8,7 +8,7 @@
   lora_ota.py status|confirm --companion C --target T --password-file F
 
 C is a companion radio: a /dev/... serial path or a BLE address.
-T is the target: a contact name or a public-key hex prefix. A repeater target
+T is the target: a contact name or a public-key hex prefix. A repeater or room server target
 takes the admin password; a companion target takes OTA only from radios it has
 favourited.
 """
@@ -339,11 +339,12 @@ async def cmd_push(a):
     try:
         await mc.ensure_contacts()
         ct = find_contact(mc, a.target)
-        repeater = ct.get("type") == 2
+        kind = {2: "repeater", 3: "room server"}.get(ct.get("type"), "companion")
+        repeater = kind != "companion"
         adm = None
-        if repeater:   # repeaters take OTA requests from a logged-in admin
+        if repeater:   # repeaters and room servers take OTA requests from a logged-in admin
             if not a.password_file:
-                raise OtaError("a repeater target needs --password-file (its admin password)")
+                raise OtaError(f"a {kind} target needs --password-file (its admin password)")
             adm = Admin(mc, a.target, open(a.password_file).read().strip())
             await adm.login()
             st = await adm.cli("ota status")
@@ -380,7 +381,7 @@ async def cmd_push(a):
             if not already_fast:
                 raise OtaError(f"{ct['adv_name']} does not answer LoRa OTA requests: no OTA firmware, or "
                                "(companion) this radio is not one of its favourites")
-        print(f"target {ct['adv_name']}: speaks LoRa OTA ({'repeater' if repeater else 'companion'})"
+        print(f"target {ct['adv_name']}: speaks LoRa OTA ({kind})"
               + (", still on the transfer channel" if already_fast else ""))
 
         if fast:
@@ -500,7 +501,7 @@ def main():
         p.add_argument("--companion", required=True)
         p.add_argument("--target", required=True)
         p.add_argument("--password-file", required=(name == "status"),
-                       help="the target's admin password (repeater targets only)")
+                       help="the target's admin password (repeater and room server targets only)")
         if name == "confirm":
             p.add_argument("--wait", type=float, default=150, help="keep trying this many seconds")
         if name == "push":

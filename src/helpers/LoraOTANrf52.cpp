@@ -355,6 +355,11 @@ static bool rawBegin() {
   if (raw_up) return true;
   if (raw_failed) return false;
   raw_failed = true;   // one attempt per boot
+#ifdef QSPI_FLASH_EN
+  pinMode(QSPI_FLASH_EN, OUTPUT);   // boards that power the chip from a GPIO (ThinkNode M6)
+  digitalWrite(QSPI_FLASH_EN, HIGH);
+  delay(5);
+#endif
   nrfx_qspi_config_t c;   // this nrfx has no QSPI defaults in its config, so no NRFX_QSPI_DEFAULT_CONFIG
   memset(&c, 0, sizeof(c));
   c.pins.sck_pin = g_ADigitalPinMap[PIN_QSPI_SCK];
