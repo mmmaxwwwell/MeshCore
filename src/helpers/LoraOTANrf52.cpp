@@ -243,6 +243,7 @@ static uint32_t fileSize(const char* path) {
 // the store the platform below uses: files on the app's LittleFS
 
 static bool storeReady() { return lfs()->cfg != NULL; }   // mounted by the app before ota.begin()
+static const char* storeWhy() { return "(no qspi fs)"; }
 static void storeLock() { QSPIFlash._lockFS(); }
 static void storeUnlock() { QSPIFlash._unlockFS(); }
 static bool storeLoad(OtaState& s) { return loadState(s); }
@@ -349,6 +350,7 @@ struct RawState { OtaState st; uint32_t old_size; uint32_t spare; };   // whole 
 
 static bool raw_up = false, raw_failed = false;
 static uint32_t raw_old_size = 0;
+static char raw_why[32] = "";   // why staging is unavailable, for `ota status`
 static uint32_t bounce[QSPI_PAGE / 4 + 2];   // QSPI DMA: word-aligned RAM only
 
 static bool rawBegin() {
@@ -360,6 +362,31 @@ static bool rawBegin() {
   digitalWrite(QSPI_FLASH_EN, HIGH);
   delay(5);
 #endif
+  // A chip an earlier firmware left in deep power-down (it stays there while it
+  // keeps power) never reports ready, so the peripheral's ACTIVATE would time
+  // out polling it. Wake it first by hand: 0xAB (release from deep power-down)
+  // clocked out on plain GPIOs, then tRES1.
+  pinMode(PIN_QSPI_CS, OUTPUT);
+  digitalWrite(PIN_QSPI_CS, HIGH);
+  pinMode(PIN_QSPI_SCK, OUTPUT);
+  digitalWrite(PIN_QSPI_SCK, LOW);
+  pinMode(PIN_QSPI_IO0, OUTPUT);
+  pinMode(PIN_QSPI_IO2, OUTPUT);   // WP and HOLD high: HOLD low would pause the chip
+  digitalWrite(PIN_QSPI_IO2, HIGH);
+  pinMode(PIN_QSPI_IO3, OUTPUT);
+  digitalWrite(PIN_QSPI_IO3, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_QSPI_CS, LOW);
+  for (int bit = 7; bit >= 0; bit--) {   // SPI mode 0, MSB first
+    digitalWrite(PIN_QSPI_IO0, (0xAB >> bit) & 1);
+    delayMicroseconds(2);
+    digitalWrite(PIN_QSPI_SCK, HIGH);
+    delayMicroseconds(2);
+    digitalWrite(PIN_QSPI_SCK, LOW);
+  }
+  digitalWrite(PIN_QSPI_CS, HIGH);
+  delayMicroseconds(100);
+
   nrfx_qspi_config_t c;   // this nrfx has no QSPI defaults in its config, so no NRFX_QSPI_DEFAULT_CONFIG
   memset(&c, 0, sizeof(c));
   c.pins.sck_pin = g_ADigitalPinMap[PIN_QSPI_SCK];
@@ -373,21 +400,32 @@ static bool rawBegin() {
   c.prot_if.addrmode = NRF_QSPI_ADDRMODE_24BIT;
   c.phy_if.sck_delay = 0x05;
   c.phy_if.spi_mode = NRF_QSPI_MODE_0;
-  c.phy_if.sck_freq = NRF_QSPI_FREQ_32MDIV2;     // 16 MHz
+  c.phy_if.sck_freq = NRF_QSPI_FREQ_32MDIV8;     // 4 MHz: within every QSPI NOR's slowest mode
   c.irq_priority = 7;
-  if (nrfx_qspi_init(&c, NULL, NULL) != NRFX_SUCCESS) return false;   // no handler = blocking calls
+  nrfx_err_t err = nrfx_qspi_init(&c, NULL, NULL);   // no handler = blocking calls
+  if (err == NRFX_ERROR_TIMEOUT) {   // nrfx waits only briefly for ACTIVATE: give the chip longer
+    for (int i = 0; i < 250 && !NRF_QSPI->EVENTS_READY; i++) delay(1);
+    if (NRF_QSPI->EVENTS_READY) err = NRFX_SUCCESS;
+  }
+  if (err != NRFX_SUCCESS) {
+    snprintf(raw_why, sizeof(raw_why), "qspi init %08lX", (unsigned long)err);   // 0BAD0007: no chip answering (ThinkNode M6 Basalt)
+    return false;
+  }
 
-  // a bootloader or an earlier app may have left the chip in deep power-down
+  // and once more through the peripheral, in case the GPIO wake was too early
   nrf_qspi_cinstr_conf_t rel = NRFX_QSPI_DEFAULT_CINSTR(0xAB, NRF_QSPI_CINSTR_LEN_1B);
   nrfx_qspi_cinstr_xfer(&rel, NULL, NULL);
   delayMicroseconds(50);
 
   uint8_t id[3] = {0};   // JEDEC: manufacturer, type, log2(capacity)
   nrf_qspi_cinstr_conf_t rdid = NRFX_QSPI_DEFAULT_CINSTR(0x9F, NRF_QSPI_CINSTR_LEN_4B);
-  if (nrfx_qspi_cinstr_xfer(&rdid, NULL, id) != NRFX_SUCCESS) return false;
+  err = nrfx_qspi_cinstr_xfer(&rdid, NULL, id);
   uint32_t size = (id[2] >= 16 && id[2] <= 28) ? (1UL << id[2]) : 0;
   LORA_OTA_LOG("ota: qspi %02X %02X %02X, %lu KB", id[0], id[1], id[2], (unsigned long)(size / 1024));
-  if (size < RAW_NEEDED) return false;   // missing chip or too small for two slots
+  if (err != NRFX_SUCCESS || size < RAW_NEEDED) {   // missing chip or too small for two slots
+    snprintf(raw_why, sizeof(raw_why), "qspi id %02X%02X%02X", id[0], id[1], id[2]);
+    return false;
+  }
   raw_up = true;
   raw_failed = false;
   return true;
@@ -437,6 +475,7 @@ static void setMap(ImageMap& m, uint32_t addr, uint32_t size) {
 // the store the platform below uses: raw slots
 
 static bool storeReady() { return rawBegin(); }
+static const char* storeWhy() { return raw_why; }
 static void storeLock() { }
 static void storeUnlock() { }
 
@@ -509,7 +548,7 @@ typedef QspiRawFlash StageFlash;
 class Nrf52OtaPlatform : public LoraOTAPlatform {
   StageFlash _flash;
   OtaState _st;
-  char _desc[32];
+  char _desc[64];
 
 public:
   lora_ota::Flash* flash() override { return storeReady() ? &_flash : NULL; }
@@ -584,8 +623,8 @@ public:
   }
 
   const char* describe() override {
-    snprintf(_desc, sizeof(_desc), "nrf52 app %luk%s", (unsigned long)(runningImageSize() / 1024),
-             _st.rolled_back ? ", ROLLED BACK" : "");
+    snprintf(_desc, sizeof(_desc), "nrf52 app %luk%s%s%s", (unsigned long)(runningImageSize() / 1024),
+             _st.rolled_back ? ", ROLLED BACK" : "", storeReady() ? "" : ", NO STAGING ", storeReady() ? "" : storeWhy());
     return _desc;
   }
 };
