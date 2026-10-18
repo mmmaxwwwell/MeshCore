@@ -35,6 +35,7 @@
 #include <helpers/TxtDataHelpers.h>
 #include <helpers/RegionMap.h>
 #include <helpers/RoutingPolicy.h>
+#include <helpers/LoraOTAService.h>
 #include "RateLimiter.h"
 
 #ifdef WITH_BRIDGE
@@ -111,6 +112,9 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
 #endif
   CayenneLPP telemetry;
   unsigned long set_radio_at, revert_radio_at;
+#ifdef LORA_OTA_ENABLED
+  LoraOTAService lora_ota;
+#endif
   float pending_freq;
   float pending_bw;
   uint8_t pending_sf;

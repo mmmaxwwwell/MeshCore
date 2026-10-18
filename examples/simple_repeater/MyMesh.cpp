@@ -213,6 +213,14 @@ int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t
   // memcpy(reply_data, &now, 4);   // response packets always prefixed with timestamp
   memcpy(reply_data, &sender_timestamp, 4); // reflect sender_timestamp back in response packet (kind of like a 'tag')
 
+#ifdef LORA_OTA_ENABLED
+  if (lora_ota::Receiver::isOtaReq(payload[0])) {
+    if (!sender->isAdmin()) return 0;
+    int n = lora_ota.handleRequest(payload, payload_len, &reply_data[4], getRNG()->nextInt(1, 0x7FFFFFFF));
+    return n > 0 ? 4 + n : 0;
+  }
+#endif
+
   if (payload[0] == REQ_TYPE_GET_STATUS) {  // guests can also access this now
     RepeaterStats stats;
     stats.batt_milli_volts = board.getBattMilliVolts();
@@ -677,6 +685,11 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
       int reply_len = handleRequest(client, timestamp, &data[4], len - 4);
       if (reply_len == 0) return; // invalid command
 
+#ifdef LORA_OTA_ENABLED
+      // OTA tags run far ahead of real time (one per chunk); recording one
+      // would lock out the real-time-stamped CLI, `ota confirm` included
+      if (!lora_ota::Receiver::isOtaReq(data[4]))
+#endif
       client->last_timestamp = timestamp;
       client->last_activity = getRTCClock()->getCurrentTime();
 
@@ -945,6 +958,9 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
 void MyMesh::begin(FILESYSTEM *fs) {
   mesh::Mesh::begin();
   _fs = fs;
+#ifdef LORA_OTA_ENABLED
+  lora_ota.begin(board);   // first: arms the rollback deadline if this image is unconfirmed
+#endif
   // load persisted prefs
   _cli.loadPrefs(_fs);
   acl.load(_fs, self_id);
@@ -1285,6 +1301,10 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     uint32_t pct = uptime_millis ? (uint32_t)(_slept_millis * 100 / uptime_millis) : 0;
     sprintf(reply, "%s - slept %lu times, %lu%% of uptime", _prefs.powersaving_enabled ? "on" : "off",
             (unsigned long)_num_sleeps, (unsigned long)pct);
+#ifdef LORA_OTA_ENABLED
+  } else if (memcmp(command, "ota ", 4) == 0 && lora_ota.handleCommand(&command[4], reply)) {
+    // ota status | confirm | rollback
+#endif
   } else{
     _cli.handleCommand(sender_timestamp, command, reply);  // common CLI commands
   }
@@ -1296,6 +1316,9 @@ void MyMesh::loop() {
 #endif
 
   mesh::Mesh::loop();
+#ifdef LORA_OTA_ENABLED
+  lora_ota.loop();
+#endif
 
   if (next_flood_advert && millisHasNowPassed(next_flood_advert)) {
     mesh::Packet *pkt = createSelfAdvert();
@@ -1343,5 +1366,8 @@ bool MyMesh::hasPendingWork() const {
   // light sleep only delays millis() deadlines (a 30 s timer wakes it), but a
   // pending temp radio change or lazy ACL write should not wait that long
   if (set_radio_at || dirty_contacts_expiry) return true;
+#ifdef LORA_OTA_ENABLED
+  if (lora_ota.hasPendingWork()) return true;   // mid-transfer, or awaiting `ota confirm`
+#endif
   return _mgr->getOutboundTotal() > 0;
 }
