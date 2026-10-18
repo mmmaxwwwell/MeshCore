@@ -124,7 +124,7 @@
   #define POSREPORT_DEST              { 0x01, 0x7f, 0xb9, 0x70, 0x22, 0xb5 }   // Rhea (titan's home radio)
 #endif
 #ifndef POSREPORT_INTERVAL_MIN
-  #define POSREPORT_INTERVAL_MIN      10
+  #define POSREPORT_INTERVAL_MIN      0    // off until titan sets it: a wiped /posrep never restarts reports
 #endif
 #define POSREPORT_FILE                "/posrep"
 #define POSREPORT_MAGIC               0x31505250UL   // "PRP1"
