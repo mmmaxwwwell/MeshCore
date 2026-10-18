@@ -501,6 +501,7 @@ def main():
                            "-I", os.path.join(HERE, "stubs"), "-I", os.path.join(REPO, "src/helpers"), "-I", ed, "-I", crypto,
                            os.path.join(HERE, "service_test.cpp"), os.path.join(REPO, "src/helpers/LoraOTAService.cpp"),
                            os.path.join(REPO, "src/helpers/LoraOTASettings.cpp"),
+                           os.path.join(REPO, "src/helpers/LoraOTAMaint.cpp"),
                            os.path.join(REPO, "src/helpers/LoraOTA.cpp"), os.path.join(REPO, "src/helpers/LoraOTADelta.cpp"),
                            *[os.path.join(crypto, f) for f in ("SHA256.cpp", "Hash.cpp", "Crypto.cpp")],
                            *[os.path.join(ed, f) for f in sorted(os.listdir(ed)) if f.endswith(".c")], "-o", exe])
@@ -508,15 +509,22 @@ def main():
     sm = sign(svc, key, board="test")
     begin = (bytes([L.REQ_BEGIN]) + struct.pack("<I", len(svc)) + bytes.fromhex(sm["sha256"]) +
              bytes.fromhex(sm["sig"]) + bytes([L.CHUNK]))
-    r = subprocess.run([exe, begin.hex(), (begin + bytes([L.FLAG_LONG])).hex()], capture_output=True, text=True)
+    reboot_cmd = L.make_command(L.MNT_OP_REBOOT, b"", (2, b"test"), 5, key)
+    r = subprocess.run([exe, begin.hex(), (begin + bytes([L.FLAG_LONG])).hex(), reboot_cmd.hex()], capture_output=True, text=True)
     check("service: 500 kHz switch, idle drop-back, probation after setup, confirm sha, rollback at 60 s",
           r.returncode == 0, r.stdout.strip())
     check("service: a LONG session lets the node sleep, a fast one does not; LONG idle timeout",
           r.returncode == 0 and "all passed" in r.stdout, r.stdout.strip())
+    check("service: maintenance requests routed; REBOOT refused while an image is unconfirmed, runs once after CONFIRM",
+          r.returncode == 0 and "REBOOT" not in r.stdout and "maintenance" not in r.stdout, r.stdout.strip())
 
     # signed settings (LoraOTASettings.cpp): settings_tests.py
     from settings_tests import run_settings_tests
     run_settings_tests(check, tmp, crypto)
+
+    # maintenance over LoRa (LoraOTAMaint.cpp): maint_tests.py
+    from maint_tests import run_maint_tests
+    run_maint_tests(check, tmp, crypto)
 
     print(f"\n{len(failures)} failed" if failures else "\nall passed")
     sys.exit(1 if failures else 0)

@@ -33,9 +33,31 @@ void LoraOTAService::beginSettings(lora_ota_settings::Target& target) {
   _settings->begin();
 }
 
-int LoraOTAService::handleRequest(const uint8_t* req, size_t len, uint8_t* reply, uint32_t random32) {
+void LoraOTAService::beginMaint(lora_ota_maint::Target& target) {
+  uint8_t pubkey[32];
+  if (!_platform || !mesh::Utils::fromHex(pubkey, 32, LORA_OTA_PUBKEY)) return;
+  _maint = new lora_ota_maint::Maint(target, pubkey, LORA_OTA_BOARD);
+  _maint->begin();
+}
+
+uint8_t LoraOTAService::maintBusy() const {
+  uint8_t b = 0;
+  if (_pending) b |= LORA_OTA_MNT_BUSY_FW_PENDING;
+  if ((_rx && (_rx->receiving() || _rx->activated())) || _reboot_at) b |= LORA_OTA_MNT_BUSY_OTA;
+  if (_settings && _settings->busy()) b |= LORA_OTA_MNT_BUSY_SETTINGS;
+  return b;
+}
+
+int LoraOTAService::handleRequest(const uint8_t* req, size_t len, uint8_t* reply, uint32_t random32, const uint8_t* requester) {
   if (!_platform || len < 1) return 0;
   touchRadio();
+
+  if (lora_ota_maint::Maint::isMaintReq(req[0])) {
+    if (!_maint) { reply[0] = lora_ota::BAD_STATE; return 1; }
+    lora_ota_maint::Ctx ctx = { requester, maintBusy(), (uint32_t)(millis() / 1000),
+                                _settings ? _settings->version() : 0 };
+    return _maint->handle(req, len, reply, millis(), ctx);
+  }
 
   if (req[0] == LORA_OTA_REQ_CONFIRM) {   // -> status, was_pending, uptime_s u32, running sha256[0:8]
     // the sha tells the sender WHICH image answered: after a rollback the old one answers too
@@ -77,7 +99,9 @@ int LoraOTAService::handleRequest(const uint8_t* req, size_t len, uint8_t* reply
 
   if (!_rx) { reply[0] = lora_ota::BAD_STATE; return 1; }
   // a settings bundle on probation counts as unconfirmed too: one thing at a time
-  return _rx->handle(req, len, reply, millis(), random32, _pending || (_settings && _settings->busy()));
+  // ... and so does a maintenance command still running (a format must not meet a staging file)
+  return _rx->handle(req, len, reply, millis(), random32,
+                     _pending || (_settings && _settings->busy()) || (_maint && _maint->working()));
 }
 
 bool LoraOTAService::handleCommand(const char* command, char* reply) {
@@ -167,6 +191,14 @@ void LoraOTAService::loop() {
       _t_active = false;   // the radio now follows the (new or restored) prefs, not the transfer channel
       _t_apply_at = 0;
     }
+  }
+
+  if (_maint) {
+    if (_maint->working()) {
+      _maint->poll(now, maintBusy());   // signature check + the command (a slice of it, if long)
+      now = millis();
+    }
+    _maint->loop(now);   // a REBOOT that is due
   }
 
   if (_t_apply_at && (long)(now - _t_apply_at) >= 0) {

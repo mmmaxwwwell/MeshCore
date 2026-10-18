@@ -7,6 +7,7 @@
 #include <vector>
 #include <string>
 #include "LoraOTAService.h"
+#include <SHA256.h>
 
 unsigned long fake_millis = 1000;
 static int fails = 0;
@@ -51,6 +52,45 @@ static std::vector<uint8_t> radioReq(uint32_t khz, uint32_t hz, uint8_t sf, uint
   r.push_back(sf); r.push_back(cr); r.push_back(idle); r.push_back(idle >> 8);
   for (int i = 0; i < 3; i++) r.push_back(0);   // AES padding, as on the air
   return r;
+}
+
+static void run(LoraOTAService& s, unsigned long ms);
+
+struct FakeMaintTarget : lora_ota_maint::Target {
+  std::vector<uint8_t> state;
+  uint8_t self[32];
+  int reboots = 0;
+  FakeMaintTarget() { memset(self, 0x5A, 32); }
+  lora_ota_maint::Role role() override { return lora_ota_maint::REPEATER; }
+  const char* fwVersion() override { return "svc"; }
+  uint16_t battMilliVolts() override { return 3900; }
+  const uint8_t* selfPubKey() override { return self; }
+  void reboot() override { reboots++; }
+  int loadState(uint8_t* b, size_t m) override { size_t n = state.size() < m ? state.size() : m; memcpy(b, state.data(), n); return n; }
+  bool saveState(const uint8_t* b, size_t n) override { state.assign(b, b + n); return true; }
+  bool hasFs(int f) override { return f == 0; }
+  bool storage(int, uint32_t& u, uint32_t& t) override { u = 4; t = 28; return true; }
+  int listDir(int, const char*, int, lora_ota_maint::FileEntry&) override { return 0; }
+  bool exists(int, const char*, bool&) override { return false; }
+  bool removeFile(int, const char*) override { return false; }
+};
+
+// upload a signed maintenance command and EXEC it, as the sender does; -> the EXEC reply status
+static uint8_t maintRun(LoraOTAService& s, const std::vector<uint8_t>& cmd, uint8_t* reply, bool* saw_pending_work) {
+  std::vector<uint8_t> d = {LORA_OTA_REQ_MNT_DATA, (uint8_t)cmd.size(), (uint8_t)(cmd.size() >> 8), 0, 0, (uint8_t)cmd.size()};
+  d.insert(d.end(), cmd.begin(), cmd.end());
+  s.handleRequest(d.data(), d.size(), reply, 7);
+  uint8_t h[32];
+  SHA256 sha; sha.update(cmd.data(), cmd.size()); sha.finalize(h, 32);
+  std::vector<uint8_t> e = {LORA_OTA_REQ_MNT_EXEC, (uint8_t)cmd.size(), (uint8_t)(cmd.size() >> 8)};
+  e.insert(e.end(), h, h + 8);
+  for (int i = 0; i < 20; i++) {
+    s.handleRequest(e.data(), e.size(), reply, 7);
+    if (reply[0] != lora_ota::WORKING) return reply[0];
+    if (saw_pending_work && s.hasPendingWork()) *saw_pending_work = true;
+    run(s, 100);
+  }
+  return 0xFF;
 }
 
 static void run(LoraOTAService& s, unsigned long ms) {
@@ -141,6 +181,35 @@ int main(int argc, char** argv) {
     }
   }
   if (argc <= 2) { printf("FAIL no signed BEGINs given\n"); fails++; }
+  if (argc > 3) { // maintenance through the service: argv[3] = a signed REBOOT for board "test"
+    auto cmd = fromHex(argv[3]);
+    plat = FakePlatform();
+    FakeRadio radio; LoraOTAService s; s.begin(radio);
+    uint8_t rd[] = {LORA_OTA_REQ_MNT_READ, LORA_OTA_MNT_RD_STATUS, 0, 0};
+    int n = s.handleRequest(rd, sizeof rd, reply, 7);
+    CHECK(n == 1 && reply[0] == lora_ota::BAD_STATE, "maintenance answered without beginMaint (n=%d)", n);
+    plat = FakePlatform(); plat.pending_at_boot = true;
+    FakeMaintTarget t;
+    LoraOTAService s2; s2.begin(radio); s2.beginMaint(t);
+    n = s2.handleRequest(rd, sizeof rd, reply, 7);
+    CHECK(n > 40 && reply[0] == lora_ota::OK && reply[1] == lora_ota_maint::REPEATER && (reply[2] & LORA_OTA_MNT_ST_FW_PENDING),
+          "STATUS through the service: n=%d status %d flags %02x", n, reply[0], reply[2]);
+    bool pend = false;
+    uint8_t st = maintRun(s2, cmd, reply, &pend);
+    CHECK(st == lora_ota_maint::BUSY && t.state.empty(), "REBOOT while the image is unconfirmed: status %d", st);
+    CHECK(pend, "a maintenance command being checked is not pending work");
+    uint8_t c[] = {LORA_OTA_REQ_CONFIRM, 0, 0, 0};
+    s2.handleRequest(c, sizeof c, reply, 7);
+    st = maintRun(s2, cmd, reply, NULL);
+    CHECK(st == lora_ota::OK && t.state.size() == 8, "REBOOT after CONFIRM: status %d", st);
+    CHECK(s2.hasPendingWork(), "a due reboot is not pending work (the node could sleep through it)");
+    run(s2, LORA_OTA_MNT_REBOOT_MS - 1000);
+    CHECK(t.reboots == 0, "rebooted before the reply could go out");
+    run(s2, 2000);
+    CHECK(t.reboots == 1, "never rebooted");
+    st = maintRun(s2, cmd, reply, NULL);
+    CHECK(st == lora_ota_settings::STALE_VERSION && t.reboots == 1, "the same REBOOT ran twice: status %d", st);
+  } else { printf("FAIL no signed REBOOT given\n"); fails++; }
   printf(fails ? "%d FAILED\n" : "all passed\n", fails);
   return fails ? 1 : 0;
 }
