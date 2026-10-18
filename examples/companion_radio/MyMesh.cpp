@@ -66,6 +66,7 @@
 #define CMD_GET_DEFAULT_FLOOD_SCOPE   64
 #define CMD_SEND_RAW_PACKET           65
 #define CMD_RUN_CLI_COMMAND           66  // v14+
+#define CMD_POSREPORT                 0xA1  // fork: position reports (POSITION_REPORT builds), sub-op in byte 1
 
 // Stats sub-types for CMD_GET_STATS
 #define STATS_TYPE_CORE               0
@@ -102,6 +103,21 @@
 #define RESP_CODE_CHANNEL_DATA_RECV   27
 #define RESP_CODE_DEFAULT_FLOOD_SCOPE 28
 #define RESP_CODE_CLI_REPLY           29  // v14+, a reply to CMD_RUN_CLI_COMMAND
+#define RESP_CODE_POSREPORT           0xA1  // fork: reply to CMD_POSREPORT / POSREPORT_OP_STATUS
+
+#define POSREPORT_OP_STATUS           0x01
+#define POSREPORT_OP_SET              0x02  // interval_min(u16 LE) dest_prefix[6]
+#define POSREPORT_OP_NOW              0x03
+
+#ifndef POSREPORT_DEST
+  #define POSREPORT_DEST              { 0x01, 0x7f, 0xb9, 0x70, 0x22, 0xb5 }   // Rhea (titan's home radio)
+#endif
+#ifndef POSREPORT_INTERVAL_MIN
+  #define POSREPORT_INTERVAL_MIN      10
+#endif
+#define POSREPORT_FILE                "/posrep"
+#define POSREPORT_MAGIC               0x31505250UL   // "PRP1"
+#define POSREPORT_MAX_MIN             1440
 
 #define MAX_CHANNEL_DATA_LENGTH       (MAX_FRAME_SIZE - 9)
 
@@ -527,6 +543,9 @@ void MyMesh::sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* pk
 void MyMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp,
                            const char *text) {
   markConnectionActive(from); // in case this is from a server, and we have a connection
+#ifdef POSITION_REPORT
+  if (posReportDM(from, text)) return;   // titan's interval control: not a chat message
+#endif
   queueMessage(from, TXT_TYPE_PLAIN, pkt, sender_timestamp, NULL, 0, text);
 }
 
@@ -1001,6 +1020,9 @@ void MyMesh::begin() {
   bootstrapRTCfromContacts();
   addChannel("Public", PUBLIC_GROUP_PSK); // pre-configure public channel
   _store->loadChannels(this);
+#ifdef POSITION_REPORT
+  posReportLoad();
+#endif
 
   radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
   radio_driver.setTxPower(_prefs.tx_power_dbm);
@@ -2056,11 +2078,137 @@ void MyMesh::handleCmdFrame(size_t len) {
     } else {
       writeErrFrame(ERR_CODE_TABLE_FULL);
     }
+#ifdef POSITION_REPORT
+  } else if (cmd_frame[0] == CMD_POSREPORT && len >= 2) {
+    handlePosReportCmd(len);
+#endif
   } else {
     writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
     MESH_DEBUG_PRINTLN("ERROR: unknown command: %02X", cmd_frame[0]);
   }
 }
+
+#ifdef POSITION_REPORT
+static File posrepOpenWrite(FILESYSTEM* fs, const char* filename) {
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  fs->remove(filename);
+  return fs->open(filename, FILE_O_WRITE);
+#elif defined(RP2040_PLATFORM)
+  return fs->open(filename, "w");
+#else
+  return fs->open(filename, "w", true);
+#endif
+}
+
+void MyMesh::posReportLoad() {
+  const uint8_t def_dest[6] = POSREPORT_DEST;
+  _posrep.magic = POSREPORT_MAGIC;
+  _posrep.interval_min = POSREPORT_INTERVAL_MIN;
+  memcpy(_posrep.dest, def_dest, 6);
+  File f = _store->openRead(POSREPORT_FILE);
+  if (f) {
+    PosReportCfg c;
+    if (f.read((uint8_t*)&c, sizeof(c)) == sizeof(c) && c.magic == POSREPORT_MAGIC && c.interval_min <= POSREPORT_MAX_MIN) _posrep = c;
+    f.close();
+  }
+  _posrep_next = millis() + 60000UL;    // first report a minute after boot (GPS fix, mesh settle)
+  _posrep_last_ms = 0;
+  _posrep_sent = 0;
+}
+
+void MyMesh::posReportSave() {
+  File f = posrepOpenWrite(_store->getPrimaryFS(), POSREPORT_FILE);
+  if (f) {
+    f.write((const uint8_t*)&_posrep, sizeof(_posrep));
+    f.close();
+  }
+}
+
+// microdegrees -> "-72.946801" without printf float support
+static int fmtE6(char* out, size_t n, long v) {
+  unsigned long a = v < 0 ? (unsigned long)(-v) : (unsigned long)v;
+  return snprintf(out, n, "%s%lu.%06lu", v < 0 ? "-" : "", a / 1000000UL, a % 1000000UL);
+}
+
+bool MyMesh::posReportSend() {
+  LocationProvider* loc = sensors.getLocationProvider();
+  if (!loc || !loc->isEnabled()) return false;            // GPS off: no reports (owner, 2026-10-17)
+  ContactInfo* to = lookupContactByPubKey(_posrep.dest, 6);
+  if (!to) return false;
+  char text[96];
+  uint16_t mv = board.getBattMilliVolts();
+  if (loc->isValid()) {
+    char lat[16], lon[16];
+    fmtE6(lat, sizeof(lat), loc->getLatitude());
+    fmtE6(lon, sizeof(lon), loc->getLongitude());
+    snprintf(text, sizeof(text), "#loc1 %s %s %ld %ld %u %lu", lat, lon, loc->getAltitude() / 1000,
+             loc->satellitesCount(), mv, (unsigned long)getRTCClock()->getCurrentTime());
+  } else {
+    snprintf(text, sizeof(text), "#loc1 nofix %u", mv);
+  }
+  uint32_t ack, est;
+  if (sendMessage(*to, getRTCClock()->getCurrentTimeUnique(), 0, text, ack, est) == MSG_SEND_FAILED) return false;
+  _posrep_sent++;
+  _posrep_last_ms = millis();
+  return true;
+}
+
+void MyMesh::posReportTick() {
+  if (_posrep.interval_min == 0 || !millisHasNowPassed(_posrep_next)) return;
+  _posrep_next = millis() + (unsigned long)_posrep.interval_min * 60000UL;
+  posReportSend();
+}
+
+bool MyMesh::posReportDM(const ContactInfo& from, const char* text) {
+  if (memcmp(from.id.pub_key, _posrep.dest, 6) != 0 || strncmp(text, "#locset ", 8) != 0) return false;
+  char* end;
+  long m = strtol(text + 8, &end, 10);
+  char reply[32];
+  if (end == text + 8 || m < 0 || m > POSREPORT_MAX_MIN) {
+    snprintf(reply, sizeof(reply), "#locack err %u", _posrep.interval_min);
+  } else {
+    _posrep.interval_min = (uint16_t)m;
+    posReportSave();
+    _posrep_next = millis() + 5000UL;    // report soon under the new interval
+    snprintf(reply, sizeof(reply), "#locack %u", _posrep.interval_min);
+  }
+  uint32_t ack, est;
+  sendMessage(from, getRTCClock()->getCurrentTimeUnique(), 0, reply, ack, est);
+  return true;
+}
+
+void MyMesh::handlePosReportCmd(size_t len) {
+  uint8_t op = cmd_frame[1];
+  if (op == POSREPORT_OP_STATUS) {
+    // A1 01 | interval_min(u16) dest[6] | gps_on fix_valid | sent(u32) last_age_s(u32, 0xFFFFFFFF = never)
+    LocationProvider* loc = sensors.getLocationProvider();
+    int i = 0;
+    out_frame[i++] = RESP_CODE_POSREPORT;
+    out_frame[i++] = POSREPORT_OP_STATUS;
+    memcpy(&out_frame[i], &_posrep.interval_min, 2); i += 2;
+    memcpy(&out_frame[i], _posrep.dest, 6); i += 6;
+    out_frame[i++] = loc && loc->isEnabled();
+    out_frame[i++] = loc && loc->isValid();
+    memcpy(&out_frame[i], &_posrep_sent, 4); i += 4;
+    uint32_t age = _posrep_last_ms ? (millis() - _posrep_last_ms) / 1000 : 0xFFFFFFFF;
+    memcpy(&out_frame[i], &age, 4); i += 4;
+    _serial->writeFrame(out_frame, i);
+  } else if (op == POSREPORT_OP_SET && len >= 2 + 2 + 6) {
+    uint16_t m;
+    memcpy(&m, &cmd_frame[2], 2);
+    if (m > POSREPORT_MAX_MIN) { writeErrFrame(ERR_CODE_ILLEGAL_ARG); return; }
+    _posrep.interval_min = m;
+    memcpy(_posrep.dest, &cmd_frame[4], 6);
+    posReportSave();
+    _posrep_next = millis() + 5000UL;
+    writeOKFrame();
+  } else if (op == POSREPORT_OP_NOW) {
+    if (posReportSend()) writeOKFrame(); else writeErrFrame(ERR_CODE_BAD_STATE);   // GPS off or no such contact
+  } else {
+    writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+  }
+}
+#endif
 
 static bool save_filter(const ContactInfo& c) {
   return c.type != ADV_TYPE_NONE;   // don't save the transient/anon entries
@@ -2425,6 +2573,10 @@ void MyMesh::loop() {
     checkCLIRescueCmd();
 #endif
   }
+
+#ifdef POSITION_REPORT
+  posReportTick();
+#endif
 
   // is there are pending dirty contacts write needed?
   if (dirty_contacts_expiry && millisHasNowPassed(dirty_contacts_expiry)) {

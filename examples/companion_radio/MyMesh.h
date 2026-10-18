@@ -121,6 +121,9 @@ public:
 
   void loop();
   void handleCmdFrame(size_t len);
+#ifdef POSITION_REPORT
+  void handlePosReportCmd(size_t len);
+#endif
   bool advert();
   void enterCLIRescue();
 
@@ -241,6 +244,27 @@ private:
 
   DataStore* _store;
   NodePrefs _prefs;
+#ifdef POSITION_REPORT
+  // Position reports to one contact (titan's Rhea): while the GPS is on, every
+  // interval_min a DM "#loc1 lat lon alt_m sats batt_mv fix_unix" (or "#loc1
+  // nofix batt_mv"). That contact alone may set the interval: DM "#locset <min>"
+  // (0 = off), answered "#locack <min>". MeshCore DMs are end-to-end encrypted
+  // and the sender key is authenticated.
+  struct PosReportCfg {
+    uint32_t magic;
+    uint16_t interval_min;
+    uint8_t dest[6];
+  };
+  PosReportCfg _posrep;
+  unsigned long _posrep_next;
+  unsigned long _posrep_last_ms;
+  uint32_t _posrep_sent;
+  void posReportLoad();
+  void posReportSave();
+  void posReportTick();
+  bool posReportSend();
+  bool posReportDM(const ContactInfo& from, const char* text);
+#endif
   uint32_t pending_login;
   uint32_t pending_status;
   uint32_t pending_telemetry, pending_discovery;   // pending _TELEMETRY_REQ
