@@ -699,12 +699,94 @@ public:
   void otaRestoreRadio() override { radio_driver.setParams(_p->freq, _p->bw, _p->sf, _p->cr); }
 };
 static LoraOTAService ota_service;
+
+// signed settings over LoRa (LoraOTASettings.h): a companion has the radio and tuning keys only
+#define OTA_SETTINGS_FILE "/ota_settings"
+static uint32_t toMilli(float f) { return (uint32_t)(f * 1000.0f + 0.5f); }
+
+class CompanionSettingsTarget : public lora_ota_settings::Target {
+  MyMesh* _m;
+public:
+  CompanionSettingsTarget(MyMesh* m) : _m(m) { }
+  uint32_t supported() override {
+    using namespace lora_ota_settings;
+    return (1u << K_RADIO) | (1u << K_TX) | (1u << K_AF) | (1u << K_RXDELAY) | (1u << K_TXDELAY) |
+           (1u << K_DIRECT_TXDELAY) | (1u << K_MULTI_ACKS) | (1u << K_PATH_HASH_MODE) | (1u << K_INT_THRESH) |
+           (1u << K_AGC_RESET_INTERVAL) | (1u << K_RXGAIN);
+  }
+  void read(lora_ota_settings::Values& v) override {
+    memset(&v, 0, sizeof(v));
+    NodePrefs& p = _m->_prefs;
+    v.freq_khz = toMilli(p.freq); v.bw_hz = toMilli(p.bw); v.sf = p.sf; v.cr = p.cr;
+    v.tx = p.tx_power_dbm;
+    v.af_milli = toMilli(p.airtime_factor);
+    v.rxdelay_milli = toMilli(p.rx_delay_base);
+    v.txdelay_milli = toMilli(p.tx_delay_factor);
+    v.direct_txdelay_milli = toMilli(p.direct_tx_delay_factor);
+    v.multi_acks = p.multi_acks;
+    v.path_hash_mode = p.path_hash_mode;
+    v.int_thresh = p.interference_threshold;
+    v.agc_reset_secs = p.agc_reset_interval * 4;
+    v.rxgain = p.rx_boosted_gain;
+  }
+  bool acceptable(const lora_ota_settings::Values& v, uint32_t m) override {
+    // same rule as CMD_SET_RADIO_PARAMS: client repeat only on the allowed bands
+    return !(m & (1u << lora_ota_settings::K_RADIO)) || !_m->_prefs.isRepeatEn() || _m->isValidClientRepeatFreq(v.freq_khz);
+  }
+  bool write(const lora_ota_settings::Values& v, uint32_t m) override {
+    using namespace lora_ota_settings;
+    NodePrefs& p = _m->_prefs;
+    if (m & (1u << K_RADIO)) { p.freq = v.freq_khz / 1000.0f; p.bw = v.bw_hz / 1000.0f; p.sf = v.sf; p.cr = v.cr; }
+    if (m & (1u << K_TX)) p.tx_power_dbm = v.tx;
+    if (m & (1u << K_AF)) p.airtime_factor = v.af_milli / 1000.0f;
+    if (m & (1u << K_RXDELAY)) p.rx_delay_base = v.rxdelay_milli / 1000.0f;
+    if (m & (1u << K_TXDELAY)) p.tx_delay_factor = v.txdelay_milli / 1000.0f;
+    if (m & (1u << K_DIRECT_TXDELAY)) p.direct_tx_delay_factor = v.direct_txdelay_milli / 1000.0f;
+    if (m & (1u << K_MULTI_ACKS)) p.multi_acks = v.multi_acks;
+    if (m & (1u << K_PATH_HASH_MODE)) p.path_hash_mode = v.path_hash_mode;
+    if (m & (1u << K_INT_THRESH)) p.interference_threshold = v.int_thresh;
+    if (m & (1u << K_AGC_RESET_INTERVAL)) p.agc_reset_interval = v.agc_reset_secs / 4;
+    if (m & (1u << K_RXGAIN)) p.rx_boosted_gain = v.rxgain;
+    _m->savePrefs();
+    return true;
+  }
+  void applyRadio() override {
+    NodePrefs& p = _m->_prefs;
+    radio_driver.setParams(p.freq, p.bw, p.sf, p.cr);
+    radio_driver.setTxPower(p.tx_power_dbm);
+    radio_driver.setRxBoostedGainMode(p.rx_boosted_gain);
+  }
+  int8_t maxTxPower() override { return MAX_LORA_TX_POWER; }
+  const uint8_t* selfPubKey() override { return _m->self_id.pub_key; }
+  int loadState(uint8_t* buf, size_t max) override {
+    File f = _m->_store->openRead(OTA_SETTINGS_FILE);
+    if (!f) return 0;
+    int n = f.read(buf, max);
+    f.close();
+    return n;
+  }
+  bool saveState(const uint8_t* buf, size_t len) override {
+    FILESYSTEM* fs = _m->_store->getPrimaryFS();
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+    fs->remove(OTA_SETTINGS_FILE);
+    File f = fs->open(OTA_SETTINGS_FILE, FILE_O_WRITE);
+#elif defined(RP2040_PLATFORM)
+    File f = fs->open(OTA_SETTINGS_FILE, "w");
+#else
+    File f = fs->open(OTA_SETTINGS_FILE, "w", true);
+#endif
+    if (!f) return false;
+    bool ok = f.write(buf, len) == len;
+    f.close();
+    return ok;
+  }
+};
 #endif
 
 uint8_t MyMesh::onContactRequest(const ContactInfo &contact, uint32_t sender_timestamp, const uint8_t *data,
                                  uint8_t len, uint8_t *reply) {
 #ifdef LORA_OTA_ENABLED
-  if (lora_ota::Receiver::isOtaReq(data[0])) {
+  if (LoraOTAService::isRequest(data[0])) {
     if (!(contact.flags & 1)) return 0;   // favourites only
     memcpy(reply, &sender_timestamp, 4);
     int n = ota_service.handleRequest(data, len, &reply[4], getRNG()->nextInt(1, 0x7FFFFFFF));
@@ -1087,6 +1169,9 @@ void MyMesh::begin() {
   radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
   radio_driver.setTxPower(_prefs.tx_power_dbm);
   radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
+#ifdef LORA_OTA_ENABLED
+  ota_service.beginSettings(*new CompanionSettingsTarget(this));   // after the prefs: a bundle left on probation reverts here
+#endif
 
   board.attachDynamicPrefs(_prefs.getCustom());
 

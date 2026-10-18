@@ -80,6 +80,7 @@ struct NeighbourInfo {
 #define PACKET_LOG_FILE  "/packet_log"
 
 class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
+  friend class RepeaterSettingsTarget;   // signed settings over LoRa (MyMesh.cpp)
   FILESYSTEM* _fs;
   uint32_t last_millis;
   uint64_t uptime_millis;

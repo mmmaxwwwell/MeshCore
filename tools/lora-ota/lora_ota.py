@@ -8,6 +8,9 @@
   lora_ota.py push  --slow [--duty PCT | --pace S] [--resume] ...  over the mesh, a little at a time
   lora_ota.py eta   IMAGE [--duty PCT | --pace S] [--hops N]           how long a --slow push takes
   lora_ota.py status|confirm --companion C --target T --password-file F
+  lora_ota.py settings make --target HEX|board:TAG --set KEY=VALUE ... -o BUNDLE
+  lora_ota.py settings push --companion C --target T [--password-file F] BUNDLE
+  lora_ota.py settings show|status|confirm|revert --companion C --target T [--password-file F]
 
 C is a companion radio: a /dev/... serial path or a BLE address.
 T is the target: a contact name or a public-key hex prefix. A repeater or room server target
@@ -29,7 +32,7 @@ COMPANION_FRAME = 176   # a stock companion's max command frame (BaseSerialInter
 CHUNK = COMPANION_FRAME - 1 - 32 - 7   # minus CMD_SEND_BINARY_REQ + pubkey, DATA's type + session + index
 STATUS_NAMES = {0: "ok", 1: "bad state", 2: "bad session", 3: "bad signature (or image for another board)",
                 4: "too big", 5: "flash error", 6: "incomplete", 7: "hash mismatch", 8: "no LoRa-OTA marker",
-                9: "activate failed", 10: "running image not confirmed yet ('ota confirm' first)", 11: "bad argument",
+                9: "activate failed", 10: "running image (or a settings bundle) not confirmed yet ('ota confirm' first)", 11: "bad argument",
                 12: "working"}
 OK, BAD_SESSION, INCOMPLETE, HASH_MISMATCH, WORKING = 0, 2, 6, 7, 12
 FLAG_LONG = 0x02   # BEGIN flags byte (payload offset 101): slow session, long idle timeout, persisted bitmap
@@ -48,6 +51,238 @@ def manifest_message(board: str, size: int, sha: bytes) -> bytes:
     if len(b) > BOARD_LEN:
         raise OtaError(f"board tag longer than {BOARD_LEN} bytes")
     return b"MCOTA1" + b.ljust(BOARD_LEN, b"\0") + struct.pack("<I", size) + sha
+
+
+# ---------------------------------------------------------------- signed settings (LoraOTASettings.h)
+
+REQ_SET_DATA, REQ_SET_APPLY, REQ_SET_CTRL = 0x67, 0x68, 0x69
+SET_OP_STATUS, SET_OP_CONFIRM, SET_OP_REVERT, SET_OP_GET = 0, 1, 2, 3
+SET_DOMAIN = b"MCSET1"   # firmware manifests sign "MCOTA1"...: one can never pass for the other
+SET_MAX_BUNDLE = 512
+SET_MAX_ENTRIES = 24
+SET_MIN_PREFIX = 6
+SET_CONFIRM_SECS = 60    # firmware LORA_OTA_SET_CONFIRM_SECS
+SET_SWITCH_SECS = 1.5    # firmware LORA_OTA_SET_SWITCH_MS: radio changes take effect after the OK reply
+SET_CHUNK = COMPANION_FRAME - 1 - 32 - 6   # CMD_SEND_BINARY_REQ + pubkey, then type + total + offset + n
+STATUS_NAMES.update({16: "version not newer than the last applied bundle", 17: "bundle is for another node",
+                     18: "setting not on the whitelist", 19: "value out of range", 20: "bundle does not parse",
+                     21: "another bundle is still on probation (confirm or revert it first)",
+                     22: "this node has no such setting", 23: "could not save on the node"})
+# the whitelist (the firmware's KEY_NAMES); the node checks the values again
+SETTINGS_KEYS = ["radio", "tx", "af", "rxdelay", "txdelay", "direct.txdelay", "multi.acks", "path.hash.mode",
+                 "int.thresh", "agc.reset.interval", "radio.rxgain", "flood.max", "flood.max.unscoped",
+                 "flood.max.advert", "advert.interval", "flood.advert.interval", "loop.detect", "repeat", "regions"]
+REPEATER_ONLY_KEYS = {"flood.max", "flood.max.unscoped", "flood.max.advert", "advert.interval",
+                      "flood.advert.interval", "loop.detect", "repeat", "regions"}
+# repeater CLI to read a key's current value
+CLI_GET = {k: f"get {k}" for k in SETTINGS_KEYS}
+CLI_GET["regions"] = "region list allowed"
+
+
+def parse_target(t: str):
+    """'board:TAG' or a public-key hex prefix (at least 6 bytes) -> (kind, bytes)"""
+    if t.startswith("board:"):
+        b = t[6:].encode()
+        if not b or len(b) > BOARD_LEN:
+            raise OtaError(f"board tag must be 1..{BOARD_LEN} bytes")
+        return 2, b
+    try:
+        b = bytes.fromhex(t)
+    except ValueError:
+        raise OtaError(f"target {t!r}: give the node's public key (hex, at least {SET_MIN_PREFIX * 2} digits) "
+                       "or board:TAG")
+    if not SET_MIN_PREFIX <= len(b) <= 32:
+        raise OtaError(f"target prefix must be {SET_MIN_PREFIX}..32 bytes")
+    return 1, b
+
+
+def bundle_body(version: int, target, entries) -> bytes:
+    kind, tgt = target
+    if not 0 < len(entries) <= SET_MAX_ENTRIES:
+        raise OtaError(f"1..{SET_MAX_ENTRIES} settings per bundle")
+    out = struct.pack("<IBB", version, kind, len(tgt)) + tgt + bytes([len(entries)])
+    for k, v in entries:
+        kb, vb = k.encode(), v.encode()
+        if len(kb) > 255 or len(vb) > 255:
+            raise OtaError(f"{k}: too long")
+        out += bytes([len(kb)]) + kb + bytes([len(vb)]) + vb
+    return out
+
+
+def make_bundle(entries, target, version, key, check=True) -> bytes:
+    """entries: [(key, value)]. Signed message: "MCSET1" || body; bundle = body || sig."""
+    if check:
+        seen = set()
+        for k, _ in entries:
+            if k not in SETTINGS_KEYS:
+                raise OtaError(f"{k!r} is not a setting this can change (whitelist: {', '.join(SETTINGS_KEYS)})")
+            if k in seen:
+                raise OtaError(f"{k} given twice")
+            seen.add(k)
+    body = bundle_body(version, target, entries)
+    blob = body + key.sign(SET_DOMAIN + body)
+    if len(blob) > SET_MAX_BUNDLE:
+        raise OtaError(f"bundle is {len(blob)} bytes, the node takes {SET_MAX_BUNDLE}")
+    return blob
+
+
+def parse_bundle(blob: bytes) -> dict:
+    body, sig = blob[:-64], blob[-64:]
+    if len(body) < 7:
+        raise OtaError("not a settings bundle")
+    version, kind, tlen = struct.unpack("<IBB", body[:6])
+    i = 6
+    tgt = body[i:i + tlen]; i += tlen
+    n = body[i]; i += 1
+    entries = []
+    for _ in range(n):
+        kl = body[i]; i += 1
+        k = body[i:i + kl].decode(); i += kl
+        vl = body[i]; i += 1
+        v = body[i:i + vl].decode(); i += vl
+        entries.append((k, v))
+    if i != len(body):
+        raise OtaError("not a settings bundle (trailing bytes)")
+    return {"version": version, "target": (kind, tgt), "entries": entries, "sig": sig}
+
+
+def target_text(target):
+    kind, t = target
+    return f"board {t.decode()}" if kind == 2 else f"node {t.hex()}"
+
+
+def radio_tuple(value: str):
+    """'910.525,62.5,7,5' -> (910.525, 62.5, 7, 5), as set_radio takes it"""
+    f, bw, sf, cr = value.split(",")
+    return float(f), float(bw), int(sf), int(cr)
+
+
+def set_status(r) -> dict:
+    """CTRL STATUS/CONFIRM/REVERT reply"""
+    if not r or len(r) < 13:
+        return None
+    return {"status": r[0], "pending": r[1], "was": r[2], "version": struct.unpack("<I", r[3:7])[0],
+            "pending_version": struct.unpack("<I", r[7:11])[0], "secs_left": struct.unpack("<H", r[11:13])[0]}
+
+
+class SettingsSender:
+    """Pushes one bundle over a link (see OtaSender) and confirms it.
+
+    radio: the sending companion's radio, with async get() -> tuple and
+    async set(tuple); used when the bundle changes the node's radio: after
+    APPLY the companion follows the node to send the CONFIRM, and goes back
+    to its own settings afterwards, whatever happened. sleep: async, seconds
+    (the simulator advances its clock)."""
+
+    def __init__(self, link, bundle, radio=None, log=print, timeout=8.0, retries=6, sleep=None):
+        self.link, self.blob, self.radio, self.log = link, bundle, radio, log
+        self.timeout, self.retries = timeout, retries
+        self.sleep = sleep or asyncio.sleep
+        try:
+            self.b = parse_bundle(bundle)
+        except (OtaError, IndexError, UnicodeDecodeError, struct.error):
+            self.b = {"version": 0, "entries": []}   # not ours to judge: the node checks it (tests send junk on purpose)
+        self.version = self.b["version"]
+        self.new_radio = next((radio_tuple(v) for k, v in self.b["entries"] if k == "radio"), None)
+
+    async def ask(self, payload, what, tries=None):
+        for attempt in range(tries or self.retries):
+            r = await self.link.request(payload, True, self.timeout)
+            if r:
+                return r
+            self.log(f"  {what}: no reply (attempt {attempt + 1})")
+        return None
+
+    async def ctrl(self, op, tries=None):
+        return set_status(await self.ask(bytes([REQ_SET_CTRL, op]), "settings", tries))
+
+    async def upload(self):
+        total = len(self.blob)
+        have, stalls = 0, 0
+        while have < total:
+            n = min(SET_CHUNK, total - have)
+            r = await self.ask(bytes([REQ_SET_DATA]) + struct.pack("<HHB", total, have, n) + self.blob[have:have + n], "DATA")
+            if r is None:
+                raise OtaError("DATA: target not answering")
+            if r[0] != OK:
+                raise OtaError(f"DATA refused: {STATUS_NAMES.get(r[0], r[0])}")
+            got = struct.unpack("<H", r[1:3])[0]
+            stalls = stalls + 1 if got <= have else 0
+            if stalls > 4:
+                raise OtaError("DATA: no progress")
+            have = got
+
+    async def apply(self):
+        """-> 'ok' | 'unknown' (it was being checked when the replies stopped). Raises on a refusal."""
+        h = hashlib.sha256(self.blob).digest()[:8]
+        req = bytes([REQ_SET_APPLY]) + struct.pack("<H", len(self.blob)) + h
+        seen_working, t0 = False, time.monotonic()
+        for _ in range(60):
+            r = await self.ask(req, "APPLY")
+            if r is None:
+                if seen_working:
+                    return "unknown"
+                raise OtaError("APPLY: target not answering")
+            if r[0] == WORKING:
+                seen_working = True
+                await self.sleep(1)
+                continue
+            if r[0] == INCOMPLETE:
+                await self.upload()
+                continue
+            if r[0] != OK:
+                raise OtaError(f"settings refused: {STATUS_NAMES.get(r[0], r[0])}")
+            left = struct.unpack("<H", r[5:7])[0] if len(r) >= 7 else SET_CONFIRM_SECS
+            self.log(f"node: bundle v{self.version} applied, on probation ({left} s to confirm)")
+            return "ok"
+        raise OtaError("APPLY: the node never finished checking the bundle")
+
+    async def confirm(self, window):
+        """CONFIRM until the node says it is confirmed; False if it never answers."""
+        t0 = None
+        while True:
+            st = await self.ctrl(SET_OP_CONFIRM, tries=1)
+            if st:
+                if st["status"] == OK and st["pending"] == 0 and st["version"] >= self.version:
+                    if st["version"] > self.version:
+                        raise OtaError(f"the node has a newer bundle (v{st['version']})")
+                    self.log("node: settings confirmed" + ("" if st["was"] else " (an earlier CONFIRM landed)"))
+                    return True
+                if st["status"] == OK and st["pending"] == 0 and st["version"] < self.version:
+                    raise OtaError("the node does not have this bundle (it was not applied)")
+                if st["status"] not in (OK, WORKING):
+                    raise OtaError(f"confirm failed on the node: {STATUS_NAMES.get(st['status'], st['status'])}")
+            await self.sleep(1)
+            window -= 1 + (0 if st else self.timeout)
+            if window <= 0:
+                return False
+
+    async def run(self, confirm=True):
+        """upload, apply, follow a radio change, confirm, put the companion back. -> True = confirmed"""
+        await self.upload()
+        await self.apply()
+        if not confirm:
+            self.log(f"not confirming: the node reverts {SET_CONFIRM_SECS} s after the change")
+            return False
+        own = None
+        try:
+            if self.new_radio and self.radio:
+                own = await self.radio.get()
+                if tuple(own[:4]) != tuple(self.new_radio):
+                    await self.sleep(SET_SWITCH_SECS + 1)   # the node switches 1.5 s after its OK reply
+                    await self.radio.set(self.new_radio)
+                    self.log(f"companion follows to {self.new_radio} to confirm")
+                else:
+                    own = None
+            ok = await self.confirm(SET_CONFIRM_SECS - 10)
+        finally:
+            if own is not None:
+                await self.radio.set(own)
+                self.log("companion back on its own radio settings")
+        if not ok:
+            self.log(f"no CONFIRM got through: the node puts its old settings back by itself "
+                     f"within {SET_CONFIRM_SECS} s of the change")
+        return ok
 
 
 # ---------------------------------------------------------------- signing
@@ -721,6 +956,133 @@ async def cmd_cli(a, cmd):
         await mc.disconnect()
 
 
+def cmd_settings_make(a):
+    entries = []
+    for kv in a.set:
+        if "=" not in kv:
+            raise OtaError(f"--set {kv!r}: want KEY=VALUE")
+        k, v = kv.split("=", 1)
+        entries.append((k.strip(), v.strip()))
+    target = parse_target(a.target)
+    version = a.version if a.version is not None else int(time.time())
+    blob = make_bundle(entries, target, version, load_key(a.key))
+    with open(a.output, "wb") as f:
+        f.write(blob)
+    print(f"{a.output}: v{version} for {target_text(target)}, {len(blob)} bytes")
+    for k, v in entries:
+        print(f"  {k} = {v}")
+
+
+async def read_current(mc, ct, link, adm, keys):
+    """current values of keys: repeater CLI if logged in, else the node's GET (LoRa-OTA-settings firmware)"""
+    cur = {}
+    if adm:
+        for k in keys:
+            try:
+                r = await adm.cli(CLI_GET[k])
+                cur[k] = r[2:].strip() if r.startswith("> ") else r.strip()
+            except OtaError as e:
+                cur[k] = f"? ({e})"
+        return cur
+    start = 0
+    while start != 0xFF:
+        r = await link.request(bytes([REQ_SET_CTRL, SET_OP_GET, start]), True, 8.0)
+        if not r or r[0] != OK:
+            break
+        for line in r[2:].decode(errors="replace").splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                cur[k] = v
+        start = r[1]
+    return {k: cur.get(k, "?") for k in keys} if keys else cur
+
+
+class CompanionRadio:
+    """the sending companion's radio, for SettingsSender"""
+
+    def __init__(self, mc, ct):
+        self.mc, self.ct, self.repeat = mc, ct, 0
+
+    async def get(self):
+        info = self.mc.self_info
+        dq = await self.mc.commands.send_device_query()
+        self.repeat = 1 if (dq.payload or {}).get("repeat") else 0   # set_radio without it turns repeat off
+        return (info["radio_freq"], info["radio_bw"], info["radio_sf"], info["radio_cr"])
+
+    async def set(self, r):
+        await self.mc.commands.set_radio(*r, repeat=self.repeat)
+        await self.mc.commands.change_contact_path(self.ct, "")   # direct: repeaters on the way keep the old settings
+
+
+async def settings_session(a):
+    mc = await connect(a.companion)
+    await mc.ensure_contacts()
+    ct = find_contact(mc, a.target)
+    repeater = ct.get("type") in (2, 3)
+    adm = None
+    if repeater:
+        if not a.password_file:
+            raise OtaError("a repeater target needs --password-file (its admin password)")
+        adm = Admin(mc, a.target, open(a.password_file).read().strip())
+        await adm.login()
+    return mc, ct, adm, CompanionLink(mc, ct)
+
+
+async def cmd_settings_push(a):
+    blob = open(a.bundle, "rb").read()
+    b = parse_bundle(blob)
+    mc, ct, adm, link = await settings_session(a)
+    try:
+        kind, tgt = b["target"]
+        if kind == 1 and not bytes.fromhex(ct["public_key"]).startswith(tgt):
+            raise OtaError(f"bundle is for {target_text(b['target'])}, {ct['adv_name']} is {ct['public_key'][:16]}...")
+        keys = [k for k, _ in b["entries"]]
+        cur = await read_current(mc, ct, link, adm, keys)
+        print(f"{ct['adv_name']}: bundle v{b['version']} ({target_text(b['target'])})")
+        for k, v in b["entries"]:
+            print(f"  {k}: {cur.get(k, '?')} -> {v}")
+        st = set_status(await link.request(bytes([REQ_SET_CTRL, SET_OP_STATUS]), True, 8.0))
+        if st is None:
+            raise OtaError(f"{ct['adv_name']} does not answer signed-settings requests (no such firmware, or "
+                           "(companion) this radio is not one of its favourites)")
+        print(f"node: last bundle v{st['version']}" + (f", v{st['pending_version']} ON PROBATION" if st["pending"] else ""))
+        sender = SettingsSender(link, blob, radio=CompanionRadio(mc, ct))
+        ok = await sender.run(confirm=not a.no_confirm)   # puts the companion's radio back itself
+        if ok and adm:
+            try:
+                await adm.login(tries=2)
+                print(f"status: {await adm.cli('ota settings')}")
+            except OtaError as e:
+                print(f"(confirmed; follow-up check failed: {e})")
+        if not ok and not a.no_confirm:
+            raise OtaError("not confirmed: the node goes back to its old settings by itself")
+    finally:
+        await mc.disconnect()
+
+
+async def cmd_settings_ctrl(a):
+    mc, ct, adm, link = await settings_session(a)
+    try:
+        if a.settings_cmd == "show":
+            # repeater: its CLI (any firmware); companion: GET over LoRa (signed-settings firmware only)
+            keys = SETTINGS_KEYS if adm else []
+            for k, v in (await read_current(mc, ct, link, adm, keys)).items():
+                print(f"{k} = {v}")
+            return
+        op = {"status": SET_OP_STATUS, "confirm": SET_OP_CONFIRM, "revert": SET_OP_REVERT}[a.settings_cmd]
+        st = set_status(await link.request(bytes([REQ_SET_CTRL, op]), True, 8.0) or
+                        await link.request(bytes([REQ_SET_CTRL, op]), True, 8.0))
+        if st is None:
+            raise OtaError("no answer")
+        if st["status"] != OK:
+            raise OtaError(STATUS_NAMES.get(st["status"], st["status"]))
+        print(f"last bundle v{st['version']}" +
+              (f", v{st['pending_version']} on probation, {st['secs_left']} s left" if st["pending"] else ", nothing pending") +
+              ({SET_OP_CONFIRM: " (confirmed now)", SET_OP_REVERT: " (reverted now)"}.get(op, "") if st["was"] else ""))
+    finally:
+        await mc.disconnect()
+
+
 async def cancellable(coro):
     """SIGINT/SIGTERM cancel the transfer ONCE, so its finally (radio restore) runs to the end."""
     task = asyncio.ensure_future(coro)
@@ -775,6 +1137,21 @@ def main():
             p.add_argument("--state", help="--slow: progress file (default under ~/.local/state/meshcore-lora-ota)")
             p.add_argument("--resume", action="store_true", help="--slow: continue from the progress file")
             p.add_argument("--no-confirm", action="store_true")
+    st = sub.add_parser("settings", help="signed settings bundles (README: Signed settings)")
+    ssub = st.add_subparsers(dest="settings_cmd", required=True)
+    m = ssub.add_parser("make")
+    m.add_argument("--target", required=True, help="node public key hex prefix (>= 12 digits) or board:TAG")
+    m.add_argument("--set", action="append", required=True, metavar="KEY=VALUE")
+    m.add_argument("--version", type=int, help="default: the current unix time")
+    m.add_argument("-o", "--output", required=True)
+    for name in ("push", "show", "status", "confirm", "revert"):
+        p = ssub.add_parser(name)
+        p.add_argument("--companion", required=True)
+        p.add_argument("--target", required=True)
+        p.add_argument("--password-file", help="the target's admin password (repeater targets)")
+        if name == "push":
+            p.add_argument("bundle")
+            p.add_argument("--no-confirm", action="store_true")
     a = ap.parse_args()
     if a.cmd == "push" and not a.slow and (a.duty or a.pace or a.resume or a.hops is not None):
         ap.error("--duty/--pace/--hops/--resume go with --slow")
@@ -787,6 +1164,9 @@ def main():
         elif a.cmd == "eta": cmd_eta(a)
         elif a.cmd == "push": asyncio.run(cancellable(cmd_push(a)))
         elif a.cmd == "confirm": asyncio.run(cmd_confirm(a))
+        elif a.cmd == "settings" and a.settings_cmd == "make": cmd_settings_make(a)
+        elif a.cmd == "settings" and a.settings_cmd == "push": asyncio.run(cancellable(cmd_settings_push(a)))
+        elif a.cmd == "settings": asyncio.run(cmd_settings_ctrl(a))
         else: asyncio.run(cmd_cli(a, f"ota {a.cmd}"))
     except OtaError as e:
         print(f"error: {e}", file=sys.stderr)
