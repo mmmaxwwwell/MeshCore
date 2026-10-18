@@ -104,6 +104,7 @@ public:
 
   void loop(uint32_t now_ms);           // drops a session idle for LORA_OTA_IDLE_MS
   void poll(uint32_t now_ms);           // the heavy part of BEGIN/FINISH; call from the main loop
+  void reset() { _state = IDLE; _size = 0; }   // e.g. the install of an activated image failed
   bool working() const { return _state == PREPARING || _state == VERIFYING; }
   bool receiving() const { return _state == RECEIVING || working(); }
   bool activated() const { return _state == DONE; }

@@ -144,6 +144,7 @@ void LoraOTAService::loop() {
     LORA_OTA_LOG("ota: install t=%lu", now);
     _platform->install();   // does not return on success
     LORA_OTA_LOG("ota: install FAILED");
+    _rx->reset();   // keep the running image; a new BEGIN may start over (no retry loop)
   }
   if (_pending && (long)(now - _confirm_by) >= 0) {
     MESH_DEBUG_PRINTLN("lora ota: not confirmed, rolling back");

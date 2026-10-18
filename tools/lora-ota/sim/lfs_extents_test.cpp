@@ -18,6 +18,7 @@ static int fails = 0;
 
 static int bd_read(const struct lfs_config*, lfs_block_t b, lfs_off_t o, void* buf, lfs_size_t n) { memcpy(buf, &chip[b * BS + o], n); return 0; }
 static int bd_prog(const struct lfs_config*, lfs_block_t b, lfs_off_t o, const void* buf, lfs_size_t n) {
+  if ((uintptr_t)buf & 3) { printf("FAIL unaligned buffer handed to the block device (nRF52 QSPI DMA refuses it)\n"); fails++; }
   for (lfs_size_t i = 0; i < n; i++) chip[b * BS + o + i] &= ((const uint8_t*)buf)[i];   // NOR
   return 0;
 }
@@ -111,7 +112,9 @@ int main() {
         memcmp(m2.ext, m.ext, m.n * sizeof(Extent)) == 0, "extents moved");
 
   // a backup of the running image, the other file the install needs
-  CHECK(lfsWriteFile(&lfs, "/ota-old.bin", img.data(), SIZE, false), "backup");
+  std::vector<uint8_t> shifted(SIZE + 1);
+  memcpy(&shifted[1], img.data(), SIZE);   // an unaligned source must still reach the device aligned
+  CHECK(lfsWriteFile(&lfs, "/ota-old.bin", &shifted[1], SIZE, false), "backup");
   CHECK(readFile("/ota-old.bin") == img, "backup read back");
   CHECK(readFile("/ota-new.bin") == img, "staged file hurt by the backup");
 
