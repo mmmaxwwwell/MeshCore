@@ -32,6 +32,9 @@
 #define LORA_OTA_SET_SWITCH_MAX_MS 10000 // ... or this long after the apply, if no one asks for the result
 #define LORA_OTA_SET_GET_TEXT    110     // GET reply text budget
 
+#define LORA_OTA_SET_REBOOT_MS  6000    // a bundle with reboot=1: reboot this long after its CONFIRM
+#define LORA_OTA_SET_POSREPORT_MAX 1440  // posreport.interval minutes (companion POSREPORT_MAX_MIN)
+
 #ifndef LORA_OTA_SET_CONFIRM_SECS
   #define LORA_OTA_SET_CONFIRM_SECS 60   // same rule as a new firmware image
 #endif
@@ -73,9 +76,19 @@ enum Key : uint8_t {
   K_LOOP_DETECT,         // off/minimal/moderate/strict  repeater
   K_REPEAT,              // on/off     repeater
   K_REGIONS,             // comma list of region names (or *) to exist with flood allowed  repeater
+  // our own companion features: on the whitelist ONLY in builds that have them
+  K_POSREPORT_INTERVAL,  // minutes 0-1440, 0 = off            POSITION_REPORT builds
+  K_OVERLAY,             // "off" only: turning it on needs the region name (the overlay's key), never in a bundle  OVERLAY_MESH builds
   K_COUNT
 };
 #define LORA_OTA_SET_RADIO_KEYS ((1u << K_RADIO) | (1u << K_TX) | (1u << K_RXGAIN))
+#define LORA_OTA_SET_REPEATER_KEYS ((1u << (lora_ota_settings::K_REGIONS + 1)) - 1)   // every stock key, no fork features
+// the "reboot" control entry: not a setting. Value "1": reboot once, a little
+// after the bundle's CONFIRM (never before it, never after a revert)
+#define LORA_OTA_SET_REBOOT_KEY "reboot"
+
+// keys this build compiled in (the feature keys only with their feature)
+uint32_t compiledKeys();
 
 const char* keyName(int k);
 int keyByName(const char* name, size_t len);   // -1 = not whitelisted
@@ -91,6 +104,8 @@ struct Values {
   uint8_t flood_max, flood_max_unscoped, flood_max_advert;
   uint8_t advert_interval_min, flood_advert_interval_h;
   uint8_t loop_detect, repeat;
+  uint16_t posreport_min;
+  uint8_t overlay;           // 1 = on (some region name configured), 0 = off. The name is never here
 };
 
 // persisted by the app (a small file): replay counter + probation record.
@@ -122,6 +137,15 @@ public:
   virtual bool regionsApply(const char* names) { (void)names; return false; }   // comma separated
   virtual bool regionsRestore() { return false; }
   virtual int regionsExport(char* out, int max) { (void)max; if (max) out[0] = 0; return 0; }   // allowed names, comma list
+  // overlay (companions, OVERLAY_MESH): keep a copy of the overlay config ON THE NODE before
+  // a bundle turns it off, put it back on a revert, delete the copy once the bundle is
+  // confirmed or reverted (the region name is the overlay's key: no stray copies)
+  virtual bool overlaySnapshot() { return false; }
+  virtual bool overlayOff() { return false; }       // as "#ovlset off" (its repeat-off comes as K_REPEAT)
+  virtual bool overlayRestore() { return false; }
+  virtual void dropSnapshots(uint32_t mask) { (void)mask; }
+  // reboot now (prefs are saved). Called only after a confirmed bundle that asked for it
+  virtual void reboot() = 0;
 };
 
 // copy the masked keys' fields of src into dst
@@ -155,6 +179,9 @@ class Settings {
   uint32_t _applied_ms, _switch_at, _confirm_by;
   bool _switch_asked;
   bool _radio_event;
+  bool _reboot_asked;      // the bundle on probation carries reboot=1
+  bool _reboot_due;        // confirmed: reboot at _reboot_at (0 = not timed yet)
+  uint32_t _reboot_at;
 
   uint8_t verifyAndApply(uint32_t now_ms, bool fw_pending);
   void revert(const char* why);
@@ -174,7 +201,8 @@ public:
   void poll(uint32_t now_ms, bool fw_pending);   // signature check + apply, from the main loop
   void loop(uint32_t now_ms);                    // radio switch + probation deadline
   bool pending() const { return _st.pending_version != 0; }
-  bool busy() const { return pending() || _phase == VERIFYING || _switch_pending; }
+  bool busy() const { return pending() || _phase == VERIFYING || _switch_pending || _reboot_due; }
+  bool rebootDue() const { return _reboot_due; }
   bool working() const { return _phase == VERIFYING; }
   bool takeRadioEvent() { bool e = _radio_event; _radio_event = false; return e; }   // the radio was set from the prefs
   uint32_t version() const { return _st.version; }

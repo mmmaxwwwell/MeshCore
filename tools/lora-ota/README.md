@@ -351,14 +351,41 @@ Source: `src/helpers/LoraOTASettings.{h,cpp}`. Every `*_lora_ota` build has it.
 | `advert.interval` | minutes: 0 (off) or 60-240, even | repeater |
 | `flood.advert.interval` | hours: 0 (off) or 3-168 | repeater |
 | `loop.detect` | off/minimal/moderate/strict | repeater |
-| `repeat` | on/off | repeater |
+| `repeat` | on/off. Companion: client repeat, as `CMD_SET_RADIO_PARAMS` sets it: on only on the client-repeat bands (`ALLOWED_REPEAT_FREQ_RANGE`) | both |
 | `regions` | `ct,northeast,east,*`: each region exists (under `*`) with flood allowed. Additive: nothing is removed or denied | repeater |
+| `posreport.interval` | minutes 0-1440, 0 = off. As `#locset <min>`: saved to `/posrep`, next report in 5 s | companion, `POSITION_REPORT` builds |
+| `overlay` | `off` only. As `#ovlset off`: the overlay name is cleared and **client repeat goes off with it** (the bundle's mask includes `repeat`, so a revert restores both) | companion, `OVERLAY_MESH` builds |
+
+The two feature keys are on the whitelist **only in builds that compile the
+feature in**: elsewhere they are `not on the whitelist`, like any unknown key
+(and a repeater refuses them as `no such setting` in any build).
+`overlay=on` is refused on purpose: turning the overlay on needs its region
+name, and the name IS the overlay's key (the transport key is SHA-256 of
+it). No key material ever travels in a bundle, so the overlay is turned on
+only by `#ovlset on #<name> <repeat>` from the report destination, or the
+app. While an `overlay=off` bundle is on probation the node keeps a copy of
+its own overlay config in `/ota_set_overlay` to revert from; the copy is
+deleted as soon as the bundle is confirmed or reverted. A bundle with
+`overlay=off` and `repeat=on` contradicts itself and is refused.
 
 Never on the list: passwords (admin, guest), the private key, the signing
 key, name, location, owner info, bridge settings, power saving, Wi-Fi, BLE
-PIN, contacts and telemetry policy, and anything about OTA itself. A
-companion refuses repeater keys (`this node has no such setting`); with
-client repeat on, it also refuses a `radio` outside the client-repeat bands.
+PIN, contacts and telemetry policy, overlay region names, the position
+report destination, and anything about OTA itself. A companion refuses
+repeater keys (`this node has no such setting`); with client repeat on
+(already, or from the same bundle), it also refuses a `radio` outside the
+client-repeat bands.
+
+**Reboot request.** A bundle may carry the control entry `reboot=1`
+(`make`/`diff --reboot`). It is not a setting: it changes nothing by itself,
+a bundle with nothing else is refused, and any value but `1` is refused. The
+node reboots **once, 6 s after the bundle's CONFIRM** (time for the reply to
+go out), with the confirmed settings saved. It never reboots instead of a
+CONFIRM: a bundle that reverts (no CONFIRM, REVERT, or a reboot/power cut
+during probation) does not reboot the node, and the request is held in RAM
+only. The version is spent like any other, so the bundle cannot be replayed
+after the reboot. A node without this firmware refuses `reboot` as not on
+the whitelist, so it never silently skips one.
 
 ### Probation
 
@@ -378,8 +405,9 @@ client repeat on, it also refuses a `radio` outside the client-repeat bands.
 5. A **reboot or power cut** before CONFIRM: the old values come back at
    boot.
 6. One thing at a time: no bundle while a new firmware image is unconfirmed,
-   no firmware BEGIN while a bundle is on probation, and no second bundle
-   until the first is confirmed or reverted.
+   no firmware BEGIN while a bundle is on probation (or its reboot is due),
+   and no second bundle until the first is confirmed or reverted.
+7. `reboot=1`: after the CONFIRM, the node reboots once, 6 s later.
 
 The sender handles the radio case: after APPLY it moves its own companion to
 the bundle's radio settings (direct path, no repeaters in between), sends
@@ -396,6 +424,12 @@ companion.
 lora_ota.py settings make --target ce6ce5eab221 --set radio=910.525,62.5,7,5 \
     --set flood.max.unscoped=12 --set flood.advert.interval=47 --set regions=ct,northeast,east,* -o quartz.mcset
 lora_ota.py settings make --target board:heltec_v4_repeater_headless --set tx=20 -o v4-tx.mcset
+lora_ota.py settings make --target 534b6eee0f09 --set posreport.interval=10 --set overlay=off --reboot -o wayfarer.mcset
+
+# diff: read the node's values (as show does), sign a bundle of ONLY the keys that differ
+lora_ota.py settings diff --companion ... --target Wayfarer --set posreport.interval=10 --set repeat=off \
+    --set tx=22 -o wayfarer.mcset          # prints current -> wanted per key; no bundle if nothing differs
+lora_ota.py settings eta wayfarer.mcset [--hops 3 | --flood]   # round trips and channel airtime
 
 # push: shows current -> new, uploads, applies, follows a radio change, confirms
 lora_ota.py settings push --companion ... --target Quartz --password-file <admin pw> quartz.mcset
@@ -413,8 +447,34 @@ Reading the current values:
   what `settings show` and `push` print. On older firmware only the
   companion's own app (or USB) shows them.
 
+`diff` compares values the way the node holds them (`1` = `1.0`,
+`62.5` = `62.50`, regions in any order); a key it cannot read counts as
+changed. The bundle targets the node's 8-byte key prefix unless
+`--bundle-target` says otherwise. Smaller bundles mean fewer DATA packets.
+
 Repeater CLI (admin): `ota settings` (version, pending, seconds left),
 `ota settings confirm`, `ota settings revert`.
+
+### Over the mesh: how long a bundle takes
+
+A settings push is not paced like a `--slow` firmware push: it is a handful
+of request/reply round trips on the mesh preset: STATUS, one DATA per 137
+bytes, APPLY (WORKING, then the result) and CONFIRM. The sender reuses slow
+mode's airtime math (`settings eta`, also printed by `make` and `diff`; US
+preset SF7 / 62.5 kHz, both directions, every relay counted):
+
+| Bundle | Round trips | Airtime direct | 3 hops | flood (10 tx) |
+|---|---|---|---|---|
+| ~100 B (one or two keys) | 5 | 1.7 s | 7.1 s | 17 s |
+| ~160 B (a few keys + reboot) | 6 | 2.2 s | 9.2 s | 22 s |
+| ~350 B (regions list) | 7 | 3.0 s | 12.5 s | 30 s |
+| 512 B (the maximum) | 8 | 3.7 s | 15.5 s | 37 s |
+
+The wall time is those round trips: seconds direct, tens of seconds over a
+few hops, plus the reply retries on loss. A typical bundle is done well
+inside the 60 s probation window. Held to slow mode's default 2% of the
+channel it would take ~1.5-3 min direct; the push does not wait like that,
+since a bundle is only a few packets.
 
 ### Protocol (REQ payload, little endian; replies after the 4-byte tag)
 
@@ -422,13 +482,15 @@ Repeater CLI (admin): `ota settings` (version, pending, seconds left),
 |---|---|---|
 | `0x67` SET_DATA | total u16, offset u16, n u8, bytes | status, have u16 (contiguous bytes held) |
 | `0x68` SET_APPLY | total u16, sha256(bundle)[0:8] | WORKING (12) while it checks; then status, version u32, secs_left u16 |
-| `0x69` SET_CTRL | op u8: 0 STATUS, 1 CONFIRM, 2 REVERT | status, pending u8 (2 = radio switch still to come), was u8, version u32, pending_version u32, secs_left u16 |
+| `0x69` SET_CTRL | op u8: 0 STATUS, 1 CONFIRM, 2 REVERT | status, pending u8 (2 = radio switch still to come), was u8, version u32, pending_version u32, secs_left u16, flags u8 (bit 0: the pending bundle asks for a reboot, bit 1: the reboot is due; older firmware stops before flags) |
 | `0x69` SET_CTRL | op 3 GET, start u8 | status, next u8 (0xFF = end), `key=value\n` text |
 
 Bundle: `body || sig[64]`, at most 512 bytes; body = version u32, target kind
 u8 (1 = public key prefix, 2 = board tag), target length u8, target, count u8,
 then per entry key length u8, key, value length u8, value (ASCII, as the CLI
-takes it).
+takes it). The entry `reboot` = `1` is the reboot request (counts toward the
+24 entries; at most once). The format is otherwise unchanged: a bundle
+without `reboot` reads the same on old and new firmware.
 
 Status codes 16+: 16 version not newer, 17 another node/board, 18 not on the
 whitelist, 19 value out of range, 20 does not parse, 21 another bundle on
@@ -473,6 +535,16 @@ manifest's signature passed off as a bundle, non-whitelisted and
 out-of-range values, other node/board, role limits, one bundle at a time,
 REVERT, a failed probation record, a multi-chunk bundle with regions over
 20% loss, GET, and the signed-only command list.
+
+It builds the fake node twice, without and with `-DPOSITION_REPORT
+-DOVERLAY_MESH`: the feature keys are refused by the first (both roles) and
+by a repeater in the second; `posreport.interval` and `overlay=off` apply,
+revert without a CONFIRM and across a reboot, `overlay=off` takes client
+repeat with it and leaves no copy of the region name once confirmed,
+`overlay=on` is refused; client `repeat` keeps to the allowed bands;
+`reboot=1` reboots exactly once ~6 s after the CONFIRM (also with a radio
+change) and never after a revert, REVERT or replay; `diff` keeps only the
+changed keys, and the bundle it makes applies.
 
 ## The first LoRa-OTA image
 

@@ -238,7 +238,8 @@ class RepeaterSettingsTarget : public lora_ota_settings::Target {
   MyMesh* _m;
 public:
   RepeaterSettingsTarget(MyMesh* m) : _m(m) { }
-  uint32_t supported() override { return (1u << lora_ota_settings::K_COUNT) - 1; }
+  uint32_t supported() override { return LORA_OTA_SET_REPEATER_KEYS; }   // every stock key; the companion features are not a repeater's
+  void reboot() override { board.reboot(); }   // prefs are saved on every write
   void read(lora_ota_settings::Values& v) override {
     NodePrefs& p = _m->_prefs;
     v.freq_khz = toMilli(p.freq); v.bw_hz = toMilli(p.bw); v.sf = p.sf; v.cr = p.cr;
