@@ -25,7 +25,7 @@ public:
   void loop() override;
 
 private:
-  enum Screen : uint8_t { INBOX, CONTACTS, CHAT };
+  enum Screen : uint8_t { INBOX, CONTACTS, CHAT, KEYB };
   enum { MAX_UI_CONTACTS = 48, MAX_UI_MSGS = 32, MAX_TX = 8 };
 
   struct Contact {
@@ -44,6 +44,8 @@ private:
 
   bool _enabled = false, _kobo_up = false, _dirty = false, _full = true;
   bool _syncing = false;
+  bool _draft_dirty = false, _shift = false, _nums = false;
+  char _draft[140] = "";
   Screen _screen = INBOX;
   int _chat_contact = -1;  // index into _contacts, or -1 = public channel 0
   uint32_t _last_draw = 0, _draws = 0;
@@ -80,5 +82,8 @@ private:
   // drawing (protocol v0)
   void draw();
   void drawHeader(const char *title);
+  void drawDraft();
+  void drawKeyboard();
+  void keyPress(int code);
   void drawButton(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const char *label);
 };

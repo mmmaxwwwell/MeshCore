@@ -35,7 +35,13 @@ static const uint16_t W = 1072, H = 1448, M = 40;
 static const uint16_t BAR_Y = 1300, BAR_H = 120;
 static const uint16_t LIST_Y = 140, ROW_H = 118, CHAT_ROW_H = 100;
 static const char *QUICK[] = {"OK", "Yes", "No", "On my way", "Where are you?"};
-static const int NQUICK = 5;
+static const int NQUICK = 5;  // + a 6th button, "Type...", opens the keyboard
+
+// On-screen keyboard. Codes >= 0x20 are characters; the rest are actions.
+enum { K_SHIFT = 1, K_NUMS, K_BACKSPACE, K_SPACE, K_SEND, K_CANCEL };
+static const char *KROWS_ABC[] = {"qwertyuiop", "asdfghjkl", "zxcvbnm"};
+static const char *KROWS_NUM[] = {"1234567890", "-/:;()$&@\"", ".,?!'#%*+="};
+static const uint16_t KEY_H = 112, KB_Y = 560, DRAFT_Y = 150, DRAFT_H = 330;
 
 static Adafruit_USBD_WebUSB vendor;  // descriptor only; IO via tud_vendor_*
 
@@ -81,12 +87,12 @@ static void tRefresh(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint8_t mod
 }
 
 // Touch targets of the screen currently drawn.
-enum Act : uint8_t { A_NONE, A_INBOX, A_CONTACTS, A_PUBLIC, A_ADVERT, A_OPEN_CONTACT, A_OPEN_MSG, A_QUICK, A_BACK };
+enum Act : uint8_t { A_NONE, A_INBOX, A_CONTACTS, A_PUBLIC, A_ADVERT, A_OPEN_CONTACT, A_OPEN_MSG, A_QUICK, A_BACK, A_TYPE, A_KEY };
 struct Hit { uint16_t x, y, w, h; Act act; int16_t arg; };
-static Hit hits[40];
+static Hit hits[48];
 static int nhits = 0;
 static void hit(uint16_t x, uint16_t y, uint16_t w, uint16_t h, Act a, int16_t arg = 0) {
-  if (nhits < 40) hits[nhits++] = {x, y, w, h, a, arg};
+  if (nhits < 48) hits[nhits++] = {x, y, w, h, a, arg};
 }
 
 // ---- lifecycle --------------------------------------------------------------
@@ -266,11 +272,89 @@ void KoboTerminal::onTouch(uint16_t x, uint16_t y) {
         if (!m.channel && _chat_contact < 0) _screen = INBOX;  // unknown sender: no contact to reply to
       } break;
       case A_QUICK: sendText(QUICK[h.arg]); break;
+      case A_TYPE: _screen = KEYB; _draft[0] = 0; _shift = true; _nums = false; break;
+      case A_KEY: keyPress(h.arg); return;  // redraws only what changed
       default: break;
     }
     _dirty = true;
     return;
   }
+}
+
+// ---- keyboard ---------------------------------------------------------------------
+void KoboTerminal::keyPress(int code) {
+  size_t n = strlen(_draft);
+  if (code >= 0x20) {
+    if (n + 1 < sizeof(_draft)) {
+      char c = (char)code;
+      if (_shift && c >= 'a' && c <= 'z') c -= 32;
+      _draft[n] = c; _draft[n + 1] = 0;
+    }
+    if (_shift) { _shift = false; _dirty = true; } else _draft_dirty = true;  // shift changes the key labels
+  } else if (code == K_SPACE) {
+    if (n + 1 < sizeof(_draft)) { _draft[n] = ' '; _draft[n + 1] = 0; }
+    _draft_dirty = true;
+  } else if (code == K_BACKSPACE) {
+    if (n) _draft[n - 1] = 0;
+    _draft_dirty = true;
+  } else if (code == K_SHIFT) {
+    _shift = !_shift; _dirty = true;
+  } else if (code == K_NUMS) {
+    _nums = !_nums; _dirty = true;
+  } else if (code == K_SEND) {
+    if (n) sendText(_draft);
+    _draft[0] = 0; _screen = CHAT; _dirty = true;
+  } else if (code == K_CANCEL) {
+    _draft[0] = 0; _screen = CHAT; _dirty = true;
+  }
+}
+
+// Just the text field, with the fast DU waveform: one keystroke = one small refresh.
+void KoboTerminal::drawDraft() {
+  tFill(M, DRAFT_Y, W - 2 * M, DRAFT_H, 0xff);
+  tFill(M, DRAFT_Y + DRAFT_H - 4, W - 2 * M, 4, 0x00);
+  // wrap at ~40 chars per line, 4 lines, cursor bar at the end
+  char line[48];
+  size_t n = strlen(_draft), per = 40;
+  int lines = 0;
+  for (size_t i = 0; i < n || (i == 0 && n == 0); i += per) {
+    size_t l = n - i < per ? n - i : per;
+    memcpy(line, _draft + i, l); line[l] = 0;
+    if (i + per >= n) strcat(line, "_");
+    tText(M + 8, DRAFT_Y + 70 + lines * 76, 44, false, 0x00, line);
+    if (++lines == 4 || n == 0) break;
+  }
+  tRefresh(M, DRAFT_Y, W - 2 * M, DRAFT_H, 2);
+  if (!g_ok) _kobo_up = false;
+}
+
+void KoboTerminal::drawKeyboard() {
+  const char **rows = _nums ? KROWS_NUM : KROWS_ABC;
+  uint16_t kw = (W - 2 * M) / 10;
+  for (int r = 0; r < 3; r++) {
+    size_t len = strlen(rows[r]);
+    uint16_t x0 = M + (uint16_t)((10 - len) * kw / 2), y = KB_Y + r * (KEY_H + 12);
+    for (size_t i = 0; i < len; i++) {
+      char c = rows[r][i], lab[2] = {c, 0};
+      if (_shift && c >= 'a' && c <= 'z') lab[0] = c - 32;
+      uint16_t x = x0 + i * kw;
+      tFill(x + 3, y, kw - 6, KEY_H, 0x00);
+      tFill(x + 6, y + 3, kw - 12, KEY_H - 6, 0xff);
+      tText(x + kw / 2 - 14, y + KEY_H / 2 + 18, 48, true, 0x00, lab);
+      hit(x, y, kw, KEY_H, A_KEY, c);
+    }
+  }
+  // action rows: [shift][123/abc][  space  ][ del ]  /  [cancel][  send  ]
+  uint16_t y = KB_Y + 3 * (KEY_H + 12), g = 16;
+  uint16_t w1 = 160, wsp = W - 2 * M - 3 * w1 - 3 * g;
+  drawButton(M, y, w1, KEY_H, _shift ? "SHIFT" : "shift"); hit(M, y, w1, KEY_H, A_KEY, K_SHIFT);
+  drawButton(M + w1 + g, y, w1, KEY_H, _nums ? "abc" : "123"); hit(M + w1 + g, y, w1, KEY_H, A_KEY, K_NUMS);
+  drawButton(M + 2 * (w1 + g), y, wsp, KEY_H, "space"); hit(M + 2 * (w1 + g), y, wsp, KEY_H, A_KEY, K_SPACE);
+  drawButton(M + 2 * (w1 + g) + wsp + g, y, w1, KEY_H, "del"); hit(M + 2 * (w1 + g) + wsp + g, y, w1, KEY_H, A_KEY, K_BACKSPACE);
+  y += KEY_H + 24;
+  uint16_t wc = 300;
+  drawButton(M, y, wc, BAR_H, "Cancel"); hit(M, y, wc, BAR_H, A_KEY, K_CANCEL);
+  drawButton(M + wc + g, y, W - 2 * M - wc - g, BAR_H, "Send"); hit(M + wc + g, y, W - 2 * M - wc - g, BAR_H, A_KEY, K_SEND);
 }
 
 // ---- drawing ------------------------------------------------------------------------
@@ -331,6 +415,15 @@ void KoboTerminal::draw() {
     }
     if (!_ncontacts) tText(M, LIST_Y + 80, 36, false, 0x55, "No contacts yet. Advert, then wait.");
     drawButton(M, BAR_Y, W - 2 * M, BAR_H, "Back"); hit(M, BAR_Y, W - 2 * M, BAR_H, A_BACK);
+  } else if (_screen == KEYB) {
+    char t2[48];
+    snprintf(t2, sizeof(t2), "To %s", _chat_contact < 0 ? "Public" : _contacts[_chat_contact].name);
+    drawHeader(t2);
+    drawKeyboard();
+    tRefresh(0, 0, W, H, 0);
+    drawDraft();
+    _full = false;
+    return;
   } else {  // CHAT
     drawHeader(_chat_contact < 0 ? "Public" : _contacts[_chat_contact].name);
     // messages for this peer, newest at the bottom of the list area
@@ -355,11 +448,11 @@ void KoboTerminal::draw() {
     if (!k) tText(M, LIST_Y + 80, 36, false, 0x55, "Nothing here yet.");
     // quick replies: 3 + 2 buttons
     uint16_t qw3 = (W - 2 * M - 2 * 16) / 3, qw2 = (W - 2 * M - 16) / 2;
-    for (int q = 0; q < NQUICK; q++) {
-      bool top = q < 3;
-      uint16_t w = top ? qw3 : qw2, x = M + (top ? q : q - 3) * (w + 16), y = quickY + (top ? 0 : 100);
-      drawButton(x, y, w, 88, QUICK[q]);
-      hit(x, y, w, 88, A_QUICK, q);
+    (void)qw2;
+    for (int q = 0; q <= NQUICK; q++) {  // 3 + 3: five quick replies, then "Type..."
+      uint16_t x = M + (q % 3) * (qw3 + 16), y = quickY + (q / 3) * 100;
+      drawButton(x, y, qw3, 88, q < NQUICK ? QUICK[q] : "Type...");
+      hit(x, y, qw3, 88, q < NQUICK ? A_QUICK : A_TYPE, q);
     }
     drawButton(M, BAR_Y, W - 2 * M, BAR_H, "Back"); hit(M, BAR_Y, W - 2 * M, BAR_H, A_BACK);
   }
@@ -374,7 +467,11 @@ void KoboTerminal::loop() {
   pollKobo();
   if (_kobo_up && _dirty && millis() - _last_draw > 250) {
     _dirty = false;
+    _draft_dirty = false;
     _last_draw = millis();
     draw();
+  } else if (_kobo_up && _draft_dirty && _screen == KEYB) {
+    _draft_dirty = false;
+    drawDraft();
   }
 }
