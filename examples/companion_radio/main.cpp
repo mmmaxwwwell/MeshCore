@@ -76,6 +76,12 @@ MultiSerialInterface interface_manager;
   ETHERNET_CLASS ethernet_interface;
 #endif
 
+// e-ink terminal on a Kobo (kobo-mesh), a second internal companion client
+#if defined(KOBO_TERMINAL)
+  #include "KoboTerminal.h"
+  KoboTerminal kobo_terminal;
+#endif
+
 // include hardware serial interface
 #if defined(SERIAL_RX)
   #include <helpers/ArduinoSerialInterface.h>
@@ -272,6 +278,11 @@ void setup() {
   companion_serial.begin(115200);
   hardware_serial_interface.begin(companion_serial);
   interface_manager.addInterface(InterfaceType::HardwareSerial, &hardware_serial_interface);
+#endif
+
+#if defined(KOBO_TERMINAL)
+  kobo_terminal.begin();
+  interface_manager.addInterface(InterfaceType::USB, &kobo_terminal);
 #endif
 
   the_mesh.startInterface(interface_manager);
