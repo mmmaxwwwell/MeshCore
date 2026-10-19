@@ -15,7 +15,9 @@
   #include <SPIFFS.h>
 #endif
 
-#define LORA_OTA_MAINT_FILE "/ota_maint"   // the replay counter (primary FS; a format of the secondary never touches it)
+#ifndef LORA_OTA_MAINT_FILE
+  #define LORA_OTA_MAINT_FILE "/ota_maint"
+#endif   // the replay counter (primary FS; a format of the secondary never touches it)
 
 class LoraOTAMaintFsTarget : public lora_ota_maint::Target {
 protected:

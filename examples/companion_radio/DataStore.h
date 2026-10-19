@@ -1,5 +1,14 @@
 #pragma once
 
+// DS_DIR namespaces every file the companion owns (DataStore, and MyMesh's
+// overlay / position-report / OTA-settings / maintenance files). Default "" keeps upstream
+// paths. The kobo terminal build sets it to "/kobo" so it can share a board
+// with another firmware's files (Drifter's repeater identity + prefs) without
+// opening, overwriting or migrating any of them.
+#ifndef DS_DIR
+  #define DS_DIR ""
+#endif
+
 #include <helpers/IdentityStore.h>
 #include <helpers/ContactInfo.h>
 #include <helpers/ChannelDetails.h>

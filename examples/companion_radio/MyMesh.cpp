@@ -114,7 +114,7 @@
 #define RESP_CODE_OVERLAY             0xA2
 #define OVERLAY_OP_STATUS             0x01  // -> A2 01 | on | repeat | name(NUL-terminated, 32)
 #define OVERLAY_OP_SET                0x02  // name (bytes to end of frame, "#..."; empty = off)
-#define OVERLAY_FILE                  "/overlay"
+#define OVERLAY_FILE                  DS_DIR "/overlay"
 #define OVERLAY_MAGIC                 0x31594C4FUL   // "OLY1"
 
 #define POSREPORT_OP_STATUS           0x01
@@ -127,7 +127,7 @@
 #ifndef POSREPORT_INTERVAL_MIN
   #define POSREPORT_INTERVAL_MIN      0    // off until titan sets it: a wiped /posrep never restarts reports
 #endif
-#define POSREPORT_FILE                "/posrep"
+#define POSREPORT_FILE                DS_DIR "/posrep"
 #define POSREPORT_MAGIC               0x31505250UL   // "PRP1"
 #define POSREPORT_MAX_MIN             1440
 
@@ -703,8 +703,8 @@ static LoraOTAService ota_service;
 
 // signed settings over LoRa (LoraOTASettings.h): a companion has the radio and tuning keys, client
 // repeat, and our own features where they are compiled in (position reports, overlay)
-#define OTA_SETTINGS_FILE "/ota_settings"
-#define OTA_SETTINGS_OVERLAY "/ota_set_overlay"   // the overlay config while a bundle that turned it off is on probation
+#define OTA_SETTINGS_FILE DS_DIR "/ota_settings"
+#define OTA_SETTINGS_OVERLAY DS_DIR "/ota_set_overlay"   // the overlay config while a bundle that turned it off is on probation
 #ifdef OVERLAY_MESH
 static File overlayOpenWrite(FILESYSTEM* fs, const char* filename);
 static void overlayKeyFor(const char* name, TransportKey& k);
@@ -948,11 +948,11 @@ public:
   bool formatSecondary() override { return _m->_store->formatSecondaryFS(); }
   bool storedCounts(int& contacts, int& channels) override {
     FILESYSTEM* fs = _fs[1] ? _fs[1] : _fs[0];
-    File f = openRead(fs, "/contacts3");
+    File f = openRead(fs, DS_DIR "/contacts3");
     contacts = f ? (int)(f.size() / MAINT_CONTACT_REC) : 0;
     if (f) f.close();
     channels = 0;
-    f = openRead(fs, "/channels2");
+    f = openRead(fs, DS_DIR "/channels2");
     if (f) {
       uint8_t rec[MAINT_CHANNEL_REC];
       while (f.read(rec, sizeof(rec)) == sizeof(rec)) if (rec[4]) channels++;   // a named slot
