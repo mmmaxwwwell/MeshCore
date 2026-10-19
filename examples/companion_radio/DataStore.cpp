@@ -1,6 +1,14 @@
 #include <Arduino.h>
 #include "DataStore.h"
 
+// DS_DIR namespaces every file this store owns. Default "" keeps upstream
+// paths. The kobo terminal build sets it to "/kobo" so it can share a board
+// with another firmware's files (Drifter's repeater identity + prefs) without
+// opening, overwriting or migrating any of them.
+#ifndef DS_DIR
+  #define DS_DIR ""
+#endif
+
 #if defined(EXTRAFS) || defined(QSPIFLASH)
   #define MAX_BLOBRECS 100
 #else
@@ -9,11 +17,11 @@
 
 DataStore::DataStore(FILESYSTEM& fs, mesh::RTCClock& clock) : _fs(&fs), _fsExtra(nullptr), _clock(&clock),
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
-    identity_store(fs, "")
+    identity_store(fs, DS_DIR)
 #elif defined(RP2040_PLATFORM)
-    identity_store(fs, "/identity")
+    identity_store(fs, DS_DIR "/identity")
 #else
-    identity_store(fs, "/identity")
+    identity_store(fs, DS_DIR "/identity")
 #endif
 {
 }
@@ -21,11 +29,11 @@ DataStore::DataStore(FILESYSTEM& fs, mesh::RTCClock& clock) : _fs(&fs), _fsExtra
 #if defined(EXTRAFS) || defined(QSPIFLASH)
 DataStore::DataStore(FILESYSTEM& fs, FILESYSTEM& fsExtra, mesh::RTCClock& clock) : _fs(&fs), _fsExtra(&fsExtra), _clock(&clock),
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
-    identity_store(fs, "")
+    identity_store(fs, DS_DIR)
 #elif defined(RP2040_PLATFORM)
-    identity_store(fs, "/identity")
+    identity_store(fs, DS_DIR "/identity")
 #else
-    identity_store(fs, "/identity")
+    identity_store(fs, DS_DIR "/identity")
 #endif
 {
 }
@@ -47,6 +55,12 @@ static File openWrite(FILESYSTEM* fs, const char* filename) {
 #endif
 
 void DataStore::begin() {
+  if (DS_DIR[0]) {
+    _fs->mkdir(DS_DIR);
+  #if defined(EXTRAFS) || defined(QSPIFLASH)
+    if (_fsExtra) _fsExtra->mkdir(DS_DIR);
+  #endif
+  }
 #if defined(RP2040_PLATFORM)
   identity_store.begin();
 #endif
@@ -59,7 +73,7 @@ void DataStore::begin() {
   #endif
 #else
   // init 'blob store' support
-  _fs->mkdir("/bl");
+  _fs->mkdir(DS_DIR "/bl");
 #endif
 }
 
@@ -190,16 +204,16 @@ bool DataStore::saveMainIdentity(const mesh::LocalIdentity &identity) {
 }
 
 void DataStore::loadPrefs(NodePrefs& prefs) {
-  if (_fs->exists("/prefs.json")) {
-    File file = openRead(_fs, "/prefs.json");
+  if (_fs->exists(DS_DIR "/prefs.json")) {
+    File file = openRead(_fs, DS_DIR "/prefs.json");
     if (file) {
       prefs.loadSerial(file);   // new Serial prefs
       file.close();
     }
-  } else if (_fs->exists("/new_prefs")) {
-    loadPrefsInt("/new_prefs", prefs);
+  } else if (_fs->exists(DS_DIR "/new_prefs")) {
+    loadPrefsInt(DS_DIR "/new_prefs", prefs);
     if (savePrefs(prefs) ) {                // save to new format
-      //_fs->remove("/new_prefs"); // remove old
+      //_fs->remove(DS_DIR "/new_prefs"); // remove old
     }
   }
 }
@@ -247,7 +261,7 @@ void DataStore::loadPrefsInt(const char *filename, NodePrefs& _prefs) {
 }
 
 bool DataStore::savePrefs(NodePrefs& _prefs) {
-  File file = openWrite(_fs, "/prefs.json");
+  File file = openWrite(_fs, DS_DIR "/prefs.json");
   if (file) {
     bool success = _prefs.saveSerial(file);
     file.close();
@@ -257,7 +271,7 @@ bool DataStore::savePrefs(NodePrefs& _prefs) {
 }
 
 void DataStore::loadContacts(DataStoreHost* host) {
-File file = openRead(_getContactsChannelsFS(), "/contacts3");
+File file = openRead(_getContactsChannelsFS(), DS_DIR "/contacts3");
     if (file) {
       bool full = false;
       while (!full) {
@@ -288,7 +302,7 @@ File file = openRead(_getContactsChannelsFS(), "/contacts3");
 }
 
 void DataStore::saveContacts(DataStoreHost* host, bool (*filter)(const ContactInfo& c)) {
-  File file = openWrite(_getContactsChannelsFS(), "/contacts3");
+  File file = openWrite(_getContactsChannelsFS(), DS_DIR "/contacts3");
   if (file) {
     uint32_t idx = 0;
     ContactInfo c;
@@ -321,7 +335,7 @@ void DataStore::saveContacts(DataStoreHost* host, bool (*filter)(const ContactIn
 }
 
 void DataStore::loadChannels(DataStoreHost* host) {
-    File file = openRead(_getContactsChannelsFS(), "/channels2");
+    File file = openRead(_getContactsChannelsFS(), DS_DIR "/channels2");
     if (file) {
       bool full = false;
       uint8_t channel_idx = 0;
@@ -346,7 +360,7 @@ void DataStore::loadChannels(DataStoreHost* host) {
 }
 
 void DataStore::saveChannels(DataStoreHost* host) {
-  File file = openWrite(_getContactsChannelsFS(), "/channels2");
+  File file = openWrite(_getContactsChannelsFS(), DS_DIR "/channels2");
   if (file) {
     uint8_t channel_idx = 0;
     ChannelDetails ch;
@@ -377,8 +391,8 @@ struct BlobRec {
 };
 
 void DataStore::checkAdvBlobFile() {
-  if (!_getContactsChannelsFS()->exists("/adv_blobs")) {
-    File file = openWrite(_getContactsChannelsFS(), "/adv_blobs");
+  if (!_getContactsChannelsFS()->exists(DS_DIR "/adv_blobs")) {
+    File file = openWrite(_getContactsChannelsFS(), DS_DIR "/adv_blobs");
     if (file) {
       BlobRec zeroes;
       memset(&zeroes, 0, sizeof(zeroes));
@@ -392,10 +406,10 @@ void DataStore::checkAdvBlobFile() {
 
 void DataStore::migrateToSecondaryFS() {
   // migrate old adv_blobs, contacts3 and channels2 files to secondary FS if they don't already exist
-  if (!_fsExtra->exists("/adv_blobs")) {
-    if (_fs->exists("/adv_blobs")) {
-    File oldAdvBlobs = openRead(_fs, "/adv_blobs");
-    File newAdvBlobs = openWrite(_fsExtra, "/adv_blobs");
+  if (!_fsExtra->exists(DS_DIR "/adv_blobs")) {
+    if (_fs->exists(DS_DIR "/adv_blobs")) {
+    File oldAdvBlobs = openRead(_fs, DS_DIR "/adv_blobs");
+    File newAdvBlobs = openWrite(_fsExtra, DS_DIR "/adv_blobs");
 
     if (oldAdvBlobs && newAdvBlobs) {
       BlobRec rec;
@@ -410,13 +424,13 @@ void DataStore::migrateToSecondaryFS() {
     }
     if (oldAdvBlobs) oldAdvBlobs.close();
     if (newAdvBlobs) newAdvBlobs.close();
-    _fs->remove("/adv_blobs");
+    _fs->remove(DS_DIR "/adv_blobs");
     }
   }
-  if (!_fsExtra->exists("/contacts3")) {
-    if (_fs->exists("/contacts3")) {
-      File oldFile = openRead(_fs, "/contacts3");
-      File newFile = openWrite(_fsExtra, "/contacts3");
+  if (!_fsExtra->exists(DS_DIR "/contacts3")) {
+    if (_fs->exists(DS_DIR "/contacts3")) {
+      File oldFile = openRead(_fs, DS_DIR "/contacts3");
+      File newFile = openWrite(_fsExtra, DS_DIR "/contacts3");
 
       if (oldFile && newFile) {
         uint8_t buf[64];
@@ -427,13 +441,13 @@ void DataStore::migrateToSecondaryFS() {
       }
       if (oldFile) oldFile.close();
       if (newFile) newFile.close();
-      _fs->remove("/contacts3");
+      _fs->remove(DS_DIR "/contacts3");
     }
   }
-  if (!_fsExtra->exists("/channels2")) {
-    if (_fs->exists("/channels2")) {
-      File oldFile = openRead(_fs, "/channels2");
-      File newFile = openWrite(_fsExtra, "/channels2");
+  if (!_fsExtra->exists(DS_DIR "/channels2")) {
+    if (_fs->exists(DS_DIR "/channels2")) {
+      File oldFile = openRead(_fs, DS_DIR "/channels2");
+      File newFile = openWrite(_fsExtra, DS_DIR "/channels2");
 
       if (oldFile && newFile) {
         uint8_t buf[64];
@@ -444,14 +458,14 @@ void DataStore::migrateToSecondaryFS() {
       }
       if (oldFile) oldFile.close();
       if (newFile) newFile.close();
-      _fs->remove("/channels2");
+      _fs->remove(DS_DIR "/channels2");
     }
   }
   // cleanup nodes which have been testing the extra fs, copy _main.id and new_prefs back to primary
-  if (_fsExtra->exists("/_main.id")) {
-      if (_fs->exists("/_main.id")) {_fs->remove("/_main.id");}
-      File oldFile = openRead(_fsExtra, "/_main.id");
-      File newFile = openWrite(_fs, "/_main.id");
+  if (_fsExtra->exists(DS_DIR "/_main.id")) {
+      if (_fs->exists(DS_DIR "/_main.id")) {_fs->remove(DS_DIR "/_main.id");}
+      File oldFile = openRead(_fsExtra, DS_DIR "/_main.id");
+      File newFile = openWrite(_fs, DS_DIR "/_main.id");
 
       if (oldFile && newFile) {
         uint8_t buf[64];
@@ -462,12 +476,12 @@ void DataStore::migrateToSecondaryFS() {
       }
       if (oldFile) oldFile.close();
       if (newFile) newFile.close();
-      _fsExtra->remove("/_main.id");
+      _fsExtra->remove(DS_DIR "/_main.id");
   }
-  if (_fsExtra->exists("/new_prefs")) {
-    if (_fs->exists("/new_prefs")) {_fs->remove("/new_prefs");}
-      File oldFile = openRead(_fsExtra, "/new_prefs");
-      File newFile = openWrite(_fs, "/new_prefs");
+  if (_fsExtra->exists(DS_DIR "/new_prefs")) {
+    if (_fs->exists(DS_DIR "/new_prefs")) {_fs->remove(DS_DIR "/new_prefs");}
+      File oldFile = openRead(_fsExtra, DS_DIR "/new_prefs");
+      File newFile = openWrite(_fs, DS_DIR "/new_prefs");
 
       if (oldFile && newFile) {
         uint8_t buf[64];
@@ -478,28 +492,28 @@ void DataStore::migrateToSecondaryFS() {
       }
       if (oldFile) oldFile.close();
       if (newFile) newFile.close();
-      _fsExtra->remove("/new_prefs");
+      _fsExtra->remove(DS_DIR "/new_prefs");
   }
   // remove files from where they should not be anymore
-  if (_fs->exists("/adv_blobs")) {
-    _fs->remove("/adv_blobs");
+  if (_fs->exists(DS_DIR "/adv_blobs")) {
+    _fs->remove(DS_DIR "/adv_blobs");
   }
-  if (_fs->exists("/contacts3")) {
-    _fs->remove("/contacts3");
+  if (_fs->exists(DS_DIR "/contacts3")) {
+    _fs->remove(DS_DIR "/contacts3");
   }
-  if (_fs->exists("/channels2")) {
-    _fs->remove("/channels2");
+  if (_fs->exists(DS_DIR "/channels2")) {
+    _fs->remove(DS_DIR "/channels2");
   }
-  if (_fsExtra->exists("/_main.id")) {
-    _fsExtra->remove("/_main.id");
+  if (_fsExtra->exists(DS_DIR "/_main.id")) {
+    _fsExtra->remove(DS_DIR "/_main.id");
   }
-  if (_fsExtra->exists("/new_prefs")) {
-    _fsExtra->remove("/new_prefs");
+  if (_fsExtra->exists(DS_DIR "/new_prefs")) {
+    _fsExtra->remove(DS_DIR "/new_prefs");
   }
 }
 
 uint8_t DataStore::getBlobByKey(const uint8_t key[], int key_len, uint8_t dest_buf[]) {
-  File file = openRead(_getContactsChannelsFS(), "/adv_blobs");
+  File file = openRead(_getContactsChannelsFS(), DS_DIR "/adv_blobs");
   uint8_t len = 0;  // 0 = not found
   if (file) {
     BlobRec tmp;
@@ -518,7 +532,7 @@ uint8_t DataStore::getBlobByKey(const uint8_t key[], int key_len, uint8_t dest_b
 bool DataStore::putBlobByKey(const uint8_t key[], int key_len, const uint8_t src_buf[], uint8_t len) {
   if (len < PUB_KEY_SIZE+4+SIGNATURE_SIZE || len > MAX_ADVERT_PKT_LEN) return false;
   checkAdvBlobFile();
-  File file = _getContactsChannelsFS()->open("/adv_blobs", FILE_O_WRITE);
+  File file = _getContactsChannelsFS()->open(DS_DIR "/adv_blobs", FILE_O_WRITE);
   if (file) {
     uint32_t pos = 0, found_pos = 0;
     uint32_t min_timestamp = 0xFFFFFFFF;
@@ -560,7 +574,7 @@ inline void makeBlobPath(const uint8_t key[], int key_len, char* path, size_t pa
   char fname[18];
   if (key_len > 8) key_len = 8; // just use first 8 bytes (prefix)
   mesh::Utils::toHex(fname, key, key_len);
-  sprintf(path, "/bl/%s", fname);
+  sprintf(path, DS_DIR "/bl/%s", fname);
 }
 
 uint8_t DataStore::getBlobByKey(const uint8_t key[], int key_len, uint8_t dest_buf[]) {
