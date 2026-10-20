@@ -159,6 +159,9 @@
 #define PUSH_CODE_CONTROL_DATA          0x8E   // v8+
 #define PUSH_CODE_CONTACT_DELETED       0x8F // used to notify client app of deleted contact when overwriting oldest
 #define PUSH_CODE_CONTACTS_FULL         0x90 // used to notify client app that contacts storage is full
+// kobo-mesh (private range, far from upstream's): the radio's own GPS fix,
+// 1 Hz, to the local client only (USB/serial). Never sent over the air.
+#define PUSH_CODE_KOBO_POSITION         0xC0
 
 #define ERR_CODE_UNSUPPORTED_CMD        1
 #define ERR_CODE_NOT_FOUND              2
@@ -3006,6 +3009,30 @@ void MyMesh::checkSerialInterface() {
   }
 }
 
+#ifdef KOBO_POSITION_PUSH
+// C0 | flags(u8: bit0 fix valid, bit1 gps enabled) | lat_e6 i32 | lon_e6 i32 |
+//      alt_m i32 | sats u8 | fix_unix u32          (19 bytes, little-endian)
+// The Kobo derives speed and course from successive fixes.
+void MyMesh::kobo_position_tick() {
+  static unsigned long next = 0;
+  if (!millisHasNowPassed(next)) return;
+  next = millis() + 1000;
+  LocationProvider* loc = sensors.getLocationProvider();
+  if (!loc || !_serial->isConnected()) return;
+  uint8_t f[19];
+  int32_t lat = loc->getLatitude(), lon = loc->getLongitude(), alt = loc->getAltitude();
+  uint32_t ts = (uint32_t)loc->getTimestamp();
+  f[0] = PUSH_CODE_KOBO_POSITION;
+  f[1] = (loc->isValid() ? 1 : 0) | (loc->isEnabled() ? 2 : 0);
+  memcpy(&f[2], &lat, 4);
+  memcpy(&f[6], &lon, 4);
+  memcpy(&f[10], &alt, 4);
+  f[14] = (uint8_t)min(loc->satellitesCount(), 255L);
+  memcpy(&f[15], &ts, 4);
+  _serial->writeFrame(f, sizeof f);
+}
+#endif
+
 void MyMesh::loop() {
   BaseChatMesh::loop();
 #ifdef LORA_OTA_ENABLED
@@ -3025,6 +3052,10 @@ void MyMesh::loop() {
 
 #ifdef POSITION_REPORT
   posReportTick();
+#endif
+
+#ifdef KOBO_POSITION_PUSH
+  kobo_position_tick();
 #endif
 
   // is there are pending dirty contacts write needed?

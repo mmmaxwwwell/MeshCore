@@ -267,6 +267,9 @@ private:
   void overlaySave();
   bool isOverlayFlood(const mesh::Packet* pkt) const;
 #endif
+#ifdef KOBO_POSITION_PUSH
+  void kobo_position_tick();   // 1 Hz own fix to the local client (PUSH 0xC0)
+#endif
 #ifdef POSITION_REPORT
   // Position reports to one contact (titan's Rhea): while the GPS is on, every
   // interval_min a DM "#loc1 lat lon alt_m sats batt_mv fix_unix" (or "#loc1
