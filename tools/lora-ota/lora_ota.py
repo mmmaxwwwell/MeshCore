@@ -556,6 +556,8 @@ class MaintSender:
             nxt = struct.unpack("<H", r[1:3])[0]
             i = 3
             while i + 6 <= len(r):
+                if not any(r[i:]):   # AES block padding of the reply, not an entry
+                    break
                 kind, size, nl = r[i], struct.unpack("<I", r[i + 1:i + 5])[0], r[i + 5]
                 out.append({"name": r[i + 6:i + 6 + nl].decode(errors="replace"), "size": size, "dir": bool(kind & 1)})
                 i += 6 + nl
@@ -574,6 +576,8 @@ class MaintSender:
             total, nxt = struct.unpack("<HH", r[1:5])
             i = 5
             while i + 12 <= len(r):
+                if not any(r[i:]):   # AES block padding of the reply, not an entry
+                    break
                 c = {"prefix": r[i:i + 6].hex(), "type": r[i + 6], "flags": r[i + 7],
                      "last_advert": struct.unpack("<I", r[i + 8:i + 12])[0]}
                 i += 12
@@ -595,6 +599,8 @@ class MaintSender:
                 raise OtaError(f"CHANNELS: {mnt_status(r[0])}")
             nxt, i = r[1], 2
             while i + 3 <= len(r):
+                if not any(r[i:]):   # AES block padding of the reply, not an entry
+                    break
                 idx, kind, nl = r[i], r[i + 1], r[i + 2]
                 out.append({"index": idx, "name": r[i + 3:i + 3 + nl].decode(errors="replace"), "name_keyed": bool(kind & 1)})
                 i += 3 + nl

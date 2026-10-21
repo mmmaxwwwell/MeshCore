@@ -166,6 +166,21 @@ def run_maint_tests(check, tmp, crypto):
           not n.leaks(), str(n.leaks()))
     n.close()
 
+    # a real reply is decrypted in 16-byte AES blocks: zero padding at the end is not an entry
+    class Padded:
+        def __init__(self, replies): self.replies = list(replies)
+        async def ask(self, payload, what, tries=None): return self.replies.pop(0)
+    def pad(b): return b + bytes(-len(b) % 16 + 16)
+    con = bytes([L.OK]) + struct.pack("<HH", 1, 0xFFFF) + bytes.fromhex("5cca79022ef9") + bytes([1, 1]) + struct.pack("<I", 7) + bytes([6]) + b"Ranger"
+    chn = bytes([L.OK, 0xFF, 0, 0, 6]) + b"Public"
+    fil = bytes([L.OK]) + struct.pack("<H", 0xFFFF) + bytes([0]) + struct.pack("<I", 9) + bytes([4]) + b"prefs"[:4]
+    pc, _ = asyncio.run(L.MaintSender.contacts(Padded([pad(con)])))
+    pch = asyncio.run(L.MaintSender.channels(Padded([pad(chn)])))
+    pf = asyncio.run(L.MaintSender.files(Padded([pad(fil)])))
+    check("maint: zero padding after the last entry is not read as contacts / channels / files",
+          [c["name"] for c in pc] == ["Ranger"] and [c["name"] for c in pch] == ["Public"] and [f["name"] for f in pf] == ["pref"],
+          f"{pc} {pch} {pf}")
+
     # paging at 350 contacts
     n = Node(sim, pub, contacts=350)
     replies0 = len(n.replies)
