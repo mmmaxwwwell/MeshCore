@@ -702,7 +702,8 @@ public:
 static LoraOTAService ota_service;
 
 // signed settings over LoRa (LoraOTASettings.h): a companion has the radio and tuning keys, client
-// repeat, and our own features where they are compiled in (position reports, overlay)
+// repeat, our own features where they are compiled in (position reports, overlay), and its own prefs
+// as the app sets them (name, advert location policy, telemetry and auto-add policy, GPS, location, BLE PIN)
 #define OTA_SETTINGS_FILE "/ota_settings"
 #define OTA_SETTINGS_OVERLAY "/ota_set_overlay"   // the overlay config while a bundle that turned it off is on probation
 #ifdef OVERLAY_MESH
@@ -726,7 +727,15 @@ public:
 #ifdef OVERLAY_MESH
            | (1u << K_OVERLAY)
 #endif
-           ;
+           | (LORA_OTA_SET_COMPANION_KEYS & ~(hasGps() ? 0 : (1u << K_GPS)));
+  }
+  // as CMD_SET_CUSTOM_VAR: only a node whose sensors offer the "gps" setting (a GPS was detected)
+  static bool hasGps() {
+#if ENV_INCLUDE_GPS == 1
+    return sensors.getSettingByKey("gps") != NULL;
+#else
+    return false;
+#endif
   }
   void read(lora_ota_settings::Values& v) override {
     memset(&v, 0, sizeof(v));
@@ -749,6 +758,15 @@ public:
 #ifdef OVERLAY_MESH
     v.overlay = _m->_overlay.name[0] ? 1 : 0;
 #endif
+    StrHelper::strncpy(v.name, p.node_name, sizeof(v.name));
+    v.adv_loc = p.advert_loc_policy;
+    v.telem_base = p.telemetry_mode_base; v.telem_loc = p.telemetry_mode_loc; v.telem_env = p.telemetry_mode_env;
+    v.manual_add = p.manual_add_contacts;
+    v.autoadd = p.autoadd_config;
+    v.gps = p.gps_enabled;
+    v.lat_micro = (int32_t)lround(sensors.node_lat * 1e6);   // the live position (savePrefs copies it to the prefs)
+    v.lon_micro = (int32_t)lround(sensors.node_lon * 1e6);
+    v.ble_pin = p.ble_pin;
   }
   bool acceptable(const lora_ota_settings::Values& v, uint32_t m) override {
     using namespace lora_ota_settings;
@@ -772,6 +790,25 @@ public:
     if (m & (1u << K_AGC_RESET_INTERVAL)) p.agc_reset_interval = v.agc_reset_secs / 4;
     if (m & (1u << K_RXGAIN)) p.rx_boosted_gain = v.rxgain;
     if (m & (1u << K_REPEAT)) p.setRepeatEn(v.repeat != 0);
+    if (m & (1u << K_NAME)) StrHelper::strncpy(p.node_name, v.name, sizeof(p.node_name));   // adverts now; BLE name at next boot
+    if (m & (1u << K_ADV_LOC)) p.advert_loc_policy = v.adv_loc;                        // as CMD_SET_OTHER_PARAMS
+    if (m & (1u << K_TELEM_BASE)) p.telemetry_mode_base = v.telem_base;
+    if (m & (1u << K_TELEM_LOC)) p.telemetry_mode_loc = v.telem_loc;
+    if (m & (1u << K_TELEM_ENV)) p.telemetry_mode_env = v.telem_env;
+    if (m & (1u << K_MANUAL_ADD)) p.manual_add_contacts = v.manual_add;
+    if (m & (1u << K_AUTOADD)) p.autoadd_config = v.autoadd;                           // as CMD_SET_AUTOADD_CONFIG
+    if (m & (1u << K_LOCATION)) {                                                      // as CMD_SET_ADVERT_LATLON
+      sensors.node_lat = v.lat_micro / 1000000.0;
+      sensors.node_lon = v.lon_micro / 1000000.0;
+    }
+    if (m & (1u << K_BLE_PIN)) p.ble_pin = v.ble_pin;                                  // as CMD_SET_DEVICE_PIN: live at next boot
+    bool ok = true;
+#if ENV_INCLUDE_GPS == 1
+    if (m & (1u << K_GPS)) {   // as CMD_SET_CUSTOM_VAR "gps": power the GPS on/off, then keep it in the prefs
+      ok = sensors.setSettingValue("gps", v.gps ? "1" : "0");
+      if (ok) p.gps_enabled = v.gps ? 1 : 0;
+    }
+#endif
     _m->savePrefs();
 #ifdef POSITION_REPORT
     if (m & (1u << K_POSREPORT_INTERVAL)) {   // as "#locset <min>"
@@ -780,7 +817,7 @@ public:
       _m->_posrep_next = millis() + 5000UL;    // report soon under the new interval
     }
 #endif
-    return true;
+    return ok;
   }
 #ifdef OVERLAY_MESH
   bool overlaySnapshot() override {   // the node's own overlay config, to a file of its own
@@ -943,6 +980,15 @@ public:
   bool channelsSave() override {
     _m->saveChannels();
     return true;
+  }
+  bool channelSet(int i, const char* name, const uint8_t secret16[16]) override {   // as CMD_SET_CHANNEL
+    ChannelDetails ch;
+    memset(&ch, 0, sizeof(ch));
+    StrHelper::strncpy(ch.name, name, 32);
+    memcpy(ch.channel.secret, secret16, 16);   // NOTE: only 128-bit supported, as the app's command
+    bool ok = _m->setChannel(i, ch);
+    memset(&ch, 0, sizeof(ch));
+    return ok;
   }
 #endif
   bool formatSecondary() override { return _m->_store->formatSecondaryFS(); }

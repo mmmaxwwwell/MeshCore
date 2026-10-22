@@ -155,6 +155,18 @@ static uint8_t checkArgs(uint8_t op, const uint8_t* a, size_t n) {
       if (n < 3 || a[0] > 1 || n - 1 >= LORA_OTA_MNT_PATH || a[1] != '/') return BAD_FORMAT;
       for (size_t i = 1; i < n; i++) if (a[i] == 0) return BAD_FORMAT;
       return lora_ota::OK;
+    case LORA_OTA_MNT_OP_SET_CHANNEL: {   // index u8, nlen u8, name (1-31 bytes), then no secret or 16 bytes
+      if (n < 3) return BAD_FORMAT;
+      uint8_t nl = a[1];
+      if (nl < 1 || nl > 31 || (n != 2 + (size_t)nl && n != 2 + (size_t)nl + 16)) return BAD_FORMAT;
+      for (size_t i = 2; i < 2 + (size_t)nl; i++) if (a[i] < ' ' || a[i] == 0x7F) return BAD_FORMAT;
+      if (n == 2 + (size_t)nl) return a[2] == '#' && nl >= 2 ? (uint8_t)lora_ota::OK : (uint8_t)BAD_FORMAT;   // hashtag
+      uint8_t any = 0;
+      for (size_t i = 2 + nl; i < n; i++) any |= a[i];
+      return any ? (uint8_t)lora_ota::OK : (uint8_t)BAD_FORMAT;   // an all-zero secret is an empty slot, not a channel
+    }
+    case LORA_OTA_MNT_OP_DELETE_CHANNEL:
+      return n == 1 ? (uint8_t)lora_ota::OK : (uint8_t)BAD_FORMAT;
   }
   return NOT_SUPPORTED;
 }
@@ -210,6 +222,10 @@ uint8_t Maint::verifyAndStart(uint8_t busy) {
   }
   if ((op == LORA_OTA_MNT_OP_FORMAT_EXTRAFS || op == LORA_OTA_MNT_OP_REBOOT) && busy) return BUSY;
   if (op == LORA_OTA_MNT_OP_DELETE_FILE && !_t->hasFs(a[0])) return NOT_SUPPORTED;
+  if (op == LORA_OTA_MNT_OP_SET_CHANNEL || op == LORA_OTA_MNT_OP_DELETE_CHANNEL) {
+    if (_t->channelCount() < 0) return NOT_SUPPORTED;
+    if (a[0] >= _t->channelCount()) return lora_ota::BAD_ARG;   // the companion's slots: 0..MAX_GROUP_CHANNELS-1
+  }
   if (_reboot_due) return BUSY;
 
   // 4. spend the counter BEFORE acting: a command never runs twice, even across a power cut
@@ -227,6 +243,8 @@ uint8_t Maint::verifyAndStart(uint8_t busy) {
     case LORA_OTA_MNT_OP_FAVOURITE: return execFavourite(a, n);
     case LORA_OTA_MNT_OP_ADD_CONTACT: return execAdd(a, n);
     case LORA_OTA_MNT_OP_DELETE_FILE: return execDeleteFile(a, n);
+    case LORA_OTA_MNT_OP_SET_CHANNEL: return execSetChannel(a, n);
+    case LORA_OTA_MNT_OP_DELETE_CHANNEL: return execDeleteChannel(a, n);
     case LORA_OTA_MNT_OP_REBOOT:
       _reboot_due = true;
       _reboot_at = 0;   // timed from the next loop(), after the reply has gone out
@@ -314,6 +332,51 @@ uint8_t Maint::execDeleteFile(const uint8_t* a, size_t n) {
   if (!_t->exists(a[0], path, dir)) return NOT_FOUND;
   if (dir) return PROTECTED;   // files only
   return _t->removeFile(a[0], path) ? (uint8_t)lora_ota::OK : (uint8_t)STORE_ERROR;
+}
+
+// static: poll() runs on the 4 KB nRF52 loop stack. Wiped after every use: a channel's secret
+// (or a hashtag channel's name, which is its key) stays in RAM only in the channel table itself
+static char s_chname[33];
+static uint8_t s_chsecret[32];
+
+// as the app's CMD_SET_CHANNEL (128-bit secret). No secret: a hashtag channel, secret =
+// SHA-256(name)[0:16], the derivation the read side recognises (nameKeyed)
+// -> was u8 (0 the slot was empty, 1 a channel was replaced), kind u8 (1 = name-keyed)
+uint8_t Maint::execSetChannel(const uint8_t* a, size_t n) {
+  uint8_t idx = a[0], nl = a[1];
+  memset(s_chname, 0, sizeof(s_chname));
+  bool was = _t->channelAt(idx, s_chname, s_chsecret) && s_chname[0];
+  memset(s_chname, 0, sizeof(s_chname));
+  memset(s_chsecret, 0, sizeof(s_chsecret));
+  memcpy(s_chname, &a[2], nl);
+  bool hashtag = n == 2 + (size_t)nl;
+  if (hashtag) {
+    SHA256 sha;
+    sha.update(s_chname, nl);
+    sha.finalize(s_chsecret, 32);
+    memset(&s_chsecret[16], 0, 16);
+  } else {
+    memcpy(s_chsecret, &a[2 + nl], 16);
+  }
+  bool ok = _t->channelSet(idx, s_chname, s_chsecret) && _t->channelsSave();
+  memset(s_chname, 0, sizeof(s_chname));
+  memset(s_chsecret, 0, sizeof(s_chsecret));
+  if (!ok) return STORE_ERROR;
+  _res[0] = was ? 1 : 0;
+  _res[1] = hashtag ? 1 : 0;
+  _res_len = 2;
+  return lora_ota::OK;
+}
+
+// as the app deletes one: an empty name and a zero secret in that slot
+uint8_t Maint::execDeleteChannel(const uint8_t* a, size_t n) {
+  (void)n;
+  memset(s_chname, 0, sizeof(s_chname));
+  bool was = _t->channelAt(a[0], s_chname, s_chsecret) && s_chname[0];
+  memset(s_chname, 0, sizeof(s_chname));
+  memset(s_chsecret, 0, sizeof(s_chsecret));
+  if (!was) return NOT_FOUND;
+  return _t->channelSet(a[0], "", s_chsecret) && _t->channelsSave() ? (uint8_t)lora_ota::OK : (uint8_t)STORE_ERROR;
 }
 
 // one slice of a long command (PRUNE, FORMAT_EXTRAFS)

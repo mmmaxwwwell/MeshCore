@@ -104,11 +104,19 @@ STATUS_NAMES.update({16: "version not newer than the last applied bundle", 17: "
 SETTINGS_KEYS = ["radio", "tx", "af", "rxdelay", "txdelay", "direct.txdelay", "multi.acks", "path.hash.mode",
                  "int.thresh", "agc.reset.interval", "radio.rxgain", "flood.max", "flood.max.unscoped",
                  "flood.max.advert", "advert.interval", "flood.advert.interval", "loop.detect", "repeat", "regions",
-                 "posreport.interval", "overlay"]
+                 "posreport.interval", "overlay",
+                 "name", "adv.loc", "telemetry.base", "telemetry.loc", "telemetry.env", "manual.add", "autoadd", "gps",
+                 "location", "ble.pin"]
 REPEATER_ONLY_KEYS = {"flood.max", "flood.max.unscoped", "flood.max.advert", "advert.interval",
                       "flood.advert.interval", "loop.detect", "regions"}
 # our companion features: whitelisted only by firmware built with them (else "not on the whitelist")
 COMPANION_FEATURE_KEYS = {"posreport.interval": "POSITION_REPORT", "overlay": "OVERLAY_MESH"}
+# the companion's stock prefs: every build's whitelist, a repeater has no such setting
+COMPANION_KEYS = {"name", "adv.loc", "telemetry.base", "telemetry.loc", "telemetry.env", "manual.add", "autoadd", "gps",
+                  "location", "ble.pin"}
+TELEM_MODES = {"deny": 0, "flags": 1, "all": 2}          # TELEM_MODE_DENY / _ALLOW_FLAGS / _ALLOW_ALL
+ADV_LOC = {"none": 0, "share": 1}                         # ADVERT_LOC_NONE / _SHARE
+AUTOADD_BITS = {"overwrite": 0x01, "chat": 0x02, "repeater": 0x04, "room": 0x08, "sensor": 0x10}   # AUTO_ADD_*
 # repeater CLI to read a key's current value
 CLI_GET = {k: f"get {k}" for k in SETTINGS_KEYS}
 CLI_GET["regions"] = "region list allowed"
@@ -152,12 +160,95 @@ def valid_overlay(v):
             all(33 <= ord(c) <= 126 for c in p[1]) and p[2] in ("0", "1"))
 
 
+def valid_name(v):
+    """the node's rule (validName): 1..31 bytes, no control characters, none of []\\:,?* , no space at either end"""
+    b = v.encode()
+    return (1 <= len(b) <= 31 and v == v.strip(" ") and all(c >= 0x20 and c != 0x7F for c in b) and
+            not any(c in v for c in "[]\\:,?*"))
+
+
+def parse_location(v):
+    """'lat,lon' -> (lat, lon) in 1e-6 degrees, as the node parses it (6 decimals at most, never rounded); None if bad"""
+    p = v.split(",")
+    if len(p) != 2:
+        return None
+    out = []
+    for x, lim in zip(p, (90, 180)):
+        neg = x.startswith("-")
+        d = x[1:] if neg else x
+        whole, _, frac = d.partition(".")
+        if not (whole + frac).isdigit() or not (whole or frac) or len(frac) > 6 or d.count(".") > 1 or not d.isascii():
+            return None
+        m = int(whole or "0") * 1000000 + int((frac + "000000")[:6])
+        if m > lim * 1000000:
+            return None
+        out.append(-m if neg else m)
+    return tuple(out)
+
+
+def canonical(k, v):
+    """a --set value in the form the node takes (names for the numeric policies, hex for autoadd, ...)"""
+    v = v.strip() if k != "name" else v
+    low = v.lower()
+    if k.startswith("telemetry.") and low in TELEM_MODES:
+        return str(TELEM_MODES[low])
+    if k == "adv.loc" and low in ADV_LOC:
+        return str(ADV_LOC[low])
+    if k in ("manual.add",) and low in ("on", "off"):
+        return "1" if low == "on" else "0"
+    if k == "gps" and low in ("1", "0"):
+        return "on" if low == "1" else "off"
+    if k == "autoadd":
+        if low.startswith("0x"):
+            try:
+                return str(int(low, 16))
+            except ValueError:
+                return v
+        if low and not low.isdigit():
+            if low == "none":
+                return "0"
+            bits = 0
+            for w in low.split(","):
+                w = w.strip().rstrip("s")
+                if w not in AUTOADD_BITS:
+                    raise OtaError(f"autoadd: {w!r} is not one of {', '.join(AUTOADD_BITS)} (or a number)")
+                bits |= AUTOADD_BITS[w]
+            return str(bits)
+    return v
+
+
+def check_value(k, v):
+    """the sender's range check of a stock companion pref (the node checks again)"""
+    def num(lo, hi):
+        return v.isdigit() and lo <= int(v) <= hi
+    ok = {"name": lambda: valid_name(v),
+          "adv.loc": lambda: num(0, 1),
+          "telemetry.base": lambda: num(0, 2), "telemetry.loc": lambda: num(0, 2), "telemetry.env": lambda: num(0, 2),
+          "manual.add": lambda: num(0, 1),
+          "autoadd": lambda: num(0, 0x1F),
+          "gps": lambda: v in ("on", "off"),
+          "location": lambda: parse_location(v) is not None,
+          "ble.pin": lambda: v.isdigit() and (int(v) == 0 or 100000 <= int(v) <= 999999)}.get(k)
+    if ok and not ok():
+        raise OtaError({"name": "name: 1..31 bytes, no control characters, none of []\\:,?* , no space at either end",
+                        "adv.loc": "adv.loc: 0 (none) or 1 (share)",
+                        "manual.add": "manual.add: 0 or 1",
+                        "autoadd": "autoadd: bitmask 0..31 (1 overwrite oldest, 2 chat, 4 repeater, 8 room, 16 sensor)",
+                        "gps": "gps: on or off",
+                        "location": "location: lat,lon in degrees (-90..90, -180..180), 6 decimals at most",
+                        "ble.pin": "ble.pin: 0 (the build's default) or 6 digits 100000..999999"}.get(
+                           k, f"{k}: 0 (deny), 1 (per contact flags) or 2 (all)"))
+
+
 def shown(k, v):
-    """a value as printed: the overlay name is the overlay's secret, so only its first characters show"""
+    """a value as printed: the overlay name is the overlay's secret, so only its first characters show;
+    a BLE PIN shows its first two digits"""
     if k == "overlay":
         p = str(v).split(" ")
         if len(p) == 3 and p[0] == "on":
             return f"on {p[1][:4]}… {p[2]}"
+    if k == "ble.pin" and str(v).isdigit() and str(v) != "0":
+        return str(v)[:2] + "****"
     return v
 
 
@@ -172,6 +263,7 @@ def check_entries(entries):
         if k == "overlay" and not valid_overlay(v):
             raise OtaError("overlay: 'off' or 'on #<name> <0|1>' (as #ovlset; name: '#' + up to 30 printable "
                            "characters, no spaces; the last field is client repeat)")
+        check_value(k, v)
         if k in seen:
             raise OtaError(f"{k} given twice")
         seen.add(k)
@@ -217,9 +309,13 @@ def bundle_reboots(b: dict) -> bool:
 
 def norm_value(key, v):
     """a value as the node would hold it, for comparing what we want with what the node reports"""
+    if key == "name":   # exact: case and inner spaces matter
+        return str(v)
     v = str(v).strip()
     if v.startswith("> "):
         v = v[2:].strip()
+    if key == "location":
+        return parse_location(v) or ("?", v)
     if key == "regions":
         return frozenset(x.strip() for x in v.split(",") if x.strip())
     out = []
@@ -238,6 +334,9 @@ def diff_entries(current: dict, wanted):
     for k, v in wanted:
         cur = current.get(k)
         if k == "overlay" and v != "off":   # the node never reports the name: "on" may be another group
+            changed.append((k, v))
+            continue
+        if (k == "ble.pin" and cur == "set") or (k == "location" and cur == "hidden"):   # never read back
             changed.append((k, v))
             continue
         if cur is None or str(cur).startswith("?") or norm_value(k, cur) != norm_value(k, v):
@@ -396,8 +495,9 @@ MNT_RD_STATUS, MNT_RD_FILES, MNT_RD_CONTACTS, MNT_RD_CHANNELS = 0, 1, 2, 3
 MNT_CF_NONFAV, MNT_CF_NONAMES = 0x01, 0x02
 MNT_OP_DELETE_CONTACTS, MNT_OP_PRUNE, MNT_OP_FAVOURITE, MNT_OP_ADD_CONTACT = 0x10, 0x11, 0x12, 0x13
 MNT_OP_FORMAT_EXTRAFS, MNT_OP_DELETE_FILE, MNT_OP_REBOOT = 0x14, 0x15, 0x16
+MNT_OP_SET_CHANNEL, MNT_OP_DELETE_CHANNEL = 0x17, 0x18
 MNT_OP_NAMES = {0x10: "delete-contact", 0x11: "prune", 0x12: "favourite", 0x13: "add-contact",
-                0x14: "format-extrafs", 0x15: "delete-file", 0x16: "reboot"}
+                0x14: "format-extrafs", 0x15: "delete-file", 0x16: "reboot", 0x17: "add-channel", 0x18: "delete-channel"}
 MNT_DEL_FORCE = 0x01
 MNT_DOMAIN = b"MCMNT1"   # firmware "MCOTA1", settings "MCSET1": a signature for one never verifies as another
 MNT_MAX_CMD = 256
@@ -484,9 +584,32 @@ def maint_args(op, **kw) -> bytes:
         if not p.startswith(b"/") or len(p) >= 64:
             raise OtaError("path: starts with /, under 64 bytes")
         return bytes([kw.get("fs", 0)]) + p
+    if op == MNT_OP_SET_CHANNEL:   # index u8, nlen u8, name, [secret 16]
+        idx, name, secret = kw["index"], kw["name"].encode(), kw.get("secret")
+        if not 0 <= idx <= 255:
+            raise OtaError("channel index: 0..255 (the node takes 0..its slot count - 1)")
+        if not 1 <= len(name) <= 31 or any(c < 0x20 or c == 0x7F for c in name):
+            raise OtaError("channel name: 1..31 bytes, no control characters")
+        if secret is None:
+            if not name.startswith(b"#") or len(name) < 2:
+                raise OtaError("no secret: only a hashtag channel (name starting with '#'), whose secret is "
+                               "SHA-256(name)[0:16]")
+            return bytes([idx, len(name)]) + name
+        if len(secret) != 16 or not any(secret):
+            raise OtaError("channel secret: 16 bytes (32 hex digits), not all zero")
+        return bytes([idx, len(name)]) + name + secret
+    if op == MNT_OP_DELETE_CHANNEL:
+        if not 0 <= kw["index"] <= 255:
+            raise OtaError("channel index: 0..255")
+        return bytes([kw["index"]])
     if op in (MNT_OP_FORMAT_EXTRAFS, MNT_OP_REBOOT):
         return b""
     raise OtaError(f"unknown op {op}")
+
+
+def cut(s, n=4):
+    """the first characters of a secret (a channel secret, a hashtag channel's name): never the whole"""
+    return s[:n] + "…" if len(s) > n else "…"
 
 
 def make_command(op, args: bytes, target, counter: int, key) -> bytes:
@@ -1428,7 +1551,8 @@ def parse_sets(sets):
         if "=" not in kv:
             raise OtaError(f"--set {kv!r}: want KEY=VALUE")
         k, v = kv.split("=", 1)
-        entries.append((k.strip(), v.strip()))
+        k = k.strip()
+        entries.append((k, canonical(k, v if k == "name" else v.strip())))
     return entries
 
 
@@ -1571,7 +1695,7 @@ async def cmd_settings_ctrl(a):
     try:
         if a.settings_cmd == "show":
             # repeater: its CLI (any firmware); companion: GET over LoRa (signed-settings firmware only)
-            keys = [k for k in SETTINGS_KEYS if k not in COMPANION_FEATURE_KEYS] if adm else []
+            keys = [k for k in SETTINGS_KEYS if k not in COMPANION_FEATURE_KEYS and k not in COMPANION_KEYS] if adm else []
             for k, v in (await read_current(mc, ct, link, adm, keys)).items():
                 print(f"{k} = {v}")
             return
@@ -1606,6 +1730,8 @@ def mnt_result(op, status, res):
     elif op == MNT_OP_FORMAT_EXTRAFS and len(res) >= 6:
         cb, cs = struct.unpack("<HH", res[:4])
         out.update(contacts_before=cb, contacts_stored=cs, channels_before=res[4], channels_stored=res[5])
+    elif op == MNT_OP_SET_CHANNEL and len(res) >= 2:
+        out.update(replaced=bool(res[0]), hashtag=bool(res[1]))
     return out
 
 
@@ -1747,16 +1873,34 @@ async def maint_do(a, ms, name, node_key):
         opc, args = MNT_OP_DELETE_FILE, maint_args(MNT_OP_DELETE_FILE, path=p, fs=fs)
     elif op == "reboot":
         opc, args = MNT_OP_REBOOT, b""
+    elif op == "add-channel":
+        secret = None
+        if a.secret is not None:
+            try:
+                secret = bytes.fromhex(a.secret)
+            except ValueError:
+                raise OtaError("channel secret: 32 hex digits")
+        opc, args = MNT_OP_SET_CHANNEL, maint_args(MNT_OP_SET_CHANNEL, index=a.index, name=a.name, secret=secret)
+        # what we say about it: a hashtag channel's name is its key, a secret is a secret
+        shown_ch = {"index": a.index, "name": cut(a.name) if secret is None else a.name,
+                    "secret": "SHA-256(name)" if secret is None else cut(secret.hex())}
+    elif op == "delete-channel":
+        opc, args = MNT_OP_DELETE_CHANNEL, maint_args(MNT_OP_DELETE_CHANNEL, index=a.index)
+        shown_ch = {"index": a.index}
     else:
         raise OtaError(f"unknown maint op {op}")
     blob = make_command(opc, args, target, counter, load_key(a.key))
     status, cnt, rop, res = await ms.run(blob)
     out = mnt_result(opc, status, res)
     out["counter"] = counter
+    if opc in (MNT_OP_SET_CHANNEL, MNT_OP_DELETE_CHANNEL):
+        out["channel"] = shown_ch
     if opc == MNT_OP_FORMAT_EXTRAFS and status == OK:
         out["after"] = await ms.status()
     def pr():
-        extra = ", ".join(f"{k} {v}" for k, v in out.items() if k not in ("op", "status", "counter", "after"))
+        extra = ", ".join(f"{k} {v}" for k, v in out.items() if k not in ("op", "status", "counter", "after", "channel"))
+        if "channel" in out:
+            extra = ", ".join(f"{k} {v}" for k, v in out["channel"].items()) + (f"; {extra}" if extra else "")
         print(f"{name}: {out['op']}: {out['status']}" + (f" ({extra})" if extra else ""))
         if opc == MNT_OP_REBOOT and status == OK:
             print(f"  the node reboots ~{MNT_REBOOT_SECS} s after this reply")
@@ -1870,7 +2014,7 @@ def main():
     mt = sub.add_parser("maint", help="maintenance over LoRa: read-only status/listings, signed commands (README: Maintenance)")
     msub = mt.add_subparsers(dest="maint_cmd", required=True)
     for name in ("status", "files", "contacts", "channels", "delete-contact", "prune", "favourite", "add-contact",
-                 "format-extrafs", "delete-file", "reboot"):
+                 "format-extrafs", "delete-file", "reboot", "add-channel", "delete-channel"):
         p = msub.add_parser(name)
         p.add_argument("--companion", required=True)
         p.add_argument("--target", required=True)
@@ -1903,6 +2047,12 @@ def main():
         if name == "delete-file":
             p.add_argument("--fs", type=int, choices=(0, 1), default=None)
             p.add_argument("path", help="/name on the primary FS, or ExtraFS/name")
+        if name in ("add-channel", "delete-channel"):
+            p.add_argument("index", type=int, help="channel slot (0 = the first; the node has MAX_GROUP_CHANNELS)")
+        if name == "add-channel":
+            p.add_argument("name", help="1..31 bytes; '#name' without a secret = hashtag channel (key = SHA-256 of the name)")
+            p.add_argument("secret", nargs="?", help="128-bit secret, 32 hex digits (travels only inside the "
+                                                     "end-to-end encrypted request; printed cut)")
     a = ap.parse_args()
     if a.cmd == "push" and not a.slow and (a.duty or a.pace or a.resume or a.hops is not None):
         ap.error("--duty/--pace/--hops/--resume go with --slow")

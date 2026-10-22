@@ -175,6 +175,13 @@ public:
     fs[has_fs2 ? 1 : 0]["/channels2"] = f;
     return true;
   }
+  bool channelSet(int i, const char* name, const uint8_t secret16[16]) override {
+    if (i < 0 || i >= (int)channels.size()) return false;
+    memset(&channels[i], 0, sizeof(Channel));
+    snprintf(channels[i].name, sizeof(channels[i].name), "%s", name);
+    memcpy(channels[i].secret, secret16, 16);
+    return true;
+  }
   bool formatSecondary() override {
     if (!has_fs2) return false;
     fs[1].clear();
@@ -349,6 +356,10 @@ int main(int argc, char** argv) {
         s += "], \"channels\": [";
         for (size_t i = 0; i < node.channels.size(); i++) {
           s += (i ? ", \"" : "\"") + std::string(node.channels[i].name) + "\"";
+        }
+        s += "], \"channel_secrets\": [";   // the test's own view of the table (a control op, never a reply)
+        for (size_t i = 0; i < node.channels.size(); i++) {
+          s += (i ? ", \"" : "\"") + hex(node.channels[i].secret, 32) + "\"";
         }
         s += "], \"files\": [";
         bool first = true;

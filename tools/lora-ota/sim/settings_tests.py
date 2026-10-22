@@ -223,7 +223,7 @@ def run_settings_tests(check, tmp, crypto):
     check("settings: a signature under the firmware domain is refused", ok_, why)
 
     # 9. whitelist
-    for k, val in (("password", "hunter2"), ("prv.key", "00" * 64), ("guest.password", "x"), ("name", "Evil"),
+    for k, val in (("password", "hunter2"), ("prv.key", "00" * 64), ("guest.password", "x"), ("owner.info", "Evil"),
                    ("lat", "1.0"), ("ota", "off")):
         try:
             L.make_bundle([(k, val)], node_t, 5000, key)
@@ -322,6 +322,7 @@ def run_settings_tests(check, tmp, crypto):
           out == "1" * len(blocked) + "0" * len(free), out)
 
     run_feature_tests(check, tmp, crypto, sim, key, pub, bundle, push, refused, v)
+    run_companion_pref_tests(check, sim, key, pub, bundle, push, refused, v)
 
 
 def run_feature_tests(check, tmp, crypto, sim, key, pub, bundle, push, refused, v):
@@ -548,3 +549,133 @@ def refused_on(sim, pub, blob, what, push, **kw):
     d = n.dump()
     n.close()
     return err is not None and what in str(err), f"{err}; {d}"
+
+
+def run_companion_pref_tests(check, sim, key, pub, bundle, push, refused, v):
+    """the companion's stock prefs: name, adv.loc, telemetry.*, manual.add, autoadd, gps, location, ble.pin"""
+
+    def get_all(n):
+        text, start = "", 0
+        while start != 0xFF:
+            r = asyncio.run(n.request(bytes([L.REQ_SET_CTRL, L.SET_OP_GET, start]), True, 0))
+            text += r[2:].decode()
+            start = r[1]
+        return dict(line.split("=", 1) for line in text.splitlines() if "=" in line), text
+
+    # the fake companion's prefs before any bundle (settings_sim.cpp)
+    orig = {"name": "SimNode", "adv.loc": 0, "telemetry": [2, 0, 1], "manual.add": 1, "autoadd": 0x0B, "gps": 0,
+            "gps_power": 0, "location": [41671234, -72946543], "ble.pin": 0}
+    want = [("name", "Wayfarer 2"), ("adv.loc", "1"), ("telemetry.base", "1"), ("telemetry.loc", "2"),
+            ("telemetry.env", "0"), ("manual.add", "0"), ("autoadd", "31"), ("gps", "on"),
+            ("location", "-33.8688,151.209296"), ("ble.pin", "424242")]
+    new = {"name": "Wayfarer 2", "adv.loc": 1, "telemetry": [1, 2, 0], "manual.add": 0, "autoadd": 31, "gps": 1,
+           "gps_power": 1, "location": [-33868800, 151209296], "ble.pin": 424242}
+
+    def prefs(d):
+        return {k: d[k] for k in orig}
+
+    # 22. GET: the companion's prefs; the location only where it is advertised anyway, never the PIN
+    n = Node(sim, pub, role="companion")
+    g, _ = get_all(n)
+    check("settings: companion GET lists its stock prefs (location hidden: not advertised; PIN never read back)",
+          g.get("name") == "SimNode" and g.get("adv.loc") == "0" and g.get("telemetry.base") == "2" and
+          g.get("telemetry.loc") == "0" and g.get("telemetry.env") == "1" and g.get("manual.add") == "1" and
+          g.get("autoadd") == "11" and g.get("gps") == "off" and g.get("location") == "hidden" and
+          g.get("ble.pin") == "0", str(g))
+
+    # 23. every new key at once: applies, confirmed, kept; GET reads it back
+    ok, err = push(n, bundle(want))
+    d = n.dump()
+    n.tick(120)
+    d2 = n.dump()
+    g, text = get_all(n)
+    check("settings: name, adv.loc, telemetry.*, manual.add, autoadd, gps, location, ble.pin apply and are confirmed",
+          ok and prefs(d) == new and prefs(d2) == new and d2["ram_name"] == "Wayfarer 2" and not d2["pending"],
+          f"{err}; {prefs(d)}; {prefs(d2)}")
+    check("settings: GET after: the location (advertised now) in 6 decimals, the PIN only as 'set'",
+          g.get("name") == "Wayfarer 2" and g.get("location") == "-33.868800,151.209296" and g.get("ble.pin") == "set" and
+          g.get("gps") == "on" and g.get("autoadd") == "31" and "424242" not in text, str(g))
+    n.close()
+
+    # 24. no CONFIRM: every one of them comes back, the GPS powered as before; also across a reboot
+    n = Node(sim, pub, role="companion")
+    ok, err = push(n, bundle(want), confirm=False)
+    mid = n.dump()
+    n.tick(L.SET_CONFIRM_SECS + 2)
+    d = n.dump()
+    check("settings: the companion prefs revert without a CONFIRM (GPS powered off again, old name in RAM)",
+          prefs(mid) == new and mid["pending"] and prefs(d) == orig and d["ram_name"] == "SimNode" and not d["pending"],
+          f"{err}; {prefs(mid)}; {prefs(d)}")
+    push(n, bundle([("name", "Temp"), ("location", "1,2"), ("ble.pin", "111111")]), confirm=False)
+    n.tick(5)
+    n.reboot()
+    d = n.dump()
+    check("settings: a reboot before CONFIRM brings the old name, location and PIN back",
+          prefs(d) == orig and not d["pending"], str(prefs(d)))
+    n.close()
+
+    # 25. range: refused by the node (the sender's own check bypassed) and by the sender
+    bad = [("name", ""), ("name", " lead"), ("name", "trail "), ("name", "x" * 32), ("name", "a,b"), ("name", "q?"),
+           ("name", "tab\there"), ("name", "nl\nx"), ("name", "del\x7f"), ("name", "[x]"),
+           ("adv.loc", "2"), ("adv.loc", "-1"), ("adv.loc", "on"),
+           ("telemetry.base", "3"), ("telemetry.loc", "9"), ("telemetry.env", "1.5"),
+           ("manual.add", "2"), ("autoadd", "32"), ("autoadd", "64"), ("autoadd", "255"), ("gps", "1"), ("gps", "yes"),
+           ("location", "90.000001,0"), ("location", "0,-180.000001"), ("location", "1.1234567,0"), ("location", "1"),
+           ("location", "1,2,3"), ("location", "a,b"), ("location", "+1,2"), ("location", ",2"),
+           ("ble.pin", "99999"), ("ble.pin", "1000000"), ("ble.pin", "-1"), ("ble.pin", "12345a")]
+    for k, val in bad:
+        ok_, why = refused(bundle([(k, val)], check_keys=False), "out of range", role="companion")
+        try:
+            L.make_bundle([(k, val)], (1, SELF[:8]), 1, key)
+            sender_ok = False
+        except L.OtaError:
+            sender_ok = True
+        check(f"settings: {k}={val!r} refused by node and sender", ok_ and sender_ok, why)
+    n = Node(sim, pub, role="companion")
+    ok, err = push(n, bundle([("location", "90,-180"), ("name", "Ünïcode ok"), ("ble.pin", "0"), ("autoadd", "0")]))
+    d = n.dump()
+    check("settings: edge values apply (90,-180; UTF-8 name; PIN 0 = the build's default; autoadd 0)",
+          ok and d["location"] == [90000000, -180000000] and d["name"] == "Ünïcode ok" and d["ble.pin"] == 0 and
+          d["autoadd"] == 0, f"{err}; {d}")
+    n.close()
+
+    # 26. a repeater has none of them; a companion without a GPS has no gps
+    for k, val in want:
+        ok_, why = refused(bundle([(k, val)]), "no such setting")
+        check(f"settings: '{k}' refused by a repeater (no such setting)", ok_, why)
+    n = Node(sim, pub)
+    g, _ = get_all(n)
+    n.close()
+    check("settings: a repeater's GET lists none of the companion prefs", not (set(g) & L.COMPANION_KEYS), str(g))
+    ok_, why = refused(bundle([("gps", "on")]), "no such setting", role="companion", extra=("--no-gps",))
+    check("settings: gps refused by a companion without a GPS", ok_, why)
+    n = Node(sim, pub, role="companion", extra=("--no-gps",))
+    g, _ = get_all(n)
+    n.close()
+    check("settings: GET of a GPS-less companion has no gps line", "gps" not in g and "name" in g, str(g))
+
+    # 27. the PIN with a reboot: live at the next boot, as the firmware takes it
+    n = Node(sim, pub, role="companion")
+    ok, err = push(n, bundle([("ble.pin", "777777")], reboot=True))
+    n.tick(L.SET_REBOOT_SECS + 2)
+    d = n.dump()
+    check("settings: ble.pin + reboot=1: confirmed, rebooted once, PIN kept", ok and d["reboots"] == 1 and
+          d["ble.pin"] == 777777 and not d["pending"], f"{err}; {d}")
+    n.close()
+
+    # 28. the sender: friendly forms, diff, what it prints
+    got = L.parse_sets(["telemetry.base=all", "telemetry.env=flags", "adv.loc=share", "autoadd=0x0b",
+                        "autoadd=overwrite,chat,repeaters", "gps=1", "manual.add=off", "name= keep "])
+    check("settings: sender canonical forms (telemetry/adv.loc words, autoadd hex and names, gps 1/0)",
+          got == [("telemetry.base", "2"), ("telemetry.env", "1"), ("adv.loc", "1"), ("autoadd", "11"), ("autoadd", "7"),
+                  ("gps", "on"), ("manual.add", "0"), ("name", " keep ")], str(got))
+    cur = {"name": "Wayfarer", "location": "hidden", "ble.pin": "set", "gps": "off", "autoadd": "11", "adv.loc": "0"}
+    got = L.diff_entries(cur, [("name", "wayfarer"), ("location", "1,2"), ("ble.pin", "123456"), ("gps", "off"),
+                               ("autoadd", "11"), ("adv.loc", "0")])
+    check("settings: diff: names compare exactly; a hidden location and a set PIN always count as changed",
+          got == [("name", "wayfarer"), ("location", "1,2"), ("ble.pin", "123456")], str(got))
+    got = L.diff_entries({"location": "41.500000,-72.000000", "ble.pin": "0", "name": "A b"},
+                         [("location", "41.5,-72"), ("ble.pin", "0"), ("name", "A b")])
+    check("settings: diff: an advertised location in another form and PIN 0 are unchanged", got == [], str(got))
+    check("settings: the sender prints only the PIN's first digits", L.shown("ble.pin", "424242") == "42****" and
+          L.shown("ble.pin", "0") == "0")

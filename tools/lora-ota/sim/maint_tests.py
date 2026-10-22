@@ -208,6 +208,8 @@ def run_maint_tests(check, tmp, crypto):
         "format-extrafs": (L.MNT_OP_FORMAT_EXTRAFS, b""),
         "delete-file": (L.MNT_OP_DELETE_FILE, L.maint_args(L.MNT_OP_DELETE_FILE, path="/adv_blobs", fs=1)),
         "reboot": (L.MNT_OP_REBOOT, b""),
+        "add-channel": (L.MNT_OP_SET_CHANNEL, L.maint_args(L.MNT_OP_SET_CHANNEL, index=3, name="#newtag")),
+        "delete-channel": (L.MNT_OP_DELETE_CHANNEL, L.maint_args(L.MNT_OP_DELETE_CHANNEL, index=2)),
     }
     for name, (op, args) in ops.items():
         n = Node(sim, pub)
@@ -425,7 +427,80 @@ def run_maint_tests(check, tmp, crypto):
           s == L.BUSY and s2 == L.OK and early == 0 and n.dump()["reboots"] == 1, f"{s} {s2} {early} {n.dump()['reboots']}")
     n.close()
 
+    # ------------------------------------------------------------ channels: add (hashtag / own secret), delete
+    n = Node(sim, pub)
+    tag_secret = hashlib.sha256(b"#fieldops").digest()[:16]
+    own = bytes.fromhex("0f1e2d3c4b5a69788796a5b4c3d2e1f0")
+    s, c, op, res = run(n, cmd(L.MNT_OP_SET_CHANNEL, L.maint_args(L.MNT_OP_SET_CHANNEL, index=3, name="#fieldops")))
+    r = L.mnt_result(op, s, res)
+    d = n.dump()
+    check("maint: add a hashtag channel to an empty slot: secret = SHA-256(name)[0:16], as the apps derive it",
+          s == L.OK and r == {"op": "add-channel", "status": "ok", "replaced": False, "hashtag": True} and
+          d["channels"][3] == "#fieldops" and d["channel_secrets"][3] == (tag_secret + bytes(16)).hex(), f"{r} {d['channels']}")
+    s, c, op, res = run(n, cmd(L.MNT_OP_SET_CHANNEL, L.maint_args(L.MNT_OP_SET_CHANNEL, index=4, name="crew", secret=own)))
+    r = L.mnt_result(op, s, res)
+    d = n.dump()
+    check("maint: add a channel with its own 128-bit secret",
+          s == L.OK and not r["replaced"] and not r["hashtag"] and d["channels"][4] == "crew" and
+          d["channel_secrets"][4] == (own + bytes(16)).hex(), f"{r} {d['channels']}")
+    s, c, op, res = run(n, cmd(L.MNT_OP_SET_CHANNEL, L.maint_args(L.MNT_OP_SET_CHANNEL, index=0, name="#public2")))
+    r = L.mnt_result(op, s, res)
+    check("maint: setting a configured slot replaces it (as CMD_SET_CHANNEL)", s == L.OK and r["replaced"] and
+          n.dump()["channels"][0] == "#public2", str(r))
+    chs = read(n, "channels")
+    check("maint: the new channels list back; hashtag names cut (the name is the key)",
+          [(c["index"], c["name"], c["name_keyed"]) for c in chs] ==
+          [(0, "#pu", True), (1, "#se", True), (2, "family", False), (3, "#fi", True), (4, "crew", False)], str(chs))
+    s, *_ = run(n, cmd(L.MNT_OP_DELETE_CHANNEL, L.maint_args(L.MNT_OP_DELETE_CHANNEL, index=2)))
+    d = n.dump()
+    s2, *_ = run(n, cmd(L.MNT_OP_DELETE_CHANNEL, L.maint_args(L.MNT_OP_DELETE_CHANNEL, index=2)))
+    check("maint: delete a channel (empty name, zero secret, as the app); an empty slot is not found",
+          s == L.OK and d["channels"][2] == "" and d["channel_secrets"][2] == "00" * 32 and s2 == L.NOT_FOUND,
+          f"{L.mnt_status(s)} {L.mnt_status(s2)} {d['channels']}")
+    n.power_cycle()
+    d = n.dump()
+    check("maint: channel changes are saved (same table after a power cycle)",
+          d["channels"] == ["#public2", "#secretgroup", "", "#fieldops", "crew"] and
+          d["channel_secrets"][4] == (own + bytes(16)).hex(), str(d["channels"]))
+    c0 = n.dump()["counter"]
+    s, *_ = run(n, cmd(L.MNT_OP_SET_CHANNEL, bytes([5, 3]) + b"#xy"))
+    s2, *_ = run(n, cmd(L.MNT_OP_DELETE_CHANNEL, bytes([200])))
+    check("maint: channel index past the node's slots refused, counter not spent",
+          s == L.BAD_ARG and s2 == L.BAD_ARG and n.dump()["counter"] == c0, f"{L.mnt_status(s)} {L.mnt_status(s2)}")
+    malformed = [("no secret, not a hashtag", bytes([3, 4]) + b"crew"), ("a lone '#'", bytes([3, 1]) + b"#"),
+                 ("all-zero secret", bytes([3, 4]) + b"crew" + bytes(16)), ("empty name", bytes([3, 0]) + own),
+                 ("control character", bytes([3, 4]) + b"cr\nw" + own), ("short secret", bytes([3, 4]) + b"crew" + own[:8]),
+                 ("32-character name", bytes([3, 32]) + b"#" + b"x" * 31), ("delete with junk", bytes([3, 1]))]
+    bad = []
+    for what, a in malformed:
+        op = L.MNT_OP_DELETE_CHANNEL if what.startswith("delete") else L.MNT_OP_SET_CHANNEL
+        s, *_ = run(n, cmd(op, a))
+        if s != 20:
+            bad.append(f"{what}: {L.mnt_status(s)}")
+    check("maint: malformed channel commands refused (does not parse), counter not spent",
+          not bad and n.dump()["counter"] == c0, str(bad))
+    leaks = [x for x in (own, tag_secret, b"fieldops", b"public2") for rr in n.replies if x in rr]
+    check("maint: no reply carries a channel secret or a hashtag channel's full name", not leaks and not n.leaks(),
+          f"{leaks} {n.leaks()}")
+    for what, kw in (("no secret, not a hashtag", dict(index=3, name="crew")),
+                     ("zero secret", dict(index=3, name="crew", secret=bytes(16))),
+                     ("short secret", dict(index=3, name="crew", secret=bytes(8))),
+                     ("long name", dict(index=3, name="#" + "x" * 31))):
+        try:
+            L.maint_args(L.MNT_OP_SET_CHANNEL, **kw)
+            sender_ok = False
+        except L.OtaError:
+            sender_ok = True
+        check(f"maint: sender refuses add-channel with {what}", sender_ok)
+    n.close()
+
     # ------------------------------------------------------------ repeater
+    n = Node(sim, pub, role="repeater")
+    s, *_ = run(n, cmd(L.MNT_OP_SET_CHANNEL, L.maint_args(L.MNT_OP_SET_CHANNEL, index=0, name="#x1")))
+    s2, *_ = run(n, cmd(L.MNT_OP_DELETE_CHANNEL, L.maint_args(L.MNT_OP_DELETE_CHANNEL, index=0)))
+    check("maint: repeater: channel ops not supported, counter not spent", s == 22 and s2 == 22 and
+          n.dump()["counter"] == 0, f"{L.mnt_status(s)} {L.mnt_status(s2)}")
+    n.close()
     n = Node(sim, pub, role="repeater")
     st = read(n, "status")
     fl = read(n, "files", 0)
@@ -488,6 +563,27 @@ def run_maint_tests(check, tmp, crypto):
     out, _, err = cli("delete-file", path="ExtraFS/adv_blobs", fs=None)
     check("maint CLI: delete-file ExtraFS/<name> on a freshly formatted ExtraFS: not found", err and "not found" in err,
           str(err))
+    import contextlib, io
+    secret_hex = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    out, pr, err = cli("add-channel", index=3, name="ops", secret=secret_hex)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        pr()
+    shown_all = buf.getvalue() + json.dumps(out)
+    check("maint CLI: add-channel with a secret: added; the secret is printed (and in --json) only cut",
+          err is None and out["status"] == "ok" and out["channel"]["secret"] == "a1b2…" and
+          secret_hex not in shown_all and secret_hex[:8] not in shown_all and
+          n.dump()["channel_secrets"][3] == secret_hex + "00" * 16, f"{err} {shown_all}")
+    out, pr, err = cli("add-channel", index=4, name="#nightwatch", secret=None)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        pr()
+    shown_all = buf.getvalue() + json.dumps(out)
+    check("maint CLI: add-channel #hashtag: its name (the key) printed only cut",
+          err is None and out["hashtag"] and "nightwatch" not in shown_all and
+          n.dump()["channels"][4] == "#nightwatch", f"{err} {shown_all}")
+    out, _, err = cli("delete-channel", index=3)
+    check("maint CLI: delete-channel", err is None and out["status"] == "ok" and n.dump()["channels"][3] == "", f"{err} {out}")
     st, _, err = cli("status")
     check("maint CLI: each command used a fresh counter (time-based, above the node's)", st["maint_counter"] >= ctr[0],
           str(st["maint_counter"]))

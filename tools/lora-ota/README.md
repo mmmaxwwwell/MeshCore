@@ -355,6 +355,14 @@ Source: `src/helpers/LoraOTASettings.{h,cpp}`. Every `*_lora_ota` build has it.
 | `regions` | `ct,northeast,east,*`: each region exists (under `*`) with flood allowed. Additive: nothing is removed or denied | repeater |
 | `posreport.interval` | minutes 0-1440, 0 = off. As `#locset <min>`: saved to `/posrep`, next report in 5 s | companion, `POSITION_REPORT` builds |
 | `overlay` | `off` or `on #<name> <0\|1>`, as `#ovlset`. `off` clears the name and **client repeat goes off with it**; `on` sets the name and client repeat to the last field (the bundle's mask includes `repeat`, so a revert restores both) | companion, `OVERLAY_MESH` builds |
+| `name` | node/advert name, 1-31 bytes: no control characters, none of `[ ] \ : , ? *` (as `set name`), no space at either end; UTF-8 allowed. Adverts use it at once, the BLE device name from the next boot | companion |
+| `adv.loc` | advert location policy (`advert_loc_policy`): 0 none, 1 share | companion |
+| `telemetry.base`, `telemetry.loc`, `telemetry.env` | telemetry modes (`telemetry_mode_*`): 0 deny, 1 per contact flags, 2 everyone | companion |
+| `manual.add` | `manual_add_contacts`: 0 or 1 | companion |
+| `autoadd` | `autoadd_config` bitmask 0-31: 1 overwrite the oldest non-favourite when full, 2 chat, 4 repeater, 8 room server, 16 sensor. Any other bit is refused | companion |
+| `gps` | on/off: powers the GPS and keeps `gps_enabled`, as the app's custom var `gps` does | companion with a GPS |
+| `location` | `lat,lon` in degrees, -90..90 and -180..180, 6 decimals at most (as `CMD_SET_ADVERT_LATLON`; with the GPS on, its fixes overwrite it) | companion |
+| `ble.pin` | 0 (the build's default: on the Wio L1 a random PIN per boot, shown on its screen) or 100000-999999, as `CMD_SET_DEVICE_PIN`. **Taken at the next boot**: send it with `--reboot` | companion |
 
 The two feature keys are on the whitelist **only in builds that compile the
 feature in**: elsewhere they are `not on the whitelist`, like any unknown key
@@ -379,10 +387,23 @@ disagrees with the overlay's (`off` = repeat off, `on ... r` = r) contradicts
 itself and is refused, and `on ... 1` off the client-repeat bands is refused
 like `CMD_SET_RADIO_PARAMS` would refuse it.
 
+The companion's stock prefs (`name` .. `ble.pin`) are on every build's
+whitelist; a repeater refuses them as `this node has no such setting`, and so
+does a companion without a GPS for `gps`. Each is set exactly as the app's
+own command sets it, saved with the prefs, and reverts like any other key.
+`GET` (and so `show`/`diff`) reads them back with two exceptions: the PIN
+reads as `0` or `set`, never its digits, and the location reads as `hidden`
+unless the node advertises it anyway (`adv.loc=1`); `diff` counts both of
+those as changed. The bundle file holds the PIN in clear: like any bundle it
+is written 0600, and the sender prints only the PIN's first two digits.
+`gps`, `name` and `location` change something live at once; `ble.pin` and
+the BLE name only at the next boot, so a bundle with `ble.pin` (or a `name`
+the phone should see) wants `--reboot`. A new PIN means re-pairing the phone.
+
 Never on the list: passwords (admin, guest), the private key, the signing
-key, name, location, owner info, bridge settings, power saving, Wi-Fi, BLE
-PIN, contacts and telemetry policy, the position
-report destination, and anything about OTA itself. A companion refuses
+key, owner info, bridge settings, power saving, Wi-Fi, the position report
+destination, contacts and channels themselves (those are signed maintenance
+commands, below), and anything about OTA itself. A companion refuses
 repeater keys (`this node has no such setting`); with client repeat on
 (already, or from the same bundle), it also refuses a `radio` outside the
 client-repeat bands.
@@ -436,6 +457,10 @@ lora_ota.py settings make --target ce6ce5eab221 --set radio=910.525,62.5,7,5 \
     --set flood.max.unscoped=12 --set flood.advert.interval=47 --set regions=ct,northeast,east,* -o quartz.mcset
 lora_ota.py settings make --target board:heltec_v4_repeater_headless --set tx=20 -o v4-tx.mcset
 lora_ota.py settings make --target 534b6eee0f09 --set posreport.interval=10 --set overlay=off --reboot -o wayfarer.mcset
+# a companion's own prefs; the sender also takes words for the numbers (telemetry deny/flags/all,
+# adv.loc none/share, autoadd 0x.. or overwrite,chat,repeater,room,sensor, manual.add on/off)
+lora_ota.py settings make --target 534b6eee0f09 --set name=Wayfarer --set adv.loc=none --set telemetry.loc=deny \
+    --set autoadd=overwrite,chat --set gps=off --set location=41.67,-72.94 --set ble.pin=424242 --reboot -o w.mcset
 
 # diff: read the node's values (as show does), sign a bundle of ONLY the keys that differ
 lora_ota.py settings diff --companion ... --target Wayfarer --set posreport.interval=10 --set repeat=off \
@@ -494,7 +519,7 @@ since a bundle is only a few packets.
 | `0x67` SET_DATA | total u16, offset u16, n u8, bytes | status, have u16 (contiguous bytes held) |
 | `0x68` SET_APPLY | total u16, sha256(bundle)[0:8] | WORKING (12) while it checks; then status, version u32, secs_left u16 |
 | `0x69` SET_CTRL | op u8: 0 STATUS, 1 CONFIRM, 2 REVERT | status, pending u8 (2 = radio switch still to come), was u8, version u32, pending_version u32, secs_left u16, flags u8 (bit 0: the pending bundle asks for a reboot, bit 1: the reboot is due; older firmware stops before flags) |
-| `0x69` SET_CTRL | op 3 GET, start u8 | status, next u8 (0xFF = end), `key=value\n` text |
+| `0x69` SET_CTRL | op 3 GET, start u8 | status, next u8 (0xFF = end), `key=value\n` text (`ble.pin` as `0`/`set`; `location` as `lat,lon` with 6 decimals, or `hidden` unless `adv.loc=1`) |
 
 Bundle: `body || sig[64]`, at most 512 bytes; body = version u32, target kind
 u8 (1 = public key prefix, 2 = board tag), target length u8, target, count u8,
@@ -529,9 +554,10 @@ without a signature. USB serial and the ethernet CLI (both `sender_timestamp`
   `region remove`, `region def`
 
 Everything else (passwords, name, location, `get ...`, `region list`,
-`ota ...`, `reboot`, ...) is unchanged. Companions take settings from their
-own app over BLE/USB, never over LoRa, so the flag only matters on
-repeaters. Whether to turn it on is the owner's call.
+`ota ...`, `reboot`, ...) is unchanged. A companion has no CLI over LoRa at
+all (over LoRa it takes only the signed bundles and maintenance commands),
+so the flag only matters on repeaters. Whether to turn it on is the owner's
+call.
 
 ### Tests
 
@@ -556,6 +582,19 @@ repeat with it and leaves no copy of the region name once confirmed,
 `reboot=1` reboots exactly once ~6 s after the CONFIRM (also with a radio
 change) and never after a revert, REVERT or replay; `diff` keeps only the
 changed keys, and the bundle it makes applies.
+
+The companion's stock prefs: GET lists them (location `hidden` until
+`adv.loc=1`, the PIN only as `0`/`set`, never its digits in any reply); all
+ten in one bundle apply and are confirmed, revert without a CONFIRM (the
+GPS powered off again) and across a reboot; every out-of-range value
+(names with control or forbidden characters, a space at an end, 32 bytes;
+policies past their maximum; autoadd bits past 31; 7 decimals or past 90/180
+in a location; a 5- or 7-digit PIN) is refused by the node and the sender;
+edge values (90,-180, a UTF-8 name, PIN 0, autoadd 0) apply; a repeater
+refuses each one as `no such setting` and lists none in GET; a companion
+without a GPS refuses `gps`; `ble.pin` with `reboot=1` reboots once and
+keeps the PIN; the sender's word forms, `diff` (exact names, hidden location
+and set PIN count as changed) and the PIN shown cut.
 
 ## Maintenance
 
@@ -634,6 +673,8 @@ them.
 | `format-extrafs` | yes | nRF52 with an ExtraFS | |
 | `delete-file [--fs 0\|1] PATH` | yes | yes | yes |
 | `reboot` | yes | yes | yes |
+| `add-channel IDX NAME [SECRET]` | yes | yes | |
+| `delete-channel IDX` | yes | yes | |
 
 - **delete-contact:** by key prefix (12+ hex digits) or by a name that is
   unique on the node. Favourites stay unless `--force`. A prefix that
@@ -660,6 +701,22 @@ them.
 - **delete-file:** `/name` on the primary FS, `ExtraFS/name` (or `--fs 1`)
   on the secondary one. Files only, never the protected ones.
 - **reboot:** 6 s after the reply. Contacts not saved yet are saved first.
+- **add-channel:** sets slot IDX (0 up to the node's `MAX_GROUP_CHANNELS` - 1;
+  past that: bad argument, counter not spent) as the app's
+  `CMD_SET_CHANNEL` does: NAME (1-31 bytes, no control characters) and a
+  128-bit SECRET (32 hex digits, not all zero). Without a SECRET, NAME must
+  start with `#`: a **hashtag channel**, whose secret the node derives as
+  SHA-256(NAME)[0:16], the same derivation the apps use and the read side
+  recognises. A configured slot is replaced (the result says so).
+  - The secret, or a hashtag channel's name (its key), travels only inside
+    the REQ datagrams, encrypted end to end like every request.
+  - The sender prints, and puts in `--json`, only the first 4 characters
+    of either.
+  - The node keeps no copy outside the channel table (its buffers are
+    wiped).
+- **delete-channel:** empties slot IDX (empty name, zero secret: what the
+  app does); an empty slot is not found. Any slot may be set or emptied,
+  slot 0 (`Public`) included, as from the app.
 
 ```sh
 lora_ota.py maint status --companion ... --target Wayfarer
@@ -667,6 +724,9 @@ lora_ota.py maint contacts --companion ... --target Wayfarer --types repeater,se
 lora_ota.py maint prune --companion ... --target Wayfarer --types repeater,sensor --dry-run
 lora_ota.py maint prune --companion ... --target Wayfarer --types repeater,sensor
 lora_ota.py maint format-extrafs --companion ... --target Wayfarer
+lora_ota.py maint add-channel --companion ... --target Wayfarer 3 '#fieldops'           # hashtag: key from the name
+lora_ota.py maint add-channel --companion ... --target Wayfarer 4 crew 0f1e2d3c4b5a69788796a5b4c3d2e1f0
+lora_ota.py maint delete-channel --companion ... --target Wayfarer 4
 lora_ota.py maint files --companion ... --target Quartz --password-file <admin pw>
 lora_ota.py --key other.key maint reboot --companion ... --target Quartz --password-file <admin pw>
 lora_ota.py maint status --json ...        # every op: --json for machines
@@ -720,6 +780,8 @@ op u8, args:
 | `0x14` FORMAT_EXTRAFS | - | contacts before u16, stored u16, channels before u8, stored u8 |
 | `0x15` DELETE_FILE | fs u8, path | - |
 | `0x16` REBOOT | - | - |
+| `0x17` SET_CHANNEL | index u8, name len u8 (1-31), name, then nothing (a `#` name: hashtag) or secret[16] (not all zero) | was u8 (1 = a channel was replaced), hashtag u8 |
+| `0x18` DELETE_CHANNEL | index u8 | - |
 
 Status codes 24+: 24 not found, 25 protected (a protected file, the node
 itself, or your own contact), 26 contact table full, 27 busy (an image,
@@ -753,8 +815,17 @@ markers) and drives it with the real sender (`sim/maint_tests.py`):
   gone, the same tables after a power cycle; not supported without ExtraFS;
 - delete-file against every protected name and traversal trick; reboot
   once, 6 s after the reply, refused while settings are on probation;
+- channels: a hashtag channel gets SHA-256(name)[0:16], an own secret is
+  stored as given, a configured slot is replaced, delete empties a slot
+  (an empty one is not found), all of it saved across a power cycle; an
+  index past the slots and every malformed form (no secret without `#`,
+  zero or short secret, empty, 32-byte or control-character name) refused
+  without spending the counter; no reply holds the secret or the hashtag
+  name; a repeater has no channels;
 - a repeater; 20% packet loss; and the CLI's own logic (`maint_do`: dry
-  run, by name, a contact from the meshcore lib's JSON, fresh counters).
+  run, by name, a contact from the meshcore lib's JSON, fresh counters,
+  add-channel printing only the first characters of a secret or hashtag
+  name, in text and `--json`).
 `service_test.cpp` also runs maintenance through `LoraOTAService`.
 
 ## The first LoRa-OTA image

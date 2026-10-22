@@ -57,6 +57,8 @@
 #define LORA_OTA_MNT_OP_FORMAT_EXTRAFS  0x14   // (none): format the secondary FS, save contacts + channels back from RAM
 #define LORA_OTA_MNT_OP_DELETE_FILE     0x15   // fs u8, path
 #define LORA_OTA_MNT_OP_REBOOT          0x16   // (none): reboot LORA_OTA_MNT_REBOOT_MS after the reply
+#define LORA_OTA_MNT_OP_SET_CHANNEL     0x17   // index u8, nlen u8, name, [secret 16]: no secret = a hashtag channel
+#define LORA_OTA_MNT_OP_DELETE_CHANNEL  0x18   // index u8
 
 #define LORA_OTA_MNT_DEL_FORCE  0x01   // DELETE_CONTACTS: favourites too (never the requester)
 
@@ -136,6 +138,9 @@ public:
   virtual int channelCount() { return -1; }
   virtual bool channelAt(int i, char name[32], uint8_t secret[32]) { (void)i; (void)name; (void)secret; return false; }
   virtual bool channelsSave() { return false; }
+  // set slot i, as the app's CMD_SET_CHANNEL: name (NUL-terminated, "" = empty slot) and a 128-bit
+  // secret (zeros for an empty slot). The caller wipes its copies; the app should wipe its own
+  virtual bool channelSet(int i, const char* name, const uint8_t secret16[16]) { (void)i; (void)name; (void)secret16; return false; }
   // format the secondary FS (only that one), and count what the store holds afterwards
   // (contacts; configured, i.e. named, channels)
   virtual bool formatSecondary() { return false; }
@@ -191,6 +196,8 @@ class Maint {
   uint8_t execFavourite(const uint8_t* a, size_t n);
   uint8_t execAdd(const uint8_t* a, size_t n);
   uint8_t execDeleteFile(const uint8_t* a, size_t n);
+  uint8_t execSetChannel(const uint8_t* a, size_t n);
+  uint8_t execDeleteChannel(const uint8_t* a, size_t n);
   int configuredChannels();
   int readStatus(uint8_t* reply, const Ctx& ctx);
   int readFiles(const uint8_t* p, size_t len, uint8_t* reply);

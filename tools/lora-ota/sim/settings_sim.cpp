@@ -16,7 +16,11 @@
 // (RAM from "flash", a fresh Settings), counted in the dump.
 //
 //   settings_sim --pubkey HEX --board TAG --role repeater|companion [--self HEX32] [--drop PCT] [--seed N]
-//                [--client-repeat]
+//                [--client-repeat] [--no-gps]
+//
+// A companion also has its stock prefs (name, adv.loc, telemetry.*, manual.add,
+// autoadd, location, ble.pin) and, unless --no-gps, a GPS whose power follows
+// the gps key (gps_power, in the dump).
 
 #include "LoraOTASettings.h"
 #include <stdio.h>
@@ -56,6 +60,7 @@ public:
   bool ovl_snap_exists = false;
   int reboots = 0;
   bool reboot_req = false;
+  bool has_gps = true, gps_power = false;   // the GPS hardware (companions): powered as the gps key says
 
   FakeNode(bool rep) : repeater(rep) {
     memset(&prefs, 0, sizeof(prefs));
@@ -65,6 +70,13 @@ public:
     prefs.advert_interval_min = 0; prefs.flood_advert_interval_h = 12; prefs.repeat = rep ? 1 : 0;
     prefs.posreport_min = 0;   // POSREPORT_INTERVAL_MIN: off
     if (!rep) ovl = ovl_saved = "#ourgroup";   // a companion starts with the overlay on (when it has one)
+    if (!rep) {   // the stock companion prefs
+      strcpy(prefs.name, "SimNode");
+      prefs.adv_loc = 0; prefs.telem_base = 2; prefs.telem_loc = 0; prefs.telem_env = 1;
+      prefs.manual_add = 1; prefs.autoadd = 0x0B; prefs.gps = 0;
+      prefs.lat_micro = 41671234; prefs.lon_micro = -72946543;
+      prefs.ble_pin = 0;
+    }
     saved = prefs;
     live = { prefs.freq_khz, prefs.bw_hz, prefs.sf, prefs.cr };
     tx_live = prefs.tx;
@@ -80,6 +92,7 @@ public:
 #ifdef OVERLAY_MESH
     common |= 1u << K_OVERLAY;
 #endif
+    common |= LORA_OTA_SET_COMPANION_KEYS & ~(has_gps ? 0 : (1u << K_GPS));   // gps: only with a GPS (CMD_SET_CUSTOM_VAR)
     return repeater ? LORA_OTA_SET_REPEATER_KEYS : common;   // as simple_repeater: every stock key, no fork features
   }
   void read(Values& v) override { v = prefs; v.overlay = ovl.empty() ? 0 : 1; }
@@ -89,7 +102,9 @@ public:
     return !v.repeat || repeatFreq(v.freq_khz);
   }
   bool write(const Values& v, uint32_t mask) override {
+    if ((mask & (1u << K_GPS)) && !has_gps) return false;
     copyMasked(prefs, v, mask);
+    if (mask & (1u << K_GPS)) gps_power = prefs.gps;
     saved = prefs;
     ovl_saved = ovl;
     writes++;
@@ -149,6 +164,7 @@ public:
     ovl = ovl_saved;
     live = { prefs.freq_khz, prefs.bw_hz, prefs.sf, prefs.cr };
     tx_live = prefs.tx;
+    gps_power = has_gps && prefs.gps;   // applyGpsPrefs() at boot
   }
 };
 
@@ -162,7 +178,7 @@ static void out(const void* p, size_t n) {
 
 int main(int argc, char** argv) {
   const char *pubhex = NULL, *board = "test_board", *selfhex = NULL;
-  bool repeater = true, client_repeat = false;
+  bool repeater = true, client_repeat = false, no_gps = false;
   int drop = 0;
   unsigned seed = 1;
   for (int i = 1; i < argc; i++) {
@@ -173,12 +189,14 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--drop")) drop = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--seed")) seed = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--client-repeat")) client_repeat = true;   // companion: repeat on, on 918 MHz
+    else if (!strcmp(argv[i], "--no-gps")) no_gps = true;                 // companion without a GPS
   }
   if (!pubhex || strlen(pubhex) != 64) { fprintf(stderr, "usage: see source\n"); return 2; }
   srand(seed);
   uint8_t pub[32];
   fromHex(pub, pubhex, 32);
   FakeNode node(repeater);
+  node.has_gps = !repeater && !no_gps;
   if (client_repeat) {
     node.prefs.repeat = 1; node.prefs.freq_khz = 918000;
     node.saved = node.prefs;
@@ -222,7 +240,7 @@ int main(int argc, char** argv) {
         step(b[0] | b[1] << 8 | b[2] << 16 | (uint32_t)b[3] << 24);
         out("", 0);
       } else if (op == 2) {
-        char txt[1200];
+        char txt[1600];
         const Values& v = node.saved;
         std::string regs;
         for (auto& r : node.regions_saved) { if (!regs.empty()) regs += ","; regs += r; }
@@ -235,13 +253,17 @@ int main(int argc, char** argv) {
           "\"ram_radio\": [%u, %u, %u, %u], \"live\": [%u, %u, %u, %u], \"tx_live\": %d, \"radio_applies\": %d, \"writes\": %d, "
           "\"version\": %u, \"pending_version\": %u, \"pending\": %d, \"busy\": %d, "
           "\"repeat\": %u, \"posreport.interval\": %u, \"overlay\": \"%s\", \"overlay_snapshot\": %d, \"reboots\": %d, "
-          "\"reboot_due\": %d}",
+          "\"reboot_due\": %d, \"name\": \"%s\", \"adv.loc\": %u, \"telemetry\": [%u, %u, %u], \"manual.add\": %u, "
+          "\"autoadd\": %u, \"gps\": %u, \"gps_power\": %d, \"location\": [%d, %d], \"ble.pin\": %u, "
+          "\"ram_name\": \"%s\"}",
           v.freq_khz, v.bw_hz, v.sf, v.cr, v.tx, v.af_milli, v.flood_max, v.flood_max_unscoped, v.flood_advert_interval_h,
           v.path_hash_mode, v.loop_detect, regs.c_str(),
           node.prefs.freq_khz, node.prefs.bw_hz, node.prefs.sf, node.prefs.cr,
           node.live.khz, node.live.hz, node.live.sf, node.live.cr, node.tx_live, node.radio_applies, node.writes,
           st.version, st.pending_version, (int)s->pending(), (int)s->busy(),
-          v.repeat, v.posreport_min, node.ovl_saved.c_str(), (int)node.ovl_snap_exists, node.reboots, (int)s->rebootDue());
+          v.repeat, v.posreport_min, node.ovl_saved.c_str(), (int)node.ovl_snap_exists, node.reboots, (int)s->rebootDue(),
+          v.name, v.adv_loc, v.telem_base, v.telem_loc, v.telem_env, v.manual_add, v.autoadd, v.gps, (int)node.gps_power,
+          (int)v.lat_micro, (int)v.lon_micro, v.ble_pin, node.prefs.name);
         out(txt, n);
       } else if (op == 3) {
         restart();

@@ -20,13 +20,15 @@ static const char* const KEY_NAMES[K_COUNT] = {
   "int.thresh", "agc.reset.interval", "radio.rxgain", "flood.max", "flood.max.unscoped",
   "flood.max.advert", "advert.interval", "flood.advert.interval", "loop.detect", "repeat", "regions",
   "posreport.interval", "overlay",
+  "name", "adv.loc", "telemetry.base", "telemetry.loc", "telemetry.env", "manual.add", "autoadd", "gps", "location",
+  "ble.pin",
 };
 static const char* const LOOP_NAMES[4] = { "off", "minimal", "moderate", "strict" };
 
 const char* keyName(int k) { return k >= 0 && k < K_COUNT ? KEY_NAMES[k] : "?"; }
 
 uint32_t compiledKeys() {
-  uint32_t m = LORA_OTA_SET_REPEATER_KEYS;
+  uint32_t m = LORA_OTA_SET_REPEATER_KEYS | LORA_OTA_SET_COMPANION_KEYS;   // a repeater refuses the companion's as NOT_SUPPORTED
 #ifdef POSITION_REPORT
   m |= 1u << K_POSREPORT_INTERVAL;
 #endif
@@ -66,6 +68,16 @@ void copyMasked(Values& d, const Values& s, uint32_t m) {
   if (m & (1u << K_REPEAT)) d.repeat = s.repeat;
   if (m & (1u << K_POSREPORT_INTERVAL)) d.posreport_min = s.posreport_min;
   if (m & (1u << K_OVERLAY)) d.overlay = s.overlay;
+  if (m & (1u << K_NAME)) memcpy(d.name, s.name, sizeof(d.name));
+  if (m & (1u << K_ADV_LOC)) d.adv_loc = s.adv_loc;
+  if (m & (1u << K_TELEM_BASE)) d.telem_base = s.telem_base;
+  if (m & (1u << K_TELEM_LOC)) d.telem_loc = s.telem_loc;
+  if (m & (1u << K_TELEM_ENV)) d.telem_env = s.telem_env;
+  if (m & (1u << K_MANUAL_ADD)) d.manual_add = s.manual_add;
+  if (m & (1u << K_AUTOADD)) d.autoadd = s.autoadd;
+  if (m & (1u << K_GPS)) d.gps = s.gps;
+  if (m & (1u << K_LOCATION)) { d.lat_micro = s.lat_micro; d.lon_micro = s.lon_micro; }
+  if (m & (1u << K_BLE_PIN)) d.ble_pin = s.ble_pin;
 }
 
 bool parseMilli(const char* s, size_t n, uint32_t& out) {
@@ -96,6 +108,53 @@ int formatMilli(char* out, uint32_t milli) {
     while (out[n - 1] == '0') out[--n] = 0;
   }
   return n;
+}
+
+// "-41.123456" -> -41123456 (6 decimals at most, never rounded); |value| <= max_deg degrees
+static bool parseMicro(const char* s, size_t n, uint32_t max_deg, int32_t& out) {
+  bool neg = n > 0 && s[0] == '-';
+  uint64_t v = 0;
+  int frac = -1;
+  size_t digits = 0;
+  for (size_t i = neg; i < n; i++) {
+    char c = s[i];
+    if (c == '.' && frac < 0) { frac = 0; continue; }
+    if (c < '0' || c > '9') return false;
+    if (frac >= 0 && ++frac > 6) return false;
+    v = v * 10 + (c - '0');
+    if (v > 1000000000ull) return false;
+    digits++;
+  }
+  if (digits == 0) return false;
+  if (frac < 0) frac = 0;
+  for (; frac < 6; frac++) v *= 10;
+  if (v > (uint64_t)max_deg * 1000000u) return false;
+  out = neg ? -(int32_t)v : (int32_t)v;
+  return true;
+}
+
+bool parseLocation(const char* s, size_t n, int32_t& lat, int32_t& lon) {
+  const char* c = (const char*)memchr(s, ',', n);
+  if (!c) return false;
+  size_t a = c - s;
+  return parseMicro(s, a, 90, lat) && parseMicro(c + 1, n - a - 1, 180, lon);
+}
+
+static int formatMicro(char* out, int32_t v) {
+  uint32_t a = v < 0 ? (uint32_t)(-(int64_t)v) : (uint32_t)v;
+  return sprintf(out, "%s%lu.%06lu", v < 0 ? "-" : "", (unsigned long)(a / 1000000), (unsigned long)(a % 1000000));
+}
+
+// as `set name` (AdvertDataParser::isValidName), plus: no control characters, no space at either
+// end. UTF-8 bytes (0x80 and up) pass, as the app's names have them
+bool validName(const char* s, size_t n) {
+  static const char FORBIDDEN[] = "[]\\:,?*";
+  if (n == 0 || n >= LORA_OTA_SET_NAME_LEN || s[0] == ' ' || s[n - 1] == ' ') return false;
+  for (size_t i = 0; i < n; i++) {
+    uint8_t c = (uint8_t)s[i];
+    if (c < ' ' || c == 0x7F || (c < 0x80 && memchr(FORBIDDEN, c, sizeof(FORBIDDEN) - 1))) return false;
+  }
+  return true;
 }
 
 static bool parseUint(const char* s, size_t n, uint32_t max, uint32_t& out) {
@@ -237,6 +296,37 @@ Status parseEntry(int key, const char* s, size_t n, Values& v, int8_t max_tx) {
       v.overlay = on;
       return (Status)lora_ota::OK;
     }
+    case K_NAME:
+      if (!validName(s, n)) return BAD_VALUE;
+      memset(v.name, 0, sizeof(v.name));
+      memcpy(v.name, s, n);
+      return (Status)lora_ota::OK;
+    case K_ADV_LOC:
+      if (!parseUint(s, n, LORA_OTA_SET_ADV_LOC_MAX, u)) return BAD_VALUE;
+      v.adv_loc = u;
+      return (Status)lora_ota::OK;
+    case K_TELEM_BASE:
+    case K_TELEM_LOC:
+    case K_TELEM_ENV:
+      if (!parseUint(s, n, LORA_OTA_SET_TELEM_MAX, u)) return BAD_VALUE;
+      (key == K_TELEM_BASE ? v.telem_base : key == K_TELEM_LOC ? v.telem_loc : v.telem_env) = u;
+      return (Status)lora_ota::OK;
+    case K_MANUAL_ADD:
+      if (!parseUint(s, n, 1, u)) return BAD_VALUE;
+      v.manual_add = u;
+      return (Status)lora_ota::OK;
+    case K_AUTOADD:   // a bit the firmware does not define is refused, never dropped
+      if (!parseUint(s, n, 255, u) || (u & ~LORA_OTA_SET_AUTOADD_BITS)) return BAD_VALUE;
+      v.autoadd = u;
+      return (Status)lora_ota::OK;
+    case K_GPS:
+      return parseOnOff(s, n, v.gps) ? (Status)lora_ota::OK : BAD_VALUE;
+    case K_LOCATION:
+      return parseLocation(s, n, v.lat_micro, v.lon_micro) ? (Status)lora_ota::OK : BAD_VALUE;
+    case K_BLE_PIN:   // as CMD_SET_DEVICE_PIN: 0 (the build's default PIN) or six digits
+      if (!parseUint(s, n, 999999, u) || (u != 0 && u < 100000)) return BAD_VALUE;
+      v.ble_pin = u;
+      return (Status)lora_ota::OK;
   }
   return NOT_ALLOWED;
 }
@@ -402,6 +492,7 @@ uint8_t Settings::verifyAndApplyInner(uint32_t now_ms, bool fw_pending) {
   if (count == 0 || count > LORA_OTA_SET_MAX_ENTRIES) return BAD_FORMAT;
 
   Values cur, nv;
+  memset(&cur, 0, sizeof(cur));   // a target that reads only its own keys leaves no stack bytes in the record
   _t->read(cur);
   nv = cur;
   uint32_t mask = 0, supported = _t->supported() & compiledKeys();
@@ -512,6 +603,7 @@ int Settings::ctrl(const uint8_t* p, size_t len, uint8_t* reply, uint32_t now_ms
     }
     case LORA_OTA_SET_OP_GET: {   // start u8 -> status, next u8, "key=value\n"...
       Values v;
+      memset(&v, 0, sizeof(v));
       _t->read(v);
       uint32_t sup = _t->supported() & compiledKeys();
       int k = len > 1 ? p[1] : 0;
@@ -547,6 +639,24 @@ int Settings::ctrl(const uint8_t* p, size_t len, uint8_t* reply, uint32_t now_ms
           case K_LOOP_DETECT: n += sprintf(&line[n], "%s", v.loop_detect < 4 ? LOOP_NAMES[v.loop_detect] : "?"); break;
           case K_POSREPORT_INTERVAL: n += sprintf(&line[n], "%u", v.posreport_min); break;
           case K_OVERLAY: n += sprintf(&line[n], "%s", v.overlay ? "on" : "off"); break;
+          case K_NAME: v.name[sizeof(v.name) - 1] = 0; n += sprintf(&line[n], "%s", v.name); break;
+          case K_ADV_LOC: n += sprintf(&line[n], "%u", v.adv_loc); break;
+          case K_TELEM_BASE: n += sprintf(&line[n], "%u", v.telem_base); break;
+          case K_TELEM_LOC: n += sprintf(&line[n], "%u", v.telem_loc); break;
+          case K_TELEM_ENV: n += sprintf(&line[n], "%u", v.telem_env); break;
+          case K_MANUAL_ADD: n += sprintf(&line[n], "%u", v.manual_add); break;
+          case K_AUTOADD: n += sprintf(&line[n], "%u", v.autoadd); break;
+          case K_GPS: n += sprintf(&line[n], "%s", v.gps ? "on" : "off"); break;
+          case K_LOCATION:   // only where the node advertises it anyway: a favourite is not told where it is
+            if (v.adv_loc) {
+              n += formatMicro(&line[n], v.lat_micro);
+              line[n++] = ',';
+              n += formatMicro(&line[n], v.lon_micro);
+            } else {
+              n += sprintf(&line[n], "hidden");
+            }
+            break;
+          case K_BLE_PIN: n += sprintf(&line[n], "%s", v.ble_pin ? "set" : "0"); break;   // a pairing PIN is never read back
           case K_REGIONS: {
             char r[LORA_OTA_SET_GET_TEXT];
             _t->regionsExport(r, sizeof(r) - 16);
@@ -563,6 +673,7 @@ int Settings::ctrl(const uint8_t* p, size_t len, uint8_t* reply, uint32_t now_ms
         memcpy(&out[used], line, n);
         used += n;
       }
+      memset(&v, 0, sizeof(v));   // the PIN and the location were in it
       reply[0] = lora_ota::OK;
       reply[1] = k < K_COUNT ? k : 0xFF;
       return 2 + used;

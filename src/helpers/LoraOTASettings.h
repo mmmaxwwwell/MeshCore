@@ -34,6 +34,11 @@
 
 #define LORA_OTA_SET_REBOOT_MS  6000    // a bundle with reboot=1: reboot this long after its CONFIRM
 #define LORA_OTA_SET_POSREPORT_MAX 1440  // posreport.interval minutes (companion POSREPORT_MAX_MIN)
+#define LORA_OTA_SET_NAME_LEN    32      // name: the companion's node_name[32] (1-31 bytes + NUL)
+#define LORA_OTA_SET_TELEM_MAX   2       // telemetry.*: TELEM_MODE_DENY 0, _ALLOW_FLAGS 1, _ALLOW_ALL 2
+#define LORA_OTA_SET_ADV_LOC_MAX 1       // adv.loc: ADVERT_LOC_NONE 0, ADVERT_LOC_SHARE 1
+#define LORA_OTA_SET_AUTOADD_BITS 0x1F   // autoadd: the companion's AUTO_ADD_* bits (overwrite oldest, chat,
+                                         // repeater, room server, sensor); any other bit is refused
 
 #ifndef LORA_OTA_SET_CONFIRM_SECS
   #define LORA_OTA_SET_CONFIRM_SECS 60   // same rule as a new firmware image
@@ -54,8 +59,8 @@ enum Status : uint8_t {
 };
 
 // The whitelist. Names are the CLI's `set` names. Nothing else can be changed
-// this way: no passwords, no keys, no name/location/owner info, nothing about
-// OTA itself (see README "Signed settings").
+// this way: no passwords, no keys, no owner info, no Wi-Fi, nothing about OTA
+// itself (see README "Signed settings").
 enum Key : uint8_t {
   K_RADIO = 0,           // freq,bw,sf,cr   (MHz, kHz)
   K_TX,                  // dBm
@@ -79,10 +84,24 @@ enum Key : uint8_t {
   // our own companion features: on the whitelist ONLY in builds that have them
   K_POSREPORT_INTERVAL,  // minutes 0-1440, 0 = off            POSITION_REPORT builds
   K_OVERLAY,             // "off" | "on #<name> <0|1>" (as #ovlset; the name is the overlay's secret)  OVERLAY_MESH builds
+  // stock companion prefs (a repeater has none of them: "no such setting")
+  K_NAME,                // node/advert name, 1-31 bytes (as CMD_SET_ADVERT_NAME / `set name`)
+  K_ADV_LOC,             // advert_loc_policy 0-1
+  K_TELEM_BASE,          // telemetry_mode_base 0-2
+  K_TELEM_LOC,           // telemetry_mode_loc 0-2
+  K_TELEM_ENV,           // telemetry_mode_env 0-2
+  K_MANUAL_ADD,          // manual_add_contacts 0-1
+  K_AUTOADD,             // autoadd_config bitmask (LORA_OTA_SET_AUTOADD_BITS)
+  K_GPS,                 // on/off: gps_enabled, as CMD_SET_CUSTOM_VAR "gps" (nodes with a GPS only)
+  K_LOCATION,            // "lat,lon", 6 decimals at most (as CMD_SET_ADVERT_LATLON)
+  K_BLE_PIN,             // 0 (the build's default) or 100000-999999 (as CMD_SET_DEVICE_PIN); live at the next boot
   K_COUNT
 };
+static_assert(K_COUNT <= 32, "keys are a 32-bit mask");
 #define LORA_OTA_SET_RADIO_KEYS ((1u << K_RADIO) | (1u << K_TX) | (1u << K_RXGAIN))
 #define LORA_OTA_SET_REPEATER_KEYS ((1u << (lora_ota_settings::K_REGIONS + 1)) - 1)   // every stock key, no fork features
+// the stock companion prefs: on every build's whitelist, supported by companions only
+#define LORA_OTA_SET_COMPANION_KEYS (((1u << lora_ota_settings::K_COUNT) - 1) & ~((1u << lora_ota_settings::K_NAME) - 1))
 // the "reboot" control entry: not a setting. Value "1": reboot once, a little
 // after the bundle's CONFIRM (never before it, never after a revert)
 #define LORA_OTA_SET_REBOOT_KEY "reboot"
@@ -107,6 +126,13 @@ struct Values {
   uint16_t posreport_min;
   uint8_t overlay;           // 1 = on (some region name configured), 0 = off. The NAME is never in
                              // Values: Values go into the state file, and the name is a secret
+  // stock companion prefs (public, or the owner's own: nothing here is a key or a password)
+  char name[LORA_OTA_SET_NAME_LEN];   // NUL-terminated
+  uint8_t adv_loc;
+  uint8_t telem_base, telem_loc, telem_env;
+  uint8_t manual_add, autoadd, gps;
+  int32_t lat_micro, lon_micro;       // degrees * 1e6, as CMD_SET_ADVERT_LATLON
+  uint32_t ble_pin;
 };
 
 // persisted by the app (a small file): replay counter + probation record.
@@ -158,6 +184,12 @@ int formatMilli(char* out, uint32_t milli);
 
 // parse and check one entry into v (range checks here; role checks by the caller)
 Status parseEntry(int key, const char* val, size_t vlen, Values& v, int8_t max_tx);
+
+// "lat,lon" in degrees, 6 decimals at most -> 1e-6 degrees; false on junk or out of range
+bool parseLocation(const char* s, size_t n, int32_t& lat, int32_t& lon);
+// a name the companion would take: 1-31 bytes, no control characters, none of AdvertDataParser's
+// forbidden []\:,?* , no space at either end
+bool validName(const char* s, size_t n);
 
 // "off" | "on #<name> <0|1>" -> on, name (NUL-terminated, < 32 bytes), repeat
 #define LORA_OTA_SET_OVERLAY_NAME 32
