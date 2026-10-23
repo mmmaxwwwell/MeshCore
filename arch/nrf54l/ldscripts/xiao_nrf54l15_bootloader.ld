@@ -10,6 +10,7 @@
  * LoRa OTA state, session: 0x116000-0x118000
  * InternalFS:              0x118000-0x147000  (188 KB, LFS_RRAM_BASE/SIZE in the variant)
  * Core persistence pages:  0x147000-0x14A000  (moved down from 0x17A000, inside the SoftDevice)
+ * Radio roles map:         0x14A000           (one page, variants/xiao_nrf54l15/RadioRoles.h)
  *
  * Every L15 env uses this map, with or without LoRa OTA, so an update never moves InternalFS.
  *

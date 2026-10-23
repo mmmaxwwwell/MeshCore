@@ -7,19 +7,25 @@
 #include <helpers/radiolib/CustomSX1262Wrapper.h>
 #include <helpers/ArduinoHelpers.h>
 #include <helpers/SensorManager.h>
+#include "RadioRoles.h"
+
+// MeshCore's radio, re-pointable at boot: the mesh role may sit on either SX1262.
+class MeshRadioWrapper : public CustomSX1262Wrapper {
+public:
+  MeshRadioWrapper(CustomSX1262& radio, mesh::MainBoard& board) : CustomSX1262Wrapper(radio, board) { }
+  void bindTo(CustomSX1262& radio) { _radio = &radio; }   // before the mesh starts
+};
 
 extern XiaoNrf54L15Board board;
-extern WRAPPER_CLASS radio_driver;
+extern MeshRadioWrapper radio_driver;
 extern VolatileRTCClock rtc_clock;
 extern SensorManager sensors;
 
-bool radio_init();
+// Radio roles (RadioRoles.h): radio_init() reads the saved map, puts MeshCore on
+// its `mesh` radio (the other SX1262 if that one does not answer) and brings the
+// `aux` radio up in standby for the app. The `radio` CLI command changes the map.
+extern RadioRolesState radio_roles;   // saved map + what this boot runs
+SX1262* aux_lora();              // the aux role's SX1262, if it is one and it answered; else NULL
 
-#ifdef P_LORA2_NSS
-// A second SX1262, owned by whatever the app builds on it (not MeshCore's radio):
-// initialised by radio_init() after radio 1, then left in standby. Optional:
-// radio2_ok is false if it did not answer, and radio 1 still runs.
-extern SX1262 radio2;
-extern bool radio2_ok;
-#endif
+bool radio_init();
 mesh::LocalIdentity radio_new_identity();

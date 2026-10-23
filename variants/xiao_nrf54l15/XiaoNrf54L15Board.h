@@ -34,6 +34,9 @@ public:
     return mv > 0xFFFF ? 0xFFFF : (uint16_t)mv;
   }
 
+  // `radio` command: radio roles (target.cpp, RadioRoles.h)
+  bool handleCommand(const char* command, uint32_t sender_timestamp, char* reply) override;
+
   const char* getManufacturerName() const override {
     return "Seeed Xiao-nrf54l15";
   }

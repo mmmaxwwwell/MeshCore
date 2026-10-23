@@ -40,10 +40,9 @@
 #include <nrf54l15.h>
 #include <SHA256.h>
 #include <nrf54l15_regs.h>
+#include <helpers/nrf54/NRF54Rram.h>
 
 extern "C" uint32_t __app_region_start, __app_region_end, __app_image_end;
-extern "C" bool nrf54l15_rram_transaction_try_lock(void);
-extern "C" void nrf54l15_rram_transaction_unlock(void);
 
 #define APP_START    ((uint32_t)&__app_region_start)
 #define APP_END      ((uint32_t)&__app_region_end)
@@ -73,89 +72,6 @@ struct OtaState {
 #define STATE_MAGIC 0x4D435432   // "MCT2"
 
 static uint32_t runningImageSize() { return (uint32_t)&__app_image_end - APP_START; }
-
-// ---------------------------------------------------------------- RRAM writes (from flash, IRQs on)
-
-static bool rramWait(const volatile uint32_t& reg, uint32_t mask) {
-  for (uint32_t n = 1000000; n; n--) {
-    if (reg & mask) return true;
-  }
-  return false;
-}
-
-// Whole words at a word-aligned address; src NULL = fill 0xFF. The same RRAMC
-// sequence as InternalFS (arch/nrf54l/InternalFileSystem): through the write
-// buffer, one commit per 512 bytes, the buffer cleared if anything fails.
-static bool rramWriteWords(uint32_t addr, const uint32_t* src, uint32_t words) {
-  if (!nrf54l15_rram_transaction_try_lock()) return false;
-  const uint32_t prev = NRF_RRAMC->CONFIG;
-  bool ok = true;
-  if ((prev & RRAMC_CONFIG_WRITEBUFSIZE_Msk) &&
-      !(NRF_RRAMC->BUFSTATUS.WRITEBUFEMPTY & RRAMC_BUFSTATUS_WRITEBUFEMPTY_EMPTY_Msk)) {
-    NRF_RRAMC->EVENTS_READY = 0;
-    NRF_RRAMC->TASKS_COMMITWRITEBUF = 1;
-    ok = rramWait(NRF_RRAMC->READY, RRAMC_READY_READY_Msk);
-  }
-  uint32_t len = words * 4;
-  for (uint32_t done = 0; ok && done < len; ) {
-    uint32_t chunk = RRAM_WRITEBUF_BYTES - ((addr + done) % RRAM_WRITEBUF_BYTES);
-    if (chunk > len - done) chunk = len - done;
-    uint32_t lines = (((addr + done) & 0xF) + chunk + 15) / 16;
-    NRF_RRAMC->CONFIG = (prev & ~RRAMC_CONFIG_WRITEBUFSIZE_Msk) | RRAMC_CONFIG_WEN_Msk |
-                        (lines << RRAMC_CONFIG_WRITEBUFSIZE_Pos);
-    ok = rramWait(NRF_RRAMC->READY, RRAMC_READY_READY_Msk);
-    NRF_RRAMC->EVENTS_ACCESSERROR = 0;
-    for (uint32_t i = done; ok && i < done + chunk; i += 4) {
-      uint32_t w = src ? src[i / 4] : 0xFFFFFFFF;
-      ok = rramWait(NRF_RRAMC->READYNEXT, RRAMC_READYNEXT_READYNEXT_Msk);
-      if (ok) *(volatile uint32_t*)(addr + i) = w;
-    }
-    ok = ok && NRF_RRAMC->EVENTS_ACCESSERROR == 0;
-    if (ok) {
-      NRF_RRAMC->EVENTS_READY = 0;
-      NRF_RRAMC->TASKS_COMMITWRITEBUF = 1;
-      ok = rramWait(NRF_RRAMC->READY, RRAMC_READY_READY_Msk);
-    }
-    done += chunk;
-  }
-  if (!ok) {
-    NRF_RRAMC->EVENTS_READY = 0;
-    NRF_RRAMC->TASKS_CLRWRITEBUF = 1;
-    rramWait(NRF_RRAMC->READY, RRAMC_READY_READY_Msk);
-  }
-  NRF_RRAMC->EVENTS_ACCESSERROR = 0;
-  NRF_RRAMC->CONFIG = prev & ~RRAMC_CONFIG_WEN_Msk;
-  ok = rramWait(NRF_RRAMC->READY, RRAMC_READY_READY_Msk) && ok;
-  nrf54l15_rram_transaction_unlock();
-  return ok;
-}
-
-// Any address, any length (src may be RRAM itself: it is copied word by word
-// first). A partial word at either end keeps the bytes around it.
-static bool rramWrite(uint32_t addr, const uint8_t* src, uint32_t n) {
-  static uint32_t buf[64];
-  while (n) {
-    uint32_t a = addr & ~3u, lead = addr - a;
-    uint32_t take = n < sizeof(buf) - lead ? n : sizeof(buf) - lead;
-    uint32_t total = (lead + take + 3) & ~3u;
-    memcpy(buf, (const void*)a, total);   // current contents: the partial words keep their bytes
-    if (src) memcpy((uint8_t*)buf + lead, src, take);
-    else memset((uint8_t*)buf + lead, 0xFF, take);
-    if (!rramWriteWords(a, buf, total / 4)) return false;
-    if (memcmp((const void*)a, buf, total) != 0) return false;   // read back
-    addr += take; n -= take;
-    if (src) src += take;
-  }
-  return true;
-}
-
-static bool rramFill(uint32_t addr, uint32_t len) {   // "erase", whole words
-  for (uint32_t done = 0; done < len; done += PAGE) {
-    uint32_t n = len - done < PAGE ? len - done : PAGE;
-    if (!rramWriteWords(addr + done, NULL, (n + 3) / 4)) return false;
-  }
-  return true;
-}
 
 // ---------------------------------------------------------------- the install routine (RAM only)
 
@@ -277,7 +193,7 @@ static RAMFUNC __attribute__((noreturn)) void r_swap(uint32_t len, uint32_t app_
 // rewrite its first word with its own value.
 static bool settingsWritable() {
   uint32_t w = *(volatile const uint32_t*)BL_SETTINGS;
-  return rramWriteWords(BL_SETTINGS, &w, 1) && *(volatile const uint32_t*)BL_SETTINGS == w;
+  return nrf54RramWriteWords(BL_SETTINGS, &w, 1) && *(volatile const uint32_t*)BL_SETTINGS == w;
 }
 
 static void swapNow(uint32_t a_size, uint32_t b_size, uint32_t new_app_size) {
@@ -299,7 +215,7 @@ static bool loadState(OtaState& s) {
 
 static bool saveState(OtaState s) {
   s.magic = STATE_MAGIC;
-  return rramWrite(STATE_ADDR, (const uint8_t*)&s, sizeof(s));
+  return nrf54RramWrite(STATE_ADDR, (const uint8_t*)&s, sizeof(s));
 }
 
 // ---------------------------------------------------------------- staging (the slot)
@@ -322,13 +238,13 @@ public:
       if (!saveState(*st)) return false;
     }
     LORA_OTA_LOG("ota: staging %lu bytes", (unsigned long)len);
-    bool ok = rramFill(SLOT, (len + 3) & ~3u);
+    bool ok = nrf54RramFill(SLOT, (len + 3) & ~3u);
     staged_size = ok ? len : 0;
     LORA_OTA_LOG("ota: slot %s t=%lu", ok ? "cleared" : "FAILED", millis());
     return ok;
   }
   bool write(size_t off, const uint8_t* src, size_t len) override {
-    return off + len <= staged_size && rramWrite(SLOT + off, src, len);
+    return off + len <= staged_size && nrf54RramWrite(SLOT + off, src, len);
   }
   bool read(size_t off, uint8_t* dest, size_t len) override {
     if (off + len > staged_size) return false;
@@ -347,9 +263,9 @@ public:
   bool loadSession(uint8_t* h, size_t hl, uint8_t* b, size_t bl) override { return load(h, hl, b, bl); }
   void clearSession() override { clear(); }
   size_t sessSize() override { return PAGE; }
-  bool sessErase() override { return rramFill(SESS_ADDR, PAGE); }
+  bool sessErase() override { return nrf54RramFill(SESS_ADDR, PAGE); }
   bool sessWrite(size_t off, const uint8_t* src, size_t len) override {
-    return off + len <= PAGE && rramWrite(SESS_ADDR + off, src, len);
+    return off + len <= PAGE && nrf54RramWrite(SESS_ADDR + off, src, len);
   }
   bool sessRead(size_t off, uint8_t* dest, size_t len) override {
     if (off + len > PAGE) return false;
@@ -385,7 +301,7 @@ public:
   lora_ota::Status patchPrepare(size_t new_size, size_t psize) override {
     patch_size = 0;
     if (psize > PATCH_SIZE) return lora_ota::TOO_BIG;   // the sender sends it whole
-    if (!rramFill(PATCH, (psize + 3) & ~3u)) return lora_ota::FLASH_ERROR;
+    if (!nrf54RramFill(PATCH, (psize + 3) & ~3u)) return lora_ota::FLASH_ERROR;
     patch_size = psize;
     return lora_ota::OK;
   }
@@ -395,7 +311,7 @@ public:
     return true;
   }
   bool patchWrite(size_t off, const uint8_t* src, size_t len) override {
-    return off + len <= patch_size && rramWrite(PATCH + off, src, len);
+    return off + len <= patch_size && nrf54RramWrite(PATCH + off, src, len);
   }
   bool patchRead(size_t off, uint8_t* dest, size_t len) override {
     if (off + len > patch_size) return false;

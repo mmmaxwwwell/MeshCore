@@ -8,9 +8,11 @@
 //   confirm         keep the running image
 //   rollback        swap the previous image back in
 //   reset           soft reset (probation boot counting)
+//   radio ...       the board's `radio` command (radio roles map), without radios fitted
 
 #include <Arduino.h>
 #include <helpers/LoraOTAService.h>
+#include <target.h>
 
 #ifndef SELFTEST_TAG
   #define SELFTEST_TAG "A"
@@ -77,6 +79,10 @@ static void command(const char* c) {
     delay(100);
     ota->rollback();
     Serial.print("rollback RETURNED (no backup?)\r\n");
+  } else if (strncmp(c, "radio", 5) == 0) {
+    char reply[160] = "";
+    if (!board.handleCommand(c, 0, reply)) strcpy(reply, "radio: not handled");
+    Serial.printf("radio: %s\r\n", reply);
   } else if (strcmp(c, "reset") == 0) {
     Serial.flush();
     delay(100);
@@ -89,6 +95,8 @@ void setup() {
   delay(1500);
   ota = &loraOtaPlatform();
   pending = ota->begin();
+  radio_roles.saved = radio_roles.running = radioRolesLoad();   // what radio_init() would read
+  radio_roles.aux_ok = true;
   Serial.print("\r\n");
   status();
 }
