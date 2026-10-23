@@ -1,4 +1,4 @@
-# Firmware over LoRa (ESP32 and nRF52, repeaters and companions)
+# Firmware over LoRa (ESP32, nRF52 and nRF54L15, repeaters and companions)
 
 Sends a signed firmware image to a repeater over the LoRa link itself, through
 any companion radio, with automatic rollback. Design and decisions:
@@ -45,6 +45,23 @@ Per chip:
   - **Not covered:** an image that dies on every boot before the OTA service
     starts.
   - Which boards: `~/git/homelab/docs/build-notes/meshcore-lora-ota-plan.md` L8.
+- **nRF54L15** (XIAO nRF54L15 + Wio-SX1262, `src/helpers/LoraOTANrf54.cpp`):
+  no QSPI chip, so it all lives in RRAM at fixed addresses (map in
+  `arch/nrf54l/ldscripts/xiao_nrf54l15_bootloader.ld`):
+  - **Staging:** a 480 KB slot the size of the app region (`0x80000`), the
+    patch of a delta in its own 120 KB area.
+  - **Install:** no room for a new image AND a backup, so a RAM routine
+    SWAPS the app region and the slot page by page. The old image ends up in
+    the slot, which is the backup. App marked invalid in the bootloader
+    settings while it swaps (andyshinn's nRF54_Bootloader is the Adafruit
+    one ported, same rules), so a power cut lands in its DFU mode; unlike
+    nRF52 the slot is then half swapped too, so recovery is a BLE/serial DFU.
+  - **Rollback:** swap back. Staging a new image drops it (the slot is reused).
+  - RRAM overwrites (no NOR "0xFF changes nothing"): partial words are
+    read-merged-written.
+  - Proven on hardware without a radio by `examples/nrf54_ota_selftest`
+    (envs `Xiao_nrf54l15_ota_selftest_{a,b}`): swap, rollback, confirm,
+    the boot counter, and staging through the Flash API.
 
 Every request is a REQ datagram encrypted and MAC'd with the shared secret of
 an admin (repeater) or a favourite (companion), so nobody else can run a
@@ -56,6 +73,10 @@ code: you also need the signing key.
 Envs: `Heltec_v3_companion_radio_usb_lora_ota` (Rhea),
 `WioTrackerL1_companion_radio_ble_posreport_lora_ota` (Wayfarer),
 `heltec_v4_repeater_lora_ota`, `Heltec_v3_repeater_lora_ota`.
+nRF54L15: `Xiao_nrf54l15_{companion_radio_ble,repeater,room_server}_lora_ota`
+(boards `xiao_nrf54l15_{companion_ble,repeater,room_server}`), signed like nRF52
+(the objcopy'd `firmware.hex`). A new board takes `firmware-merged.hex` over SWD
+(the XIAO's onboard CMSIS-DAP) first: bootloader + SoftDevice + app.
 
 ```sh
 P='nix shell --impure --expr "with import <nixpkgs> {}; [ (python3.withPackages (p: [ p.cryptography ])) ]" -c python3'

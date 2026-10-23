@@ -8,7 +8,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#if (defined(ESP32) || defined(NRF52_PLATFORM)) && defined(LORA_OTA_PUBKEY) && defined(LORA_OTA_BOARD)
+#if (defined(ESP32) || defined(NRF52_PLATFORM) || defined(NRF54_PLATFORM)) && defined(LORA_OTA_PUBKEY) && defined(LORA_OTA_BOARD)
   #define LORA_OTA_ENABLED 1
 #endif
 

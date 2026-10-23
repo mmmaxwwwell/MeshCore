@@ -23,21 +23,37 @@ CORE_SHA256 = "f9d133328f2ad89a77bef7bf5262d6faf1a59b3e8befbf335348fc6d106ebaf5"
 # andyshinn's nRF54_Bootloader (BLE and serial DFU), plus the s145 SoftDevice it needs for BLE DFU.
 # This must stay a single-bank build: DFU then only overwrites the app, not InternalFS above it.
 BOOTLOADER_VERSION = "0.5.0"
-BOOTLOADER_FILES = {
-    "bootloader.hex": (
-        "https://github.com/andyshinn/nRF54_Bootloader/releases/download/v0.5.0/"
-        "xiao_nrf54lm20a_bootloader.hex",
-        "2926e8c5d2a8d50c65410192b47bb446f97863a02f9a55ba5006aaeb9b98befa",
-    ),
-    "softdevice.hex": (
-        "https://raw.githubusercontent.com/andyshinn/nRF54_Bootloader/v0.5.0/"
-        "lib/softdevice/s145_nrf54lm20_10.0.1/s145_nrf54lm20_10.0.1_softdevice.hex",
-        "d1d244958494b2717b7d3315526a7cb7783e0b0fd92f697cbfd186fd82feffd1",
-    ),
+BL_BASE = "https://github.com/andyshinn/nRF54_Bootloader/releases/download/v0.5.0/"
+SD_BASE = "https://raw.githubusercontent.com/andyshinn/nRF54_Bootloader/v0.5.0/lib/softdevice/"
+# Per bootloader board (the board JSON's build.bootloader): its hex, the matching s145 SoftDevice,
+# and the bootloader settings page. Leaving that page erased tells the bootloader the app was
+# flashed over SWD, so it doesn't check the CRC saved by the last DFU.
+BOOTLOADERS = {
+    "xiao_nrf54lm20a": {
+        "bootloader.hex": (
+            BL_BASE + "xiao_nrf54lm20a_bootloader.hex",
+            "2926e8c5d2a8d50c65410192b47bb446f97863a02f9a55ba5006aaeb9b98befa",
+        ),
+        "softdevice.hex": (
+            SD_BASE + "s145_nrf54lm20_10.0.1/s145_nrf54lm20_10.0.1_softdevice.hex",
+            "d1d244958494b2717b7d3315526a7cb7783e0b0fd92f697cbfd186fd82feffd1",
+        ),
+        "settings": 0x1D1000,
+    },
+    "xiao_nrf54l15": {
+        "bootloader.hex": (
+            BL_BASE + "xiao_nrf54l15_bootloader.hex",
+            "ce5bef71a8feb0e85a2af3e73b26306946550e20dde5382f3e4e409727cca805",
+        ),
+        "softdevice.hex": (
+            SD_BASE + "s145_nrf54l15_10.0.1/s145_nrf54l15_10.0.1_softdevice.hex",
+            "fe6fef44a7cf99dd10e3b0dc8ac65389f45f77b6762b2deb893d4691cdbba69d",
+        ),
+        "settings": 0x14F000,
+    },
 }
-# Bootloader settings page. Leaving it erased tells the bootloader the app was flashed over SWD,
-# so it doesn't check the CRC saved by the last DFU.
-SETTINGS_PAGE = 0x1D1000
+BOOTLOADER = BOOTLOADERS[board.get("build.bootloader", "xiao_nrf54lm20a")]
+SETTINGS_PAGE = BOOTLOADER["settings"]
 
 
 def sha256(path):
@@ -102,9 +118,9 @@ env["NRF54_CORE_DIR"] = core_dir()
 
 
 def bootloader_file(name):
-    root = os.path.join(env.subst("$PROJECT_PACKAGES_DIR"), "nrf54-bootloader-" + BOOTLOADER_VERSION)
+    root = os.path.join(env.subst("$PROJECT_PACKAGES_DIR"), "nrf54-bootloader-%s-%s" % (BOOTLOADER_VERSION, board.get("build.bootloader", "xiao_nrf54lm20a")))
     path = os.path.join(root, name)
-    url, expected = BOOTLOADER_FILES[name]
+    url, expected = BOOTLOADER[name]
     if os.path.isfile(path) and sha256(path) == expected:
         return path
     print("Fetching %s" % url)

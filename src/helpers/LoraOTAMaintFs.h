@@ -22,7 +22,7 @@ protected:
   FILESYSTEM* _fs[2];
 
   static File openRead(FILESYSTEM* fs, const char* path) {
-#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+#if defined(NRF52_PLATFORM) || defined(NRF54_PLATFORM) || defined(STM32_PLATFORM)
     return fs->open(path, FILE_O_READ);
 #elif defined(RP2040_PLATFORM)
     return fs->open(path, "r");
@@ -31,7 +31,7 @@ protected:
 #endif
   }
   static File openWrite(FILESYSTEM* fs, const char* path) {
-#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+#if defined(NRF52_PLATFORM) || defined(NRF54_PLATFORM) || defined(STM32_PLATFORM)
     fs->remove(path);
     return fs->open(path, FILE_O_WRITE);
 #elif defined(RP2040_PLATFORM)
@@ -40,7 +40,7 @@ protected:
     return fs->open(path, "w", true);
 #endif
   }
-#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+#if defined(NRF52_PLATFORM) || defined(NRF54_PLATFORM) || defined(STM32_PLATFORM)
   static int countBlock(void* p, lfs_block_t block) {
     (void)block;
     *(lfs_size_t*)p += 1;
@@ -55,7 +55,7 @@ public:
 
   bool storage(int f, uint32_t& used_kb, uint32_t& total_kb) override {
     if (!hasFs(f)) return false;
-#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+#if defined(NRF52_PLATFORM) || defined(NRF54_PLATFORM) || defined(STM32_PLATFORM)
     lfs_t* l = _fs[f]->_getFS();
     if (!l || !l->cfg) return false;
     lfs_size_t blocks = 0;

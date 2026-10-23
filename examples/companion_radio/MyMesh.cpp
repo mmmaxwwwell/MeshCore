@@ -875,7 +875,7 @@ public:
   }
   bool saveState(const uint8_t* buf, size_t len) override {
     FILESYSTEM* fs = _m->_store->getPrimaryFS();
-#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+#if defined(NRF52_PLATFORM) || defined(NRF54_PLATFORM) || defined(STM32_PLATFORM)
     fs->remove(OTA_SETTINGS_FILE);
     File f = fs->open(OTA_SETTINGS_FILE, FILE_O_WRITE);
 #elif defined(RP2040_PLATFORM)
@@ -2470,7 +2470,7 @@ void MyMesh::handleCmdFrame(size_t len) {
 
 #ifdef OVERLAY_MESH
 static File overlayOpenWrite(FILESYSTEM* fs, const char* filename) {
-#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+#if defined(NRF52_PLATFORM) || defined(NRF54_PLATFORM) || defined(STM32_PLATFORM)
   fs->remove(filename);
   return fs->open(filename, FILE_O_WRITE);
 #elif defined(RP2040_PLATFORM)
@@ -2540,7 +2540,7 @@ void MyMesh::handleOverlayCmd(size_t len) {
 
 #ifdef POSITION_REPORT
 static File posrepOpenWrite(FILESYSTEM* fs, const char* filename) {
-#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+#if defined(NRF52_PLATFORM) || defined(NRF54_PLATFORM) || defined(STM32_PLATFORM)
   fs->remove(filename);
   return fs->open(filename, FILE_O_WRITE);
 #elif defined(RP2040_PLATFORM)

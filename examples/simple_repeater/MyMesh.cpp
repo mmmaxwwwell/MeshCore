@@ -238,7 +238,7 @@ public:
 #define OTA_SETTINGS_FILE      "/ota_settings"
 #define OTA_SETTINGS_REGIONS   "/ota_set_regions"
 static File otaSettingsOpenWrite(FILESYSTEM* fs, const char* filename) {
-#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+#if defined(NRF52_PLATFORM) || defined(NRF54_PLATFORM) || defined(STM32_PLATFORM)
   fs->remove(filename);
   return fs->open(filename, FILE_O_WRITE);
 #elif defined(RP2040_PLATFORM)
