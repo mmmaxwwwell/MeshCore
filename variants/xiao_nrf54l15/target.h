@@ -14,4 +14,12 @@ extern VolatileRTCClock rtc_clock;
 extern SensorManager sensors;
 
 bool radio_init();
+
+#ifdef P_LORA2_NSS
+// A second SX1262, owned by whatever the app builds on it (not MeshCore's radio):
+// initialised by radio_init() after radio 1, then left in standby. Optional:
+// radio2_ok is false if it did not answer, and radio 1 still runs.
+extern SX1262 radio2;
+extern bool radio2_ok;
+#endif
 mesh::LocalIdentity radio_new_identity();
