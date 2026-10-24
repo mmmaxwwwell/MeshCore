@@ -328,10 +328,10 @@ Known gaps:
 | Build | Flash | RAM |
 |---|---|---|
 | `WioTrackerL1_companion_radio_ble` | 405,044 | 148,576 |
-| `..._findhub` (CryptoCell EC) | 428,380 (+23,336) | 154,344 (+5,768) |
-| `..._findhub_swec` (micro-ecc EC) | 438,804 (+33,760) | 150,904 (+2,328) |
+| `..._findhub` (CryptoCell EC) | 428,028 (+22,984) | 154,344 (+5,768) |
+| `..._findhub_swec` (micro-ecc EC) | 439,972 (+34,928) | 150,904 (+2,328) |
 
-The CryptoCell build is 10-12 KB smaller (micro-ecc's P-256 and secp160r1
+The CryptoCell build is 12 KB smaller (micro-ecc's P-256 and secp160r1
 tables go) and keeps the CPU free: Key-based Pairing answers in 84 ms over the
 air, including the ECDH. Its RAM cost is CC310's static work buffers. Headroom
 left: about 280 KB flash, 81 KB RAM.
