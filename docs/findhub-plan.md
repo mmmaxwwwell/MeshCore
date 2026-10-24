@@ -1,5 +1,10 @@
 # Find Hub (native Fast Pair + FHN) on the nRF52840 companion
 
+**Status 2026-10-24: implemented (phases 1-5), proven on Rover against a
+seeker emulator; not yet tried with a real Android phone.** Results, measured
+costs and the phone test plan are in sections 6-8 at the end; sections 1-5
+are the plan as approved.
+
 Goal: an L1 BLE companion that pairs with Fast Pair from an Android phone, shows
 up in the Find Hub app, rings from it, and gets crowd location reports, with no
 off-device provisioning or periodic re-registration.
@@ -261,3 +266,126 @@ baseline table above, the native tests green, and a commit.
   per-connection security override.
 - CC310 secp160r1 domain correctness (D1) is caught by the self-test before
   anything goes on air.
+
+## 6. What was built (and where it differs from the plan)
+
+Commits on `companion-v1.18.0-findhub`: `4d97ff8f` (portable core + tests),
+`9508870b` (nRF52 glue, scheduler, UI), `5e0d947a` (fixes from the first
+on-device run).
+
+- `helpers/findhub/FastPair`: Key-based Pairing (initial pairing with the
+  anti-spoofing key, later ones with an account key), Passkey, Account Key,
+  5-key LRU list that keeps the owner key, 10-failure lockout for 5 min,
+  replayed-request check, discoverable / not-discoverable payloads.
+- `helpers/findhub/FindHubBeacon`: Beacon Actions against the account-key
+  list; owner = the first key ever written; first Set EIK without a hash; Read
+  EIK (0x04) with the recovery key, only inside the consent window; Clear EIK
+  is a factory reset (spec, locator tags).
+- `helpers/findhub/FindHub`: the locator-tag policy and the frame/address plan
+  (section 3, phases 2 and 4).
+- `nrf52/FindHubService`: GATT (0xFE2C: Model ID, KBP, Passkey, Account Key,
+  Beacon Actions; DIS Firmware Revision gated as the spec asks), InternalFS
+  (`/fh_ak`, `/fh_eik`, `/fh_clk`, `/fh_boot`), the beacon clock, the boot EC
+  self-test.
+- `nrf52/SerialBLEInterface`: the advertising scheduler (companion 900 ms on
+  the identity address, Fast Pair 600 ms and FHN 500 ms on the tag address).
+- Companion `CMD_FINDHUB`: status (new layout), 0x05 pair, 0x03 clear, 0x04
+  ring; 0x02 provision removed (D3).
+- UI: a "Find Hub" home page (owner, mid-implementation): Enter registers
+  (pairing mode, 10 min) or cancels; when registered, Enter twice removes it
+  (factory reset). This replaces D5's triple-click, which the L1 already uses
+  for the buzzer. Removing on the device stops the beacon and wipes its keys;
+  the entry in the owner's Find Hub app goes away only when removed there.
+- Clock (D4): a counter from the first boot, saved hourly and at provisioning.
+  GPS time sync is gone. After a reboot the clock resumes from the last save
+  (measured on Rover: 131 s behind after a reboot 130 s after the last save),
+  and the tag sends not-discoverable Fast Pair frames until the owner's phone
+  reads the beacon parameters, which is how Android re-synchronises
+  (throttled by the phone to once a day).
+- Addresses: random static addresses (`sd_ble_gap_addr_set`), not NRPAs. The
+  SoftDevice only takes private addresses through its privacy mode, which
+  would move the companion's address too. An address that changes with every
+  EID is just as unlinkable on air.
+- Existing bonds are unaffected: Bluefruit never distributes an identity key
+  (`keys_own.p_id_key = NULL`), so a phone keeps the address it bonded on: the
+  companion advert's, which stays the factory identity address.
+
+Known gaps:
+- Passkey characteristic: implemented and tested in the portable layer, but
+  the bonding flow cannot run on Bluefruit (it answers numeric comparison
+  inside its own event handler, and the companion's IO capabilities are
+  display-only). Only the no-bonding flow works, which is what locator tags
+  (and the Nordic debug model, "Data-Only connection") use.
+- DULT accessory non-owner service, precision finding, personalized name: not
+  implemented. DULT is required for certification, not for the debug model.
+- "Bluetooth off" in the UI turns the Find Hub beacon off too (one radio switch).
+- While any phone is connected (the companion app included) FHN frames are
+  non-connectable, as asked: the Find Hub app cannot ring the tag then.
+  The companion command (`ring --companion`) still works.
+
+## 7. Measured (Wio Tracker L1, nRF52840)
+
+| Build | Flash | RAM |
+|---|---|---|
+| `WioTrackerL1_companion_radio_ble` | 405,044 | 148,576 |
+| `..._findhub` (CryptoCell EC) | 428,380 (+23,336) | 154,344 (+5,768) |
+| `..._findhub_swec` (micro-ecc EC) | 438,804 (+33,760) | 150,904 (+2,328) |
+
+The CryptoCell build is 10-12 KB smaller (micro-ecc's P-256 and secp160r1
+tables go) and keeps the CPU free: Key-based Pairing answers in 84 ms over the
+air, including the ECDH. Its RAM cost is CC310's static work buffers. Headroom
+left: about 280 KB flash, 81 KB RAM.
+
+Tests: `pio test -e native_findhub`, 39 cases. They include every applicable
+case of Google's "Cryptographic Test Cases" (SHA-256, AES-128, ECDH, the AES
+key from ECDH, the account key filter with and without battery data, AES-CTR
++ HMAC additional data) and a full Seeker<->Provider walk on the spec's
+Alice/Bob keys.
+
+On Rover, using a seeker emulator on enceladus (bleak; the debug model's
+anti-spoofing key; homelab `fhn.py` for EIDs):
+- the boot self-test passes on the CryptoCell;
+- the discoverable frame (Model ID `4a436b`, TX power) is on air, and Model ID
+  and Firmware Revision read back;
+- the KBP response is valid; the account key is accepted; beacon parameters
+  come back encrypted with it; the owner flag is set; Set EIK is accepted;
+- the FHN frame on air resolves to the EIK (frame type 0x40, hashed flags =
+  battery normal);
+- ring: started, then stopped (timeout), both notifications authenticated;
+- Read EIK: ATT 0x82 without consent; the right EIK inside the consent window;
+- after a reboot: still provisioned, the clock resumes, the not-discoverable
+  frame carries the right account key filter, and a clock read ends it;
+- the companion protocol still works (meshcore-cli `infos`, contacts,
+  channels), and LoRa adverts keep arriving.
+
+## 8. Test with an Android phone
+
+Prerequisites (owner):
+- The Google account on the phone must be on Google's FHN allowlist for debug
+  models: Nordic's README says FHN provisioning of the debug model fails
+  otherwise. Request it through the device proposal form linked from the FHN
+  spec. The Fast Pair half-sheet itself shows without it.
+- Settings → Google → Devices & sharing → Devices → "Include debug results" on.
+- Find Hub app installed; Bluetooth and location on.
+
+Steps:
+1. Flash: `pio run -e WioTrackerL1_companion_radio_ble_findhub`, then copy
+   `firmware.uf2` (from `bin/uf2conv/uf2conv.py -f 0xADA52840 -c firmware.hex`)
+   onto the bootloader drive.
+2. On the tracker: home pages → "Find Hub" → Enter ("pairing: open phone").
+   Or `nix run .#meshcore-findhub -- pair --address <ble>` from enceladus.
+3. Phone near the tracker: the half-sheet "NCS locator tag" (debug) appears →
+   Connect → accept the Find Hub terms. The tracker page goes "adding to Find
+   Hub.." then "registered"; `meshcore-findhub status` shows provisioned, 1
+   account key and `key-based pairing 1 ok`.
+4. Find Hub app: the device is listed. "Play sound": the tracker rings until
+   stopped, the timeout runs out, or any key is pressed.
+5. Crowd report: leave the owner's phone behind, carry the tracker past other
+   Android phones (Find Hub network on, "high-traffic areas" or "all areas"),
+   ideally in a busy place. A location shows up in Find Hub, often after
+   15-60 min.
+6. Power-cycle the tracker: it comes back "registered", and the owner's phone
+   re-syncs its clock the next time it is near (the status shows "waiting for
+   the owner's phone" until then).
+7. Remove: in the Find Hub app (removes it from the account), then on the
+   tracker Enter twice on the Find Hub page (or `meshcore-findhub clear`).
