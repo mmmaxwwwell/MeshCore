@@ -233,6 +233,7 @@ void SerialBLEInterface::begin(const char* prefix, char* name, uint32_t pin_code
 #endif
 
   setCompanionAdvData();
+  BLE_DEBUG_PRINTLN("begin: services registered");
 
 #ifdef WITH_FINDHUB
   // The scheduler owns advertising: no restarts from Bluefruit's BLE task.
@@ -280,7 +281,11 @@ void SerialBLEInterface::startAdvSlot(AdvSlot slot, const uint8_t* data, uint8_t
   _adv_slot_started = millis();
   if (slot == ADV_NONE) return;
 
-  if (!setAddress(slot == ADV_COMPANION ? NULL : addr)) {
+  bool addr_ok = setAddress(slot == ADV_COMPANION ? NULL : addr);
+#ifdef FINDHUB_DEBUG
+  if (!addr_ok) Serial.printf("findhub: addr_set failed slot=%d\n", slot);
+#endif
+  if (!addr_ok) {
     // Could not move off the identity address: never send a tag frame on it.
     if (slot != ADV_COMPANION) { _adv_slot = ADV_NONE; return; }
   }
@@ -302,7 +307,18 @@ void SerialBLEInterface::startAdvSlot(AdvSlot slot, const uint8_t* data, uint8_t
                                             : BLE_GAP_ADV_TYPE_NONCONNECTABLE_NONSCANNABLE_UNDIRECTED);
   Bluefruit.Advertising.setInterval(interval, interval);
   if (findhub_service) findhub_service->noteAdvAddress(_current_addr.addr);
-  Bluefruit.Advertising.start(0);
+  bool started = Bluefruit.Advertising.start(0);
+#ifdef FINDHUB_DEBUG
+  static unsigned long last_print = 0;
+  if (!started || millis() - last_print > 5000) {
+    last_print = millis();
+    Serial.printf("findhub: slot=%d conn=%d started=%d len=%d addr=%02X:%02X:%02X:%02X:%02X:%02X links=%d\n", slot, connectable,
+                  started, len, _current_addr.addr[5], _current_addr.addr[4], _current_addr.addr[3], _current_addr.addr[2],
+                  _current_addr.addr[1], _current_addr.addr[0], Bluefruit.Periph.connected());
+  }
+#else
+  (void)started;
+#endif
 }
 
 void SerialBLEInterface::advertisingTick() {

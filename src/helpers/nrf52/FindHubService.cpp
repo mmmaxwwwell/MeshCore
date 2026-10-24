@@ -9,11 +9,14 @@ using namespace findhub;
 FindHubService* findhub_service = nullptr;
 static uint32_t* sd_err_sink = nullptr;
 
-// FE2C12xx-8366-4814-8EB0-01DE32100BEA (little-endian for Bluefruit); byte 12 = xx.
-static BLEUuid fpUuid(uint8_t xx) {
-  uint8_t u[16] = { 0xEA, 0x0B, 0x10, 0x32, 0xDE, 0x01, 0xB0, 0x8E, 0x14, 0x48, 0x66, 0x83, xx, 0x12, 0x2C, 0xFE };
-  return BLEUuid(u);
-}
+// FE2C12xx-8366-4814-8EB0-01DE32100BEA (little-endian for Bluefruit). Static:
+// BLEUuid keeps a pointer to the array, not a copy.
+#define FP_UUID(xx) { 0xEA, 0x0B, 0x10, 0x32, 0xDE, 0x01, 0xB0, 0x8E, 0x14, 0x48, 0x66, 0x83, xx, 0x12, 0x2C, 0xFE }
+static const uint8_t UUID_MODEL_ID[16] = FP_UUID(0x33);
+static const uint8_t UUID_KBP[16] = FP_UUID(0x34);
+static const uint8_t UUID_PASSKEY[16] = FP_UUID(0x35);
+static const uint8_t UUID_ACCOUNT_KEY[16] = FP_UUID(0x36);
+static const uint8_t UUID_BEACON_ACTIONS[16] = FP_UUID(0x38);
 static const uint16_t FAST_PAIR_SERVICE_UUID = 0xFE2C;
 static const uint16_t DIS_UUID = 0x180A;
 static const uint16_t FW_REV_UUID = 0x2A26;
@@ -52,8 +55,8 @@ static FastPairConfig makeConfig() {
 }
 
 FindHubService::FindHubService()
-  : _svc(FAST_PAIR_SERVICE_UUID), _model_id(fpUuid(0x33)), _kbp(fpUuid(0x34)), _passkey(fpUuid(0x35)),
-    _account_key(fpUuid(0x36)), _beacon_chr(fpUuid(0x38)), _dis(DIS_UUID), _fw_rev(FW_REV_UUID),
+  : _svc(FAST_PAIR_SERVICE_UUID), _model_id(UUID_MODEL_ID), _kbp(UUID_KBP), _passkey(UUID_PASSKEY),
+    _account_key(UUID_ACCOUNT_KEY), _beacon_chr(UUID_BEACON_ACTIONS), _dis(DIS_UUID), _fw_rev(FW_REV_UUID),
     _fw_version("unknown"), _cfg(makeConfig()), _hub(*this, _cfg), _board(nullptr), _ring_cb(nullptr),
     _q_head(0), _q_tail(0), _started(false), _clock_s(0), _clock_ms_acc(0), _clock_last_ms(0), _clock_saved(0) {
   memset(&_stats, 0, sizeof(_stats));
@@ -61,10 +64,40 @@ FindHubService::FindHubService()
   findhub_service = this;
 }
 
+// Known-answer test of the elliptic-curve backend (the CryptoCell's domain IDs
+// are only trusted once they reproduce these): Fast Pair's ECDH test case and the
+// FHN EID of EIK 00..1f at clock 0 (test/test_findhub).
+static bool selfTest() {
+  static const uint8_t bob[32] = {
+    0x02, 0xB4, 0x37, 0xB0, 0xED, 0xD6, 0xBB, 0xD4, 0x29, 0x06, 0x4A, 0x4E, 0x52, 0x9F, 0xCB, 0xF1,
+    0xC4, 0x8D, 0x0D, 0x62, 0x49, 0x24, 0xD5, 0x92, 0x27, 0x4B, 0x7E, 0xD8, 0x11, 0x93, 0xD7, 0x63};
+  static const uint8_t alice_pub[64] = {
+    0x36, 0xAC, 0x68, 0x2C, 0x50, 0x82, 0x15, 0x66, 0x8F, 0xBE, 0xFE, 0x24, 0x7D, 0x01, 0xD5, 0xEB,
+    0x96, 0xE6, 0x31, 0x8E, 0x85, 0x5B, 0x2D, 0x64, 0xB5, 0x19, 0x5D, 0x38, 0xEE, 0x7E, 0x37, 0xBE,
+    0x18, 0x38, 0xC0, 0xB9, 0x48, 0xC3, 0xF7, 0x55, 0x20, 0xE0, 0x7E, 0x70, 0xF0, 0x72, 0x91, 0x41,
+    0x9A, 0xCE, 0x2D, 0x28, 0x14, 0x3C, 0x5A, 0xDB, 0x2D, 0xBD, 0x98, 0xEE, 0x3C, 0x8E, 0x4F, 0xBF};
+  static const uint8_t shared_head[4] = { 0x9D, 0xAD, 0xE4, 0xF8 };
+  static const uint8_t eid_head[4] = { 0xe6, 0xce, 0xc9, 0xca };
+  uint8_t s[32], eik[32], eid[20];
+  bool ok = ecdhP256(bob, alice_pub, s) && memcmp(s, shared_head, 4) == 0;
+  for (int i = 0; i < 32; i++) eik[i] = (uint8_t)i;
+  ok = computeEid(eik, 0, eid, NULL) && memcmp(eid, eid_head, 4) == 0 && ok;
+  return ok;
+}
+
 void FindHubService::begin(mesh::MainBoard* board, const char* fw_version) {
   _board = board;
   if (fw_version) _fw_version = fw_version;
+#ifdef FINDHUB_DEBUG
+  for (unsigned long t = ::millis(); !Serial && ::millis() - t < 15000; ) delay(10);
+  Serial.println("findhub: begin");
+#endif
+  _selftest_ok = selfTest();
+  Serial.printf("findhub: ec self-test %s\n", _selftest_ok ? "ok" : "FAILED");
   loadState();
+#ifdef FINDHUB_DEBUG
+  Serial.printf("findhub: state=%d keys=%u clock=%lu\n", _hub.state(), (unsigned)_hub.fastPair().keyCount(), (unsigned long)_clock_s);
+#endif
 }
 
 void FindHubService::loadState() {
@@ -167,14 +200,20 @@ bool FindHubService::saveEik(const uint8_t* eik) {
   return ok;
 }
 
+#ifdef FINDHUB_DEBUG
+  #define GATT_STEP(x) do { err_t e = (x); Serial.printf("findhub: gatt %s -> %d\n", #x, (int)e); } while (0)
+#else
+  #define GATT_STEP(x) (x)
+#endif
+
 void FindHubService::beginGatt() {
   sd_err_sink = &_stats.last_sd_err;
-  _svc.begin();
+  GATT_STEP(_svc.begin());
 
   _model_id.setProperties(CHR_PROPS_READ);
   _model_id.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
   _model_id.setFixedLen(MODEL_ID_LEN);
-  _model_id.begin();
+  GATT_STEP(_model_id.begin());
   _model_id.write(_cfg.model_id, MODEL_ID_LEN);
 
   // Spec: none of these is encrypted. Writes are authorised so the answer (and
@@ -184,22 +223,25 @@ void FindHubService::beginGatt() {
     bool notify = c != &_account_key;
     bool read = c == &_beacon_chr;
     c->setProperties(CHR_PROPS_WRITE | (notify ? CHR_PROPS_NOTIFY : 0) | (read ? CHR_PROPS_READ : 0));
-    c->setPermission(read ? SECMODE_OPEN : SECMODE_NO_ACCESS, SECMODE_OPEN);
+    // Read permission open even without the READ property: Bluefruit gives the
+    // CCCD the value's read permission, and a no-access CCCD is rejected
+    // (NRF_ERROR_INVALID_PARAM). Without the property the value stays unreadable.
+    c->setPermission(SECMODE_OPEN, SECMODE_OPEN);
     c->setMaxLen(c == &_kbp ? FP_BLOCK + P256_PUB_LEN : 64);
     c->setWriteAuthorizeCallback(onWriteAuth, false);    // run on the BLE task, just queue
     c->setWriteCallback(onLongWrite, false);
     if (read) c->setReadAuthorizeCallback(onReadAuth, false);
-    c->begin();
+    GATT_STEP(c->begin());
   }
 
   // Firmware Revision (Seekers read it during pairing and once a day after).
   // Spec: readable while discoverable or after an authenticated Beacon Actions op.
-  _dis.begin();
+  GATT_STEP(_dis.begin());
   _fw_rev.setProperties(CHR_PROPS_READ);
   _fw_rev.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
   _fw_rev.setMaxLen(32);
   _fw_rev.setReadAuthorizeCallback(onReadAuth, false);
-  _fw_rev.begin();
+  GATT_STEP(_fw_rev.begin());
 }
 
 FindHubService::Chr FindHubService::chrOf(BLECharacteristic* c) const {
@@ -383,10 +425,33 @@ void FindHubService::loop() {
   }
   _hub.loop();
   persistClock(false);
+#ifdef FINDHUB_DEBUG
+  static unsigned long last = 0;
+  if (::millis() - last > 5000) {
+    last = ::millis();
+    Serial.printf("findhub: selftest=%d state=%d keys=%u clock=%lu kbp=%u/%u ak=%u/%u sd_err=%lx q=%u\n", _selftest_ok,
+                  _hub.state(), (unsigned)_hub.fastPair().keyCount(), (unsigned long)beaconClock(), _stats.kbp_ok,
+                  _stats.kbp_fail, _stats.ak_ok, _stats.ak_fail, (unsigned long)_stats.last_sd_err, _stats.queue_full);
+  }
+#endif
 }
 
 void FindHubService::randomBytes(uint8_t* dest, size_t len) {
-  // SoftDevice TRNG pool; fall back to waiting for it to refill.
+  uint8_t sd_on = 0;
+  sd_softdevice_is_enabled(&sd_on);
+  if (!sd_on) {
+    // begin() runs before Bluefruit.begin(): the RNG peripheral is still ours.
+    NRF_RNG->CONFIG = RNG_CONFIG_DERCEN_Msk;       // bias correction
+    NRF_RNG->TASKS_START = 1;
+    for (size_t i = 0; i < len; i++) {
+      NRF_RNG->EVENTS_VALRDY = 0;
+      while (!NRF_RNG->EVENTS_VALRDY) {}
+      dest[i] = (uint8_t)NRF_RNG->VALUE;
+    }
+    NRF_RNG->TASKS_STOP = 1;
+    return;
+  }
+  // SoftDevice TRNG pool; wait for it to refill when empty.
   while (len > 0) {
     uint8_t avail = 0;
     sd_rand_application_bytes_available_get(&avail);

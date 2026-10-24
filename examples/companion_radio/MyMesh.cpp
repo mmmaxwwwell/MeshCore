@@ -2087,14 +2087,14 @@ void MyMesh::handleFindHubCmd(size_t len) {
   uint8_t op = cmd_frame[1];
   if (op == FINDHUB_OP_STATUS) {
     // A0 01 | state (0 idle, 1 pairing, 2 awaiting EIK, 3 provisioned) | flags
-    // (1 pairing mode, 2 consent, 4 clock sync pending, 8 UTP, 16 ringing) |
+    // (1 pairing mode, 2 consent, 4 clock sync pending, 8 UTP, 16 ringing, 32 EC self-test FAILED) |
     // account keys | beacon clock (u32 LE) | eid[20] (zeros unprovisioned)
     int i = 0;
     out_frame[i++] = RESP_CODE_FINDHUB_STATUS;
     out_frame[i++] = FINDHUB_OP_STATUS;
     out_frame[i++] = hub.state();
     out_frame[i++] = (hub.pairingMode() ? 1 : 0) | (hub.consentOpen() ? 2 : 0) | (hub.clockSyncPending() ? 4 : 0) |
-                     (b.utpMode() ? 8 : 0) | (b.isRinging() ? 16 : 0);
+                     (b.utpMode() ? 8 : 0) | (b.isRinging() ? 16 : 0) | (findhub_service->selfTestOk() ? 0 : 32);
     out_frame[i++] = (uint8_t)hub.fastPair().keyCount();
     uint32_t v = b.clock();                         memcpy(&out_frame[i], &v, 4); i += 4;
     uint8_t adv[findhub::ADV_FRAME_LEN];

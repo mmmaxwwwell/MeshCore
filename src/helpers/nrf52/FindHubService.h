@@ -60,6 +60,7 @@ public:
     uint16_t kbp_ok, kbp_fail, ak_ok, ak_fail;
   };
   const Stats& stats() const { return _stats; }
+  bool selfTestOk() const { return _selftest_ok; }
 
   // FindHubPlatform
   void randomBytes(uint8_t* dest, size_t len) override;
@@ -106,6 +107,7 @@ private:
 
   uint8_t _adv_addr[2][findhub::ADDR_LEN];   // [0] = current, [1] = previous
   bool _started;
+  bool _selftest_ok = false;
 
   // beacon clock: seconds, persisted, counts from the first boot
   uint32_t _clock_s;
