@@ -22,12 +22,15 @@ static const uint8_t RING_COMPONENTS = 1;      // one buzzer
 static const uint8_t UTP_FLAG_SKIP_RING_AUTH = 0x01;
 static const uint8_t PROV_FLAG_EIK_SET = 0x01;
 static const uint8_t PROV_FLAG_OWNER = 0x02;
-static const uint32_t MIN_PLAUSIBLE_UNIX = 1735689600UL;  // 2025-01-01
+static const size_t EIK_HASH_LEN = 8;
 
-FindHubBeacon::FindHubBeacon(FindHubPlatform& platform) : _p(platform) {
+FindHubBeacon::FindHubBeacon(FindHubPlatform& platform, FastPairProvider& fp) : _p(platform), _fp(fp) {
   _provisioned = false;
-  memset(&_prov, 0, sizeof(_prov));
+  memset(_eik, 0, sizeof(_eik));
   memset(_conns, 0, sizeof(_conns));
+  _consent = false;
+  _clock_read = false;
+  _prov_changed = false;
   _eid_valid = false;
   _eid_window = 0;
   memset(_eid, 0, sizeof(_eid));
@@ -45,48 +48,33 @@ FindHubBeacon::FindHubBeacon(FindHubPlatform& platform) : _p(platform) {
   _last_status = 0xFF;
 }
 
-void FindHubBeacon::load(const Provisioning* p) {
-  if (p) {
-    _prov = *p;
-    _provisioned = true;
-  } else {
-    memset(&_prov, 0, sizeof(_prov));
-    _provisioned = false;
-  }
+void FindHubBeacon::load(const uint8_t* eik) {
+  if (eik) memcpy(_eik, eik, EIK_LEN);
+  else memset(_eik, 0, EIK_LEN);
+  _provisioned = eik != NULL;
+  _utp = false;
+  _utp_skip_ring_auth = false;
   invalidateEid();
 }
 
-bool FindHubBeacon::provision(const Provisioning& p) {
-  if (!_p.saveProvisioning(&p)) return false;
-  load(&p);
-  _utp = false;
-  _utp_skip_ring_auth = false;
+bool FindHubBeacon::setEik(const uint8_t* eik) {
+  if (!_p.saveEik(eik)) return false;
+  load(eik);
+  _prov_changed = true;
   return true;
 }
 
-bool FindHubBeacon::clear() {
-  if (!_p.saveProvisioning(NULL)) return false;
+bool FindHubBeacon::factoryReset() {
   if (isRinging()) stopRing(RING_STOPPED_GATT);
-  load(NULL);
-  _utp = false;
-  _utp_skip_ring_auth = false;
-  return true;
-}
-
-bool FindHubBeacon::clockValid() {
-  if (!_provisioned) return false;
-  uint32_t now = _p.unixTime();
-  return now >= MIN_PLAUSIBLE_UNIX && now >= _prov.pair_date;
-}
-
-uint32_t FindHubBeacon::counter() {
-  return clockValid() ? _p.unixTime() - _prov.pair_date : 0;
+  bool ok = setEik(NULL);
+  ok = _fp.factoryReset() && ok;
+  return ok;
 }
 
 bool FindHubBeacon::ensureEid(uint32_t adv_counter) {
   uint32_t window = adv_counter >> ROTATION_EXP;
   if (_eid_valid && window == _eid_window) return true;
-  _eid_valid = computeEid(_prov.eik, adv_counter, _eid, &_hash_xor);
+  _eid_valid = computeEid(_eik, adv_counter, _eid, &_hash_xor);
   _eid_window = window;
   return _eid_valid;
 }
@@ -98,8 +86,8 @@ uint8_t FindHubBeacon::hashedFlags() {
 }
 
 size_t FindHubBeacon::buildAdvert(uint8_t out[ADV_FRAME_LEN]) {
-  if (!clockValid()) return 0;
-  uint32_t c = counter();
+  if (!_provisioned) return 0;
+  uint32_t c = clock();
 
   // The switch to a new EID is delayed by a random 1..204 s past each window
   // boundary (spec "ID rotation"). Until then the previous window's EID stays.
@@ -142,6 +130,7 @@ void FindHubBeacon::onDisconnect(uint8_t conn) {
 uint8_t FindHubBeacon::onWrite(uint8_t conn, const uint8_t* buf, size_t len, uint8_t rsp[MAX_NOTIFY_LEN], size_t* rsp_len) {
   _last_op = len ? buf[0] : 0xFE;
   _last_status = dispatch(conn, buf, len, rsp, rsp_len);
+  if (_last_status == ATT_OK && conn < MAX_CONN) _conns[conn].authed = true;
   return _last_status;
 }
 
@@ -165,7 +154,7 @@ uint8_t FindHubBeacon::dispatch(uint8_t conn, const uint8_t* buf, size_t len, ui
     case ID_PROVISIONING_STATE: return opProvisioningState(conn, payload, data_len, rsp, rsp_len);
     case ID_SET_EIK:            return opSetEik(conn, payload, data_len, rsp, rsp_len);
     case ID_CLEAR_EIK:          return opClearEik(conn, payload, data_len, rsp, rsp_len);
-    case ID_READ_EIK:           return ATT_NO_USER_CONSENT;   // recovery mode not implemented
+    case ID_READ_EIK:           return opReadEik(conn, payload, data_len, rsp, rsp_len);
     case ID_RING:               return opRing(conn, payload, data_len, rsp, rsp_len);
     case ID_RING_STATE:         return opRingState(conn, payload, data_len, rsp, rsp_len);
     case ID_UTP_ON:
@@ -182,6 +171,15 @@ static bool authOk(const uint8_t* key, size_t key_len, const uint8_t nonce[NONCE
   return equalCT(expect, payload, AUTH_LEN);
 }
 
+// The account key whose one-time authentication key this request carries.
+const uint8_t* FindHubBeacon::matchAccountKey(const uint8_t nonce[NONCE_LEN], uint8_t id, const uint8_t* p, size_t n, bool hash_add) {
+  for (size_t i = 0; i < _fp.keyCount(); i++) {
+    const uint8_t* k = _fp.key(i);
+    if (authOk(k, AK_LEN, nonce, id, p, n, hash_add)) return k;
+  }
+  return NULL;
+}
+
 size_t FindHubBeacon::buildResponse(uint8_t* rsp, uint8_t data_id, const uint8_t* key, size_t key_len,
                                     const uint8_t nonce[NONCE_LEN], const uint8_t* add, size_t add_len) {
   rsp[0] = data_id;
@@ -193,12 +191,13 @@ size_t FindHubBeacon::buildResponse(uint8_t* rsp, uint8_t data_id, const uint8_t
 
 uint8_t FindHubBeacon::opBeaconParams(uint8_t conn, const uint8_t* p, size_t n, uint8_t* rsp, size_t* rsp_len) {
   if (n != AUTH_LEN) return ATT_INVALID_VALUE;
-  if (!_provisioned || !authOk(_prov.ak, AK_LEN, _conns[conn].nonce, ID_BEACON_PARAMS, p, n, false))
-    return ATT_UNAUTHENTICATED;
+  const uint8_t* nonce = _conns[conn].nonce;
+  const uint8_t* ak = matchAccountKey(nonce, ID_BEACON_PARAMS, p, n, false);
+  if (!ak) return ATT_UNAUTHENTICATED;
 
   uint8_t plain[16];
   memset(plain, 0, sizeof(plain));
-  uint32_t clk = counter();
+  uint32_t clk = clock();
   plain[0] = (uint8_t)_p.calibratedPower();
   plain[1] = (uint8_t)(clk >> 24); plain[2] = (uint8_t)(clk >> 16);
   plain[3] = (uint8_t)(clk >> 8);  plain[4] = (uint8_t)clk;
@@ -206,70 +205,94 @@ uint8_t FindHubBeacon::opBeaconParams(uint8_t conn, const uint8_t* p, size_t n, 
   plain[6] = RING_COMPONENTS;
   plain[7] = 0x00;                 // no volume selection
   uint8_t enc[16];
-  aes128EcbEncrypt(_prov.ak, plain, enc, sizeof(enc));
-  *rsp_len = buildResponse(rsp, ID_BEACON_PARAMS, _prov.ak, AK_LEN, _conns[conn].nonce, enc, sizeof(enc));
+  aes128EcbEncrypt(ak, plain, enc, sizeof(enc));
+  *rsp_len = buildResponse(rsp, ID_BEACON_PARAMS, ak, AK_LEN, nonce, enc, sizeof(enc));
+  _clock_read = true;
   return ATT_OK;
 }
 
 uint8_t FindHubBeacon::opProvisioningState(uint8_t conn, const uint8_t* p, size_t n, uint8_t* rsp, size_t* rsp_len) {
   if (n != AUTH_LEN) return ATT_INVALID_VALUE;
-  // Only the owner account key exists on this device, so a match is always "owner".
-  if (!_provisioned || !authOk(_prov.ak, AK_LEN, _conns[conn].nonce, ID_PROVISIONING_STATE, p, n, false))
-    return ATT_UNAUTHENTICATED;
+  const uint8_t* nonce = _conns[conn].nonce;
+  const uint8_t* ak = matchAccountKey(nonce, ID_PROVISIONING_STATE, p, n, false);
+  if (!ak) return ATT_UNAUTHENTICATED;
 
   uint8_t add[1 + EID_LEN];
   size_t add_len = 1;
-  add[0] = PROV_FLAG_OWNER;
-  if (clockValid() && ensureEid(counter())) {
+  add[0] = _fp.isOwnerKey(ak) ? PROV_FLAG_OWNER : 0;
+  uint8_t adv[ADV_FRAME_LEN];
+  if (_provisioned && buildAdvert(adv)) {
     add[0] |= PROV_FLAG_EIK_SET;
     memcpy(&add[1], _eid, EID_LEN);
     add_len += EID_LEN;
   }
-  *rsp_len = buildResponse(rsp, ID_PROVISIONING_STATE, _prov.ak, AK_LEN, _conns[conn].nonce, add, add_len);
+  *rsp_len = buildResponse(rsp, ID_PROVISIONING_STATE, ak, AK_LEN, nonce, add, add_len);
   return ATT_OK;
 }
 
 uint8_t FindHubBeacon::opSetEik(uint8_t conn, const uint8_t* p, size_t n, uint8_t* rsp, size_t* rsp_len) {
-  // First provisioning happens over the bonded companion link (we have no account
-  // key before that), so this is only ever a re-key, which carries the hash of
-  // the current EIK.
-  if (!_provisioned) return ATT_UNAUTHENTICATED;
-  if (n != AUTH_LEN + EIK_LEN + 8) return ATT_INVALID_VALUE;
+  // Unprovisioned: the encrypted EIK only. Re-key: plus the hash of the current EIK.
+  if (n != AUTH_LEN + EIK_LEN && n != AUTH_LEN + EIK_LEN + EIK_HASH_LEN) return ATT_INVALID_VALUE;
+  const uint8_t* owner = _fp.ownerKey();
   const uint8_t* nonce = _conns[conn].nonce;
-  uint8_t expect[AUTH_LEN];
-  authSegment(_prov.ak, AK_LEN, nonce, ID_SET_EIK, (uint8_t)n, &p[AUTH_LEN], n - AUTH_LEN, false, expect);
-  if (!equalCT(expect, p, AUTH_LEN)) return ATT_UNAUTHENTICATED;
-  uint8_t hash[8];
-  sha256Trunc8(_prov.eik, EIK_LEN, nonce, NONCE_LEN, hash);
-  if (!equalCT(hash, &p[AUTH_LEN + EIK_LEN], 8)) return ATT_UNAUTHENTICATED;
+  if (!owner || !authOk(owner, AK_LEN, nonce, ID_SET_EIK, p, n, true)) return ATT_UNAUTHENTICATED;
+  bool has_hash = n == AUTH_LEN + EIK_LEN + EIK_HASH_LEN;
+  if (has_hash) {
+    if (!_provisioned) return ATT_UNAUTHENTICATED;
+    uint8_t hash[EIK_HASH_LEN];
+    sha256Trunc8(_eik, EIK_LEN, nonce, NONCE_LEN, hash);
+    if (!equalCT(hash, &p[AUTH_LEN + EIK_LEN], EIK_HASH_LEN)) return ATT_UNAUTHENTICATED;
+  } else if (_provisioned) {
+    return ATT_UNAUTHENTICATED;
+  }
 
-  Provisioning next = _prov;
-  aes128EcbDecrypt(_prov.ak, &p[AUTH_LEN], next.eik, EIK_LEN);
-  uint8_t saved_nonce[NONCE_LEN];
-  memcpy(saved_nonce, nonce, NONCE_LEN);
-  if (!provision(next)) return ATT_INVALID_VALUE;
-  memset(next.eik, 0, EIK_LEN);
+  uint8_t eik[EIK_LEN];
+  aes128EcbDecrypt(owner, &p[AUTH_LEN], eik, EIK_LEN);
+  bool ok = setEik(eik);
+  memset(eik, 0, sizeof(eik));
+  if (!ok) return ATT_INVALID_VALUE;
   // Response auth: HMAC(AK, ver || nonce || id || len || 0x01), no additional data.
-  *rsp_len = buildResponse(rsp, ID_SET_EIK, _prov.ak, AK_LEN, saved_nonce, NULL, 0);
+  *rsp_len = buildResponse(rsp, ID_SET_EIK, owner, AK_LEN, nonce, NULL, 0);
   return ATT_OK;
 }
 
 uint8_t FindHubBeacon::opClearEik(uint8_t conn, const uint8_t* p, size_t n, uint8_t* rsp, size_t* rsp_len) {
-  if (n != AUTH_LEN + 8) return ATT_INVALID_VALUE;
+  if (n != AUTH_LEN + EIK_HASH_LEN) return ATT_INVALID_VALUE;
+  const uint8_t* owner = _fp.ownerKey();
+  const uint8_t* nonce = _conns[conn].nonce;
+  if (!_provisioned || !owner || !authOk(owner, AK_LEN, nonce, ID_CLEAR_EIK, p, n, true)) return ATT_UNAUTHENTICATED;
+  uint8_t hash[EIK_HASH_LEN];
+  sha256Trunc8(_eik, EIK_LEN, nonce, NONCE_LEN, hash);
+  if (!equalCT(hash, &p[AUTH_LEN], EIK_HASH_LEN)) return ATT_UNAUTHENTICATED;
+
+  // The response is authenticated with the owner key, so build it before the
+  // factory reset (spec, locator tags: clearing the EIK also clears the account keys).
+  *rsp_len = buildResponse(rsp, ID_CLEAR_EIK, owner, AK_LEN, nonce, NULL, 0);
+  if (!factoryReset()) {
+    *rsp_len = 0;
+    return ATT_INVALID_VALUE;
+  }
+  return ATT_OK;
+}
+
+uint8_t FindHubBeacon::opReadEik(uint8_t conn, const uint8_t* p, size_t n, uint8_t* rsp, size_t* rsp_len) {
+  if (n != AUTH_LEN) return ATT_INVALID_VALUE;
   if (!_provisioned) return ATT_UNAUTHENTICATED;
   const uint8_t* nonce = _conns[conn].nonce;
-  if (!authOk(_prov.ak, AK_LEN, nonce, ID_CLEAR_EIK, p, n, true)) return ATT_UNAUTHENTICATED;
-  uint8_t hash[8];
-  sha256Trunc8(_prov.eik, EIK_LEN, nonce, NONCE_LEN, hash);
-  if (!equalCT(hash, &p[AUTH_LEN], 8)) return ATT_UNAUTHENTICATED;
-
-  uint8_t ak[AK_LEN], saved_nonce[NONCE_LEN];
-  memcpy(ak, _prov.ak, AK_LEN);
-  memcpy(saved_nonce, nonce, NONCE_LEN);
-  if (!clear()) return ATT_INVALID_VALUE;
-  *rsp_len = buildResponse(rsp, ID_CLEAR_EIK, ak, AK_LEN, saved_nonce, NULL, 0);
-  memset(ak, 0, sizeof(ak));
-  return ATT_OK;
+  uint8_t recovery[DERIVED_KEY_LEN];
+  deriveKey(_eik, KEY_RECOVERY, recovery);
+  uint8_t status = ATT_OK;
+  const uint8_t* owner = _fp.ownerKey();
+  if (!authOk(recovery, sizeof(recovery), nonce, ID_READ_EIK, p, n, false)) status = ATT_UNAUTHENTICATED;
+  else if (!_consent) status = ATT_NO_USER_CONSENT;      // checked after auth, as NCS does
+  else if (!owner) status = ATT_UNAUTHENTICATED;
+  else {
+    uint8_t enc[EIK_LEN];
+    aes128EcbEncrypt(owner, _eik, enc, EIK_LEN);
+    *rsp_len = buildResponse(rsp, ID_READ_EIK, recovery, sizeof(recovery), nonce, enc, sizeof(enc));
+  }
+  memset(recovery, 0, sizeof(recovery));
+  return status;
 }
 
 uint8_t FindHubBeacon::opRing(uint8_t conn, const uint8_t* p, size_t n, uint8_t* rsp, size_t* rsp_len) {
@@ -279,7 +302,7 @@ uint8_t FindHubBeacon::opRing(uint8_t conn, const uint8_t* p, size_t n, uint8_t*
   bool auth = !(_utp && _utp_skip_ring_auth);
   if (auth) {
     uint8_t ring_key[DERIVED_KEY_LEN];
-    deriveKey(_prov.eik, KEY_RING, ring_key);
+    deriveKey(_eik, KEY_RING, ring_key);
     bool ok = authOk(ring_key, sizeof(ring_key), nonce, ID_RING, p, n, true);
     memset(ring_key, 0, sizeof(ring_key));
     if (!ok) return ATT_UNAUTHENTICATED;
@@ -307,7 +330,7 @@ uint8_t FindHubBeacon::opRingState(uint8_t conn, const uint8_t* p, size_t n, uin
   if (n != AUTH_LEN) return ATT_INVALID_VALUE;
   if (!_provisioned) return ATT_UNAUTHENTICATED;
   uint8_t ring_key[DERIVED_KEY_LEN];
-  deriveKey(_prov.eik, KEY_RING, ring_key);
+  deriveKey(_eik, KEY_RING, ring_key);
   if (!authOk(ring_key, sizeof(ring_key), _conns[conn].nonce, ID_RING_STATE, p, n, false)) {
     memset(ring_key, 0, sizeof(ring_key));
     return ATT_UNAUTHENTICATED;
@@ -323,7 +346,7 @@ uint8_t FindHubBeacon::opUtp(uint8_t conn, uint8_t id, const uint8_t* p, size_t 
   if (!_provisioned) return ATT_UNAUTHENTICATED;
   const uint8_t* nonce = _conns[conn].nonce;
   uint8_t utp_key[DERIVED_KEY_LEN];
-  deriveKey(_prov.eik, KEY_UTP, utp_key);
+  deriveKey(_eik, KEY_UTP, utp_key);
   uint8_t status = ATT_OK;
 
   if (id == ID_UTP_ON) {
@@ -335,12 +358,12 @@ uint8_t FindHubBeacon::opUtp(uint8_t conn, uint8_t id, const uint8_t* p, size_t 
       else { _utp = true; _utp_skip_ring_auth = (flags & UTP_FLAG_SKIP_RING_AUTH) != 0; }
     }
   } else {
-    if (n != AUTH_LEN + 8) status = ATT_INVALID_VALUE;
+    if (n != AUTH_LEN + EIK_HASH_LEN) status = ATT_INVALID_VALUE;
     else if (!authOk(utp_key, sizeof(utp_key), nonce, id, p, n, true)) status = ATT_UNAUTHENTICATED;
     else {
-      uint8_t hash[8];
-      sha256Trunc8(_prov.eik, EIK_LEN, nonce, NONCE_LEN, hash);
-      if (!equalCT(hash, &p[AUTH_LEN], 8)) status = ATT_UNAUTHENTICATED;
+      uint8_t hash[EIK_HASH_LEN];
+      sha256Trunc8(_eik, EIK_LEN, nonce, NONCE_LEN, hash);
+      if (!equalCT(hash, &p[AUTH_LEN], EIK_HASH_LEN)) status = ATT_UNAUTHENTICATED;
       else { _utp = false; _utp_skip_ring_auth = false; }
     }
   }
@@ -374,7 +397,7 @@ void FindHubBeacon::stopRing(RingTrigger why) {
 void FindHubBeacon::notifyRingState(RingTrigger why) {
   if (!_ring_has_conn || !_provisioned) return;
   uint8_t ring_key[DERIVED_KEY_LEN];
-  deriveKey(_prov.eik, KEY_RING, ring_key);
+  deriveKey(_eik, KEY_RING, ring_key);
   uint16_t rem = ringRemainingDs();
   uint8_t add[4] = { why, _ring_comp, (uint8_t)(rem >> 8), (uint8_t)rem };
   uint8_t rsp[2 + AUTH_LEN + sizeof(add)];

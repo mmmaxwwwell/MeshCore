@@ -3,7 +3,6 @@
 #include <string.h>
 #include <AES.h>
 #include <SHA256.h>
-#include <uECC.h>
 
 namespace findhub {
 
@@ -82,19 +81,15 @@ bool computeEid(const uint8_t eik[EIK_LEN], uint32_t counter, uint8_t eid[EID_LE
 
   U192 r;
   modN(r_dash, r);
-  uint8_t priv[21];
+  uint8_t priv[SECP160R1_PRIV_LEN];
   u192ToBE(r, priv, sizeof(priv));
 
-  uint8_t pub[40];
-  bool ok = uECC_compute_public_key(priv, pub, uECC_secp160r1()) == 1;
-  if (ok) memcpy(eid, pub, EID_LEN);
+  bool ok = ecSecp160r1MulG(priv, eid);
 
   if (hash_xor) {
     // r aligned to the curve size: its low 160 bits, big-endian.
     uint8_t digest[32];
-    SHA256 sha;
-    sha.update(&priv[1], 20);
-    sha.finalize(digest, sizeof(digest));
+    sha256(&priv[1], 20, NULL, 0, digest);
     *hash_xor = digest[31];
   }
   memset(priv, 0, sizeof(priv));
@@ -107,13 +102,24 @@ void deriveKey(const uint8_t eik[EIK_LEN], DerivedKey which, uint8_t out[DERIVED
   sha256Trunc8(eik, EIK_LEN, &w, 1, out);
 }
 
+void sha256(const uint8_t* a, size_t a_len, const uint8_t* b, size_t b_len, uint8_t out[32]) {
+  SHA256 sha;
+  if (a_len) sha.update(a, a_len);
+  if (b_len) sha.update(b, b_len);
+  sha.finalize(out, 32);
+}
+
 void sha256Trunc8(const uint8_t* a, size_t a_len, const uint8_t* b, size_t b_len, uint8_t out[8]) {
   uint8_t digest[32];
-  SHA256 sha;
-  sha.update(a, a_len);
-  sha.update(b, b_len);
-  sha.finalize(digest, sizeof(digest));
+  sha256(a, a_len, b, b_len, digest);
   memcpy(out, digest, 8);
+}
+
+void hmacSha256(const uint8_t* key, size_t key_len, const uint8_t* data, size_t len, uint8_t out[32]) {
+  SHA256 sha;
+  sha.resetHMAC(key, key_len);
+  if (len) sha.update(data, len);
+  sha.finalizeHMAC(key, key_len, out, 32);
 }
 
 void authSegment(const uint8_t* key, size_t key_len, const uint8_t nonce[NONCE_LEN],
@@ -136,6 +142,71 @@ void authSegment(const uint8_t* key, size_t key_len, const uint8_t nonce[NONCE_L
   uint8_t mac[32];
   sha.finalizeHMAC(key, key_len, mac, sizeof(mac));
   memcpy(out, mac, AUTH_LEN);
+}
+
+void aesKeyFromSecret(const uint8_t secret[32], uint8_t key[AK_LEN]) {
+  uint8_t digest[32];
+  sha256(secret, 32, NULL, 0, digest);
+  memcpy(key, digest, AK_LEN);
+  memset(digest, 0, sizeof(digest));
+}
+
+size_t accountKeyFilter(const uint8_t (*keys)[AK_LEN], size_t n, const uint8_t salt[2],
+                        const uint8_t* extra, size_t extra_len, uint8_t out[MAX_FILTER_LEN]) {
+  size_t s = (12 * n) / 10 + 3;     // (uint8_t)(1.2f * n) + 3, without floats
+  if (s > MAX_FILTER_LEN) return 0;
+  memset(out, 0, s);
+  for (size_t k = 0; k < n; k++) {
+    SHA256 sha;
+    uint8_t h[32];
+    sha.update(keys[k], AK_LEN);
+    sha.update(salt, 2);
+    if (extra_len) sha.update(extra, extra_len);
+    sha.finalize(h, sizeof(h));
+    for (int i = 0; i < 8; i++) {
+      uint32_t x = ((uint32_t)h[i * 4] << 24) | ((uint32_t)h[i * 4 + 1] << 16) |
+                   ((uint32_t)h[i * 4 + 2] << 8) | h[i * 4 + 3];
+      uint32_t m = x % (uint32_t)(s * 8);
+      out[m / 8] |= (uint8_t)(1 << (m % 8));
+    }
+  }
+  return s;
+}
+
+// encryptedBlock[i] = clearBlock[i] ^ AES(key, (uint8)i || 0x00 * 7 || nonce)
+static void aesCtr(const uint8_t key[AK_LEN], const uint8_t nonce[8], const uint8_t* in, size_t len, uint8_t* out) {
+  AES128 aes;
+  aes.setKey(key, AK_LEN);
+  uint8_t ctr[16], ks[16];
+  for (size_t off = 0, i = 0; off < len; off += 16, i++) {
+    memset(ctr, 0, sizeof(ctr));
+    ctr[0] = (uint8_t)i;
+    memcpy(&ctr[8], nonce, 8);
+    aes.encryptBlock(ks, ctr);
+    size_t n = len - off < 16 ? len - off : 16;
+    for (size_t j = 0; j < n; j++) out[off + j] = in[off + j] ^ ks[j];
+  }
+  aes.clear();
+  memset(ks, 0, sizeof(ks));
+}
+
+// HMAC-SHA256 with K = key || 48 zero bytes, which is what HMAC pads a 16-byte key to.
+void additionalDataEncode(const uint8_t key[AK_LEN], const uint8_t nonce[8], const uint8_t* data, size_t len,
+                          uint8_t* out) {
+  memcpy(&out[8], nonce, 8);
+  aesCtr(key, nonce, data, len, &out[ADDITIONAL_DATA_HDR]);
+  uint8_t mac[32];
+  hmacSha256(key, AK_LEN, &out[8], 8 + len, mac);
+  memcpy(out, mac, 8);
+}
+
+bool additionalDataDecode(const uint8_t key[AK_LEN], const uint8_t* packet, size_t packet_len, uint8_t* out) {
+  if (packet_len < ADDITIONAL_DATA_HDR) return false;
+  uint8_t mac[32];
+  hmacSha256(key, AK_LEN, &packet[8], packet_len - 8, mac);
+  if (!equalCT(mac, packet, 8)) return false;
+  aesCtr(key, &packet[8], &packet[ADDITIONAL_DATA_HDR], packet_len - ADDITIONAL_DATA_HDR, out);
+  return true;
 }
 
 bool equalCT(const uint8_t* a, const uint8_t* b, size_t len) {

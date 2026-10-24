@@ -1,24 +1,25 @@
 #pragma once
 
-// Find Hub Network beacon: provisioning state, rotating EID advertisement and the
-// Fast Pair "Beacon Actions" GATT protocol (ring, ringing state, beacon
-// parameters/clock, provisioning state, unwanted tracking protection).
+// Find Hub Network beacon: the ephemeral identity key, the rotating EID
+// advertisement and the Fast Pair "Beacon Actions" GATT protocol (beacon
+// parameters/clock, provisioning state, set/clear/recover the EIK, ring, ringing
+// state, unwanted tracking protection).
+// Spec: https://developers.google.com/nearby/fast-pair/specifications/extensions/fmdn
 //
-// Portable: the BLE stack, clock, RNG, storage and buzzer come in through
-// FindHubPlatform, so the whole protocol runs under the native test env.
+// Account keys (and which one is the owner's) come from the FastPairProvider:
+// the Seeker provisions the EIK over Beacon Actions right after Fast Pair wrote
+// its account key. Portable: board services come in through FindHubPlatform.
 //
-// Not implemented on purpose: Fast Pair pairing (key-based pairing needs a
-// Google-issued model anti-spoofing key; we are provisioned over the bonded
-// companion link instead), EIK recovery with user consent (0x04: always "no user
-// consent"), precision finding, and the DULT non-owner service.
+// Not implemented: precision finding (data IDs 0x0A-0x0D) and the DULT
+// accessory non-owner service.
 
-#include "FindHubCrypto.h"
+#include "FastPair.h"
 
 namespace findhub {
 
-constexpr size_t MAX_CONN = 8;            // Bluefruit connection handles are < 8 here
+constexpr size_t MAX_CONN = FP_MAX_CONN;
 constexpr size_t ADV_FRAME_LEN = 29;      // flags(3) + service data(26)
-constexpr size_t MAX_NOTIFY_LEN = 2 + AUTH_LEN + EID_LEN + 1;   // largest: provisioning state
+constexpr size_t MAX_NOTIFY_LEN = 2 + AUTH_LEN + 2 * AK_LEN;   // largest: read EIK (32 bytes)
 constexpr uint16_t RING_MAX_DS = 6000;    // 10 minutes in deciseconds
 
 // ATT application error codes from the spec (table 7).
@@ -27,36 +28,6 @@ enum AttStatus : uint8_t {
   ATT_UNAUTHENTICATED = 0x80,
   ATT_INVALID_VALUE = 0x81,
   ATT_NO_USER_CONSENT = 0x82,
-};
-
-enum BatteryLevel : uint8_t {
-  BATTERY_UNSUPPORTED = 0,
-  BATTERY_NORMAL = 1,
-  BATTERY_LOW = 2,
-  BATTERY_CRITICAL = 3,
-};
-
-// What is persisted. pair_date = Unix time at provisioning; the beacon clock is
-// unix_now - pair_date, the convention Google's backend and owner phones use
-// when they precompute EIDs from the registration's pairDate.
-struct Provisioning {
-  uint8_t eik[EIK_LEN];
-  uint8_t ak[AK_LEN];        // owner account key
-  uint32_t pair_date;
-};
-
-class FindHubPlatform {
-public:
-  virtual ~FindHubPlatform() {}
-  virtual void randomBytes(uint8_t* dest, size_t len) = 0;
-  virtual uint32_t unixTime() = 0;           // 0 or a pre-provisioning value = unknown
-  virtual uint32_t millis() = 0;
-  virtual int8_t calibratedPower() = 0;      // dBm at 0 m
-  virtual BatteryLevel batteryLevel() = 0;
-  virtual bool saveProvisioning(const Provisioning* p) = 0;   // NULL = erase
-  virtual void ringStart() = 0;              // start (or keep) sounding
-  virtual void ringStop() = 0;
-  virtual void notify(uint8_t conn, const uint8_t* data, size_t len) = 0;  // async notifications
 };
 
 enum RingTrigger : uint8_t {
@@ -69,33 +40,43 @@ enum RingTrigger : uint8_t {
 
 class FindHubBeacon {
 public:
-  explicit FindHubBeacon(FindHubPlatform& platform);
+  FindHubBeacon(FindHubPlatform& platform, FastPairProvider& fp);
 
-  // Provisioning (from the bonded companion link, or GATT 0x02/0x03).
-  void load(const Provisioning* p);          // boot: restore without persisting
-  bool provision(const Provisioning& p);     // persist + take effect
-  bool clear();
+  // EIK (Beacon Actions 0x02/0x03, or restored at boot).
+  void load(const uint8_t* eik);             // boot: restore without persisting (NULL = none)
   bool isProvisioned() const { return _provisioned; }
-  uint32_t pairDate() const { return _prov.pair_date; }
+  // Forget the EIK and every account key (spec: clearing the EIK is a factory reset).
+  bool factoryReset();
 
-  // Clock. Valid once the wall clock is at or after pair_date.
-  bool clockValid();
-  uint32_t counter();
+  uint32_t clock() { return _p.beaconClock(); }
 
-  // Full advertising payload (flags + FHN service data). Returns 0 when the beacon
-  // must not advertise (unprovisioned or clock unknown). Recomputes the EID when
-  // its rotation window changes (one secp160r1 multiplication per ~1024 s).
+  // Full advertising payload (flags + FHN service data). 0 when unprovisioned.
+  // Recomputes the EID when its rotation window changes (one secp160r1
+  // multiplication per ~1024 s).
   size_t buildAdvert(uint8_t out[ADV_FRAME_LEN]);
-  // The EID currently advertised (valid after buildAdvert returned > 0).
   const uint8_t* currentEid() const { return _eid; }
+  // Changes exactly when the advertised EID does (after the random delay): the
+  // FHN address rotates with it.
+  uint32_t advertWindow() const { return _eid_window; }
 
   // GATT Beacon Actions characteristic.
   size_t onRead(uint8_t conn, uint8_t out[1 + NONCE_LEN]);
   // Returns an ATT status. On ATT_OK, `rsp` holds the notification to send BEFORE
   // the write response (spec: table 6 note), rsp_len its length (0 = none).
   uint8_t onWrite(uint8_t conn, const uint8_t* buf, size_t len, uint8_t rsp[MAX_NOTIFY_LEN], size_t* rsp_len);
-  uint8_t dispatch(uint8_t conn, const uint8_t* buf, size_t len, uint8_t* rsp, size_t* rsp_len);
   void onDisconnect(uint8_t conn);
+  // True on a link that passed Beacon Actions authentication (Firmware Revision
+  // reads are allowed there, spec "Firmware updates").
+  bool authenticated(uint8_t conn) const { return conn < MAX_CONN && _conns[conn].authed; }
+
+  // User consent for "read EIK" (0x04): pairing mode or a recent button press.
+  void setUserConsent(bool on) { _consent = on; }
+
+  // True once after an authenticated read of the beacon parameters (the Seeker
+  // synchronised its copy of our clock).
+  bool takeClockRead() { bool r = _clock_read; _clock_read = false; return r; }
+  // True once after the EIK was set or cleared over GATT.
+  bool takeProvisioningChanged() { bool r = _prov_changed; _prov_changed = false; return r; }
 
   // Ringing.
   void loop();                               // timeout handling
@@ -114,12 +95,17 @@ private:
   struct Conn {
     uint8_t nonce[NONCE_LEN];
     bool nonce_valid;
+    bool authed;
   };
 
   FindHubPlatform& _p;
+  FastPairProvider& _fp;
   bool _provisioned;
-  Provisioning _prov;
+  uint8_t _eik[EIK_LEN];
   Conn _conns[MAX_CONN];
+  bool _consent;
+  bool _clock_read;
+  bool _prov_changed;
 
   // advertisement cache
   bool _eid_valid;
@@ -146,16 +132,20 @@ private:
   void invalidateEid() { _eid_valid = false; }
   bool ensureEid(uint32_t adv_counter);
   uint8_t hashedFlags();
+  bool setEik(const uint8_t* eik);
+  const uint8_t* matchAccountKey(const uint8_t nonce[NONCE_LEN], uint8_t id, const uint8_t* p, size_t n, bool hash_add);
   void startRing(uint16_t ds);
   void stopRing(RingTrigger why);
   void notifyRingState(RingTrigger why);
   size_t buildResponse(uint8_t* rsp, uint8_t data_id, const uint8_t* key, size_t key_len,
                        const uint8_t nonce[NONCE_LEN], const uint8_t* add, size_t add_len);
 
+  uint8_t dispatch(uint8_t conn, const uint8_t* buf, size_t len, uint8_t* rsp, size_t* rsp_len);
   uint8_t opBeaconParams(uint8_t conn, const uint8_t* p, size_t n, uint8_t* rsp, size_t* rsp_len);
   uint8_t opProvisioningState(uint8_t conn, const uint8_t* p, size_t n, uint8_t* rsp, size_t* rsp_len);
   uint8_t opSetEik(uint8_t conn, const uint8_t* p, size_t n, uint8_t* rsp, size_t* rsp_len);
   uint8_t opClearEik(uint8_t conn, const uint8_t* p, size_t n, uint8_t* rsp, size_t* rsp_len);
+  uint8_t opReadEik(uint8_t conn, const uint8_t* p, size_t n, uint8_t* rsp, size_t* rsp_len);
   uint8_t opRing(uint8_t conn, const uint8_t* p, size_t n, uint8_t* rsp, size_t* rsp_len);
   uint8_t opRingState(uint8_t conn, const uint8_t* p, size_t n, uint8_t* rsp, size_t* rsp_len);
   uint8_t opUtp(uint8_t conn, uint8_t id, const uint8_t* p, size_t n, uint8_t* rsp, size_t* rsp_len);
