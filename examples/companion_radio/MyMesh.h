@@ -121,7 +121,7 @@ public:
 
   void loop();
   void handleCmdFrame(size_t len);
-#ifdef FINDHUB_BEACON
+#ifdef WITH_FINDHUB
   void handleFindHubCmd(size_t len);
 #endif
   bool advert();

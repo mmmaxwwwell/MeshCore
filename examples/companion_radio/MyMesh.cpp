@@ -5,7 +5,7 @@
 #include <WiFi.h>
 #endif
 #include <Mesh.h>
-#ifdef FINDHUB_BEACON
+#ifdef WITH_FINDHUB
 #include <helpers/nrf52/FindHubService.h>
 #endif
 
@@ -69,7 +69,7 @@
 #define CMD_GET_DEFAULT_FLOOD_SCOPE   64
 #define CMD_SEND_RAW_PACKET           65
 #define CMD_RUN_CLI_COMMAND           66  // v14+
-#define CMD_FINDHUB                   0xA0  // fork: Find Hub beacon (FINDHUB_BEACON builds), sub-op in byte 1
+#define CMD_FINDHUB                   0xA0  // fork: Find Hub accessory (WITH_FINDHUB builds), sub-op in byte 1
 
 // Stats sub-types for CMD_GET_STATS
 #define STATS_TYPE_CORE               0
@@ -110,10 +110,12 @@
 
 // CMD_FINDHUB sub-ops. Only reachable over the companion link (bonded BLE / USB),
 // never from a mesh peer's remote CLI, and there is no op that reads a key back.
+// Keys arrive only through Fast Pair from the owner's phone (0x02, the old
+// "provision with a laptop-minted EIK", is gone).
 #define FINDHUB_OP_STATUS             0x01
-#define FINDHUB_OP_PROVISION          0x02  // eik[32] ak[16] pair_date(u32 LE)
-#define FINDHUB_OP_CLEAR              0x03
+#define FINDHUB_OP_CLEAR              0x03  // factory reset: forget the EIK and every account key
 #define FINDHUB_OP_RING               0x04  // deciseconds(u16 LE), 0 = stop
+#define FINDHUB_OP_PAIR               0x05  // pairing mode (unprovisioned) / EIK recovery consent (provisioned)
 
 #define MAX_CHANNEL_DATA_LENGTH       (MAX_FRAME_SIZE - 9)
 
@@ -2068,7 +2070,7 @@ void MyMesh::handleCmdFrame(size_t len) {
     } else {
       writeErrFrame(ERR_CODE_TABLE_FULL);
     }
-#ifdef FINDHUB_BEACON
+#ifdef WITH_FINDHUB
   } else if (cmd_frame[0] == CMD_FINDHUB && len >= 2 && findhub_service) {
     handleFindHubCmd(len);
 #endif
@@ -2078,49 +2080,45 @@ void MyMesh::handleCmdFrame(size_t len) {
   }
 }
 
-#ifdef FINDHUB_BEACON
+#ifdef WITH_FINDHUB
 void MyMesh::handleFindHubCmd(size_t len) {
-  findhub::FindHubBeacon& b = findhub_service->beacon();
+  findhub::FindHub& hub = findhub_service->hub();
+  findhub::FindHubBeacon& b = hub.beacon();
   uint8_t op = cmd_frame[1];
   if (op == FINDHUB_OP_STATUS) {
-    // A0 01 | provisioned clock_valid utp ringing | pair_date counter unix (u32 LE) | eid[20]
+    // A0 01 | state (0 idle, 1 pairing, 2 awaiting EIK, 3 provisioned) | flags
+    // (1 pairing mode, 2 consent, 4 clock sync pending, 8 UTP, 16 ringing) |
+    // account keys | beacon clock (u32 LE) | eid[20] (zeros unprovisioned)
     int i = 0;
     out_frame[i++] = RESP_CODE_FINDHUB_STATUS;
     out_frame[i++] = FINDHUB_OP_STATUS;
-    out_frame[i++] = b.isProvisioned();
-    out_frame[i++] = b.clockValid();
-    out_frame[i++] = b.utpMode();
-    out_frame[i++] = b.isRinging();
-    uint32_t v = b.pairDate();                      memcpy(&out_frame[i], &v, 4); i += 4;
-    v = b.counter();                                memcpy(&out_frame[i], &v, 4); i += 4;
-    v = getRTCClock()->getCurrentTime();            memcpy(&out_frame[i], &v, 4); i += 4;
+    out_frame[i++] = hub.state();
+    out_frame[i++] = (hub.pairingMode() ? 1 : 0) | (hub.consentOpen() ? 2 : 0) | (hub.clockSyncPending() ? 4 : 0) |
+                     (b.utpMode() ? 8 : 0) | (b.isRinging() ? 16 : 0);
+    out_frame[i++] = (uint8_t)hub.fastPair().keyCount();
+    uint32_t v = b.clock();                         memcpy(&out_frame[i], &v, 4); i += 4;
     uint8_t adv[findhub::ADV_FRAME_LEN];
     if (b.buildAdvert(adv)) memcpy(&out_frame[i], b.currentEid(), findhub::EID_LEN);
     else memset(&out_frame[i], 0, findhub::EID_LEN);
     i += findhub::EID_LEN;
-    // diagnostics: last_op last_status | reads writes long_writes queue_full rejected notifies notify_fail (u16 LE) | last_sd_err (u32 LE)
+    // diagnostics: beacon last_op last_status | fast pair last_result failures |
+    // reads writes long_writes queue_full rejected notifies notify_fail kbp_ok
+    // kbp_fail ak_ok ak_fail (u16 LE) | last_sd_err (u32 LE)
     const FindHubService::Stats& st = findhub_service->stats();
     out_frame[i++] = b.lastOp();
     out_frame[i++] = b.lastStatus();
-    uint16_t c16[7] = { st.reads, st.writes, st.long_writes, st.queue_full, st.rejected, st.notifies, st.notify_fail };
+    out_frame[i++] = hub.fastPair().lastResult();
+    out_frame[i++] = hub.fastPair().failures();
+    uint16_t c16[11] = { st.reads, st.writes, st.long_writes, st.queue_full, st.rejected, st.notifies, st.notify_fail,
+                         st.kbp_ok, st.kbp_fail, st.ak_ok, st.ak_fail };
     memcpy(&out_frame[i], c16, sizeof(c16)); i += sizeof(c16);
     memcpy(&out_frame[i], &st.last_sd_err, 4); i += 4;
-    // gps_state (0 idle, 1 syncing, 2 no gps) | seconds since last GPS time fix (u32 LE, 0xFFFFFFFF = never)
-    out_frame[i++] = findhub_service->gpsState();
-    uint32_t age = findhub_service->gpsLastSyncAgeS();
-    memcpy(&out_frame[i], &age, 4); i += 4;
     _serial->writeFrame(out_frame, i);
-  } else if (op == FINDHUB_OP_PROVISION && len >= 2 + findhub::EIK_LEN + findhub::AK_LEN + 4) {
-    findhub::Provisioning p;
-    memcpy(p.eik, &cmd_frame[2], findhub::EIK_LEN);
-    memcpy(p.ak, &cmd_frame[2 + findhub::EIK_LEN], findhub::AK_LEN);
-    memcpy(&p.pair_date, &cmd_frame[2 + findhub::EIK_LEN + findhub::AK_LEN], 4);
-    bool ok = b.provision(p);
-    memset(&p, 0, sizeof(p));
-    memset(&cmd_frame[2], 0, findhub::EIK_LEN + findhub::AK_LEN);
-    if (ok) writeOKFrame(); else writeErrFrame(ERR_CODE_FILE_IO_ERROR);
+  } else if (op == FINDHUB_OP_PAIR) {
+    findhub_service->requestPairing();
+    writeOKFrame();
   } else if (op == FINDHUB_OP_CLEAR) {
-    if (b.clear()) writeOKFrame(); else writeErrFrame(ERR_CODE_FILE_IO_ERROR);
+    if (findhub_service->clearDevice()) writeOKFrame(); else writeErrFrame(ERR_CODE_FILE_IO_ERROR);
   } else if (op == FINDHUB_OP_RING && len >= 4) {
     uint16_t ds;
     memcpy(&ds, &cmd_frame[2], 2);

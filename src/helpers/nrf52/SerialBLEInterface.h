@@ -36,16 +36,21 @@ class SerialBLEInterface : public BaseSerialInterface {
   bool isAdvertising() const;
   void setCompanionAdvData();
 
-#ifdef FINDHUB_BEACON
-  // Advertising alternates between the companion advert and the Find Hub beacon
-  // frame while the beacon is provisioned (see advertisingTick()).
-  enum AdvSlot : uint8_t { ADV_NONE, ADV_COMPANION, ADV_BEACON };
+#ifdef WITH_FINDHUB
+  // Advertising cycles through the companion advert, the Fast Pair frame and the
+  // Find Hub frame, each with its own address (see advertisingTick()).
+  enum AdvSlot : uint8_t { ADV_NONE, ADV_COMPANION, ADV_FASTPAIR, ADV_FHN, ADV_SLOTS };
   AdvSlot _adv_slot;
   unsigned long _adv_slot_started;
-  uint8_t _adv_beacon[31];
-  uint8_t _adv_beacon_len;
-  void startAdvSlot(AdvSlot slot, const uint8_t* beacon, uint8_t beacon_len);
-  bool advertisingTick();   // true when it owns advertising (beacon provisioned)
+  uint8_t _adv_data[31];
+  uint8_t _adv_len;
+  uint8_t _adv_addr[6];
+  bool _adv_connectable;
+  ble_gap_addr_t _identity_addr;
+  ble_gap_addr_t _current_addr;
+  void startAdvSlot(AdvSlot slot, const uint8_t* data, uint8_t len, const uint8_t* addr, bool connectable, uint16_t interval);
+  bool setAddress(const uint8_t* addr);   // NULL = identity
+  void advertisingTick();
 #endif
   static void onConnect(uint16_t connection_handle);
   static void onDisconnect(uint16_t connection_handle, uint8_t reason);
@@ -64,10 +69,11 @@ public:
     _last_retry_attempt = 0;
     send_queue_len = 0;
     recv_queue_len = 0;
-#ifdef FINDHUB_BEACON
+#ifdef WITH_FINDHUB
     _adv_slot = ADV_NONE;
     _adv_slot_started = 0;
-    _adv_beacon_len = 0;
+    _adv_len = 0;
+    _adv_connectable = true;
 #endif
   }
 

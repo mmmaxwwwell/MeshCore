@@ -36,7 +36,7 @@ MultiSerialInterface interface_manager;
 #endif
 
 // include wifi interface
-#ifdef FINDHUB_BEACON
+#ifdef WITH_FINDHUB
   #include <helpers/nrf52/FindHubService.h>
   FindHubService findhub_svc;
 #endif
@@ -209,8 +209,8 @@ void setup() {
   the_mesh.setBLEPin(0);
 #endif
 
-#ifdef FINDHUB_BEACON
-  findhub_svc.begin(&rtc_clock, &board);     // before BLE: the GATT service registers in begin()
+#ifdef WITH_FINDHUB
+  findhub_svc.begin(&board, FIRMWARE_VERSION);   // before BLE; the GATT services register in bluetooth_interface.begin()
 #endif
 
 // add bluetooth interface
@@ -289,9 +289,6 @@ void setup() {
 #if ENV_INCLUDE_GPS == 1
   the_mesh.applyGpsPrefs();
 #endif
-#ifdef FINDHUB_BEACON
-  findhub_svc.setGps(&sensors, &the_mesh.getNodePrefs()->gps_enabled);
-#endif
 
 #ifdef DISPLAY_CLASS
   ui_task.begin(disp, &sensors, the_mesh.getNodePrefs());  // still want to pass this in as dependency, as prefs might be moved
@@ -303,7 +300,7 @@ void setup() {
 
 void loop() {
   the_mesh.loop();
-#ifdef FINDHUB_BEACON
+#ifdef WITH_FINDHUB
   findhub_svc.loop();
 #endif
   interface_manager.loop();

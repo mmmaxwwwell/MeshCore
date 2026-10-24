@@ -1,17 +1,29 @@
 #pragma once
 
-// nRF52 / Bluefruit glue for the Find Hub Network beacon (helpers/findhub):
-// the Fast Pair service (0xFE2C) with the Beacon Actions characteristic, the
-// beacon's advertising payload, persistence on InternalFS and the clock.
+// nRF52 / Bluefruit glue for the Find Hub accessory (helpers/findhub): the Fast
+// Pair service (0xFE2C: Model ID, Key-based Pairing, Passkey, Account Key, Beacon
+// Actions), the Device Information Firmware Revision, persistence on InternalFS
+// and the FHN beacon clock.
 //
 // GATT requests arrive on Bluefruit's BLE task; they are queued and answered from
-// loop(), so every FindHubBeacon call runs on the main loop (one thread).
+// loop(), so every findhub call runs on the main loop (one thread), and the
+// CryptoCell is only ever used from there.
 
 #include <Arduino.h>
 #include <bluefruit.h>
 #include <MeshCore.h>
-#include <helpers/findhub/FindHubBeacon.h>
-#include <helpers/SensorManager.h>
+#include <helpers/findhub/FindHub.h>
+
+// Fast Pair model. Default: Nordic's debug "NCS locator tag" model (Model ID
+// 0x4A436B), which Android only shows with "Include debug results" on, and whose
+// FHN provisioning only works for Google accounts on Google's allowlist. A
+// registered model swaps in with these two build flags.
+#ifndef FINDHUB_MODEL_ID
+  #define FINDHUB_MODEL_ID 0x4A436B
+#endif
+#ifndef FINDHUB_ANTISPOOF_KEY_HEX       // 32-byte secp256r1 private key, hex
+  #define FINDHUB_ANTISPOOF_KEY_HEX "ae27b5d00ece36ac1defb5669311ac6e53d46ccb77f38aa30e070427f72d4fd6"
+#endif
 
 class FindHubService : public findhub::FindHubPlatform {
 public:
@@ -20,59 +32,71 @@ public:
   FindHubService();
 
   // Call after the filesystem is up and before Bluefruit.begin().
-  void begin(mesh::RTCClock* clock, mesh::MainBoard* board);
-  // Call after Bluefruit.begin(), before advertising starts: registers the GATT service.
+  void begin(mesh::MainBoard* board, const char* fw_version);
+  // Call after Bluefruit.begin(), before advertising starts: registers the GATT services.
   void beginGatt();
   void loop();
 
   void setRingCallback(RingCallback cb) { _ring_cb = cb; }
 
-  // GPS time sync: while provisioned, power the GPS up at boot and once a day
-  // just long enough for a time fix (the location provider sets the RTC), then
-  // power it down again. Left alone when the user has GPS on (*user_gps != 0):
-  // the provider already re-syncs the clock every 30 min then.
-  void setGps(SensorManager* sensors, const uint8_t* user_gps) { _sensors = sensors; _user_gps = user_gps; }
-  enum GpsSync : uint8_t { GPS_IDLE = 0, GPS_SYNCING = 1, GPS_NO_GPS = 2 };
-  GpsSync gpsState() const { return _gps_state; }
-  uint32_t gpsLastSyncAgeS() const { return _gps_last_ok ? (::millis() - _gps_last_ok_ms) / 1000 : 0xFFFFFFFF; }
-  void onDisconnect(uint16_t conn_hdl);
+  findhub::FindHub& hub() { return _hub; }
+  findhub::FindHubBeacon& beacon() { return _hub.beacon(); }
 
-  findhub::FindHubBeacon& beacon() { return _beacon; }
+  // User actions (UI, companion command).
+  void requestPairing() { _hub.requestPairing(); }
+  bool clearDevice() { return _hub.beacon().factoryReset(); }
+
+  // BLE glue. onConnect/onDisconnect run on the BLE task (they only queue).
+  void onConnect(uint16_t conn_hdl);
+  void onDisconnect(uint16_t conn_hdl);
+  // The scheduler reports each address it starts advertising on, so a new link
+  // can be matched to the address the Seeker saw.
+  void noteAdvAddress(const uint8_t addr[findhub::ADDR_LEN]);
 
   struct Stats {
     uint16_t reads, writes, long_writes, queue_full, rejected;   // rejected: offset/len/no service
     uint32_t last_sd_err;      // last non-success return from a SoftDevice reply/notify
     uint16_t notifies, notify_fail;
+    uint16_t kbp_ok, kbp_fail, ak_ok, ak_fail;
   };
   const Stats& stats() const { return _stats; }
-  bool wantsAdvertising() { return _beacon.isProvisioned(); }
-  size_t advertisement(uint8_t out[findhub::ADV_FRAME_LEN]) { return _beacon.buildAdvert(out); }
 
   // FindHubPlatform
   void randomBytes(uint8_t* dest, size_t len) override;
-  uint32_t unixTime() override;
   uint32_t millis() override { return ::millis(); }
+  uint32_t beaconClock() override;
   int8_t calibratedPower() override;
   findhub::BatteryLevel batteryLevel() override;
-  bool saveProvisioning(const findhub::Provisioning* p) override;
+  bool saveAccountKeys(const findhub::AccountKeyData* d) override;
+  bool saveEik(const uint8_t* eik) override;
   void ringStart() override { if (_ring_cb) _ring_cb(true); }
   void ringStop() override { if (_ring_cb) _ring_cb(false); }
   void notify(uint8_t conn, const uint8_t* data, size_t len) override;
 
 private:
-  enum ReqType : uint8_t { REQ_READ, REQ_WRITE, REQ_LONG_WRITE, REQ_DISCONNECT };
+  enum ReqType : uint8_t { REQ_READ, REQ_WRITE, REQ_LONG_WRITE, REQ_CONNECT, REQ_DISCONNECT };
+  enum Chr : uint8_t { CHR_BEACON, CHR_KBP, CHR_PASSKEY, CHR_ACCOUNT_KEY, CHR_FW_REV, CHR_NONE };
   struct Req {
     ReqType type;
+    Chr chr;
     uint16_t conn;
     uint8_t len;
-    uint8_t data[64];
+    uint8_t data[80];          // Key-based Pairing with the Seeker's public key
   };
   static const uint8_t QUEUE_LEN = 8;
 
   BLEService _svc;
-  BLECharacteristic _chr;
-  findhub::FindHubBeacon _beacon;
-  mesh::RTCClock* _clock;
+  BLECharacteristic _model_id;
+  BLECharacteristic _kbp;
+  BLECharacteristic _passkey;
+  BLECharacteristic _account_key;
+  BLECharacteristic _beacon_chr;
+  BLEService _dis;
+  BLECharacteristic _fw_rev;
+  const char* _fw_version;
+
+  findhub::FastPairConfig _cfg;
+  findhub::FindHub _hub;
   mesh::MainBoard* _board;
   RingCallback _ring_cb;
 
@@ -80,23 +104,23 @@ private:
   volatile uint8_t _q_head;    // written by the BLE task
   volatile uint8_t _q_tail;    // written by loop()
 
-  uint32_t _last_clock_save;
+  uint8_t _adv_addr[2][findhub::ADDR_LEN];   // [0] = current, [1] = previous
+  bool _started;
+
+  // beacon clock: seconds, persisted, counts from the first boot
+  uint32_t _clock_s;
+  uint32_t _clock_ms_acc;
+  uint32_t _clock_last_ms;
+  uint32_t _clock_saved;
+
   Stats _stats;
 
-  SensorManager* _sensors = nullptr;
-  const uint8_t* _user_gps = nullptr;
-  GpsSync _gps_state = GPS_IDLE;
-  bool _gps_last_ok = false;
-  bool _gps_we_powered = false;
-  uint32_t _gps_started_ms = 0;
-  uint32_t _gps_last_ok_ms = 0;
-  uint32_t _gps_next_try_ms = 0;     // 0 = as soon as provisioned (boot)
-  void gpsLoop();
-
-  bool push(ReqType type, uint16_t conn, const uint8_t* data, size_t len);
+  bool push(ReqType type, Chr chr, uint16_t conn, const uint8_t* data, size_t len);
   void handle(const Req& r);
+  void handleWrite(const Req& r);
   void loadState();
-  void persistClock();
+  void persistClock(bool force);
+  Chr chrOf(BLECharacteristic* c) const;
 
   static void onReadAuth(uint16_t conn_hdl, BLECharacteristic* chr, ble_gatts_evt_read_t* req);
   static void onWriteAuth(uint16_t conn_hdl, BLECharacteristic* chr, ble_gatts_evt_write_t* req);

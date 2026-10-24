@@ -33,7 +33,7 @@
 
 #include "icons.h"
 
-#ifdef FINDHUB_BEACON
+#ifdef WITH_FINDHUB
 static UITask* ui_task_instance = nullptr;
 #endif
 
@@ -106,6 +106,9 @@ class HomeScreen : public UIScreen {
 #if UI_DISCOVER_SCREEN
     DISCOVERY,
 #endif
+#ifdef WITH_FINDHUB
+    FINDHUB,
+#endif
 #ifndef UI_NO_HIBERNATE
     SHUTDOWN,
 #endif
@@ -119,6 +122,9 @@ class HomeScreen : public UIScreen {
   uint8_t _page;
   bool _shutdown_init;
   AdvertPath recent[UI_RECENT_LIST_SIZE];
+#ifdef WITH_FINDHUB
+  unsigned long _findhub_confirm_until = 0;   // second press removes the device
+#endif
 #if UI_DISCOVER_SCREEN
   DiscoveredNode discovered[DISCOVERED_NODES_TABLE_SIZE]; // not circular, latest discovered nodes are not kept
   uint32_t disc_node_req_tag = 0;
@@ -545,6 +551,42 @@ public:
         display.drawTextCentered(display.width() / 2, y, "discover: " PRESS_LABEL);
       }
 #endif
+#ifdef WITH_FINDHUB
+    } else if (_page == HomePage::FINDHUB) {
+      // Register (Fast Pair from the phone) and remove, from the joystick.
+      display.setTextSize(1);
+      display.setColor(UIColor::primary_txt);
+      display.drawTextCentered(display.width() / 2, 18, "Find Hub");
+      const char* line1 = "not registered";
+      const char* line2 = "register: " PRESS_LABEL;
+      if (findhub_service) {
+        findhub::FindHub& hub = findhub_service->hub();
+        bool confirming = millis() < _findhub_confirm_until;
+        switch (hub.state()) {
+          case findhub::FindHub::ST_PAIRING:
+            line1 = "pairing: open phone";
+            line2 = "cancel: " PRESS_LABEL;
+            break;
+          case findhub::FindHub::ST_AWAIT_EIK:
+            line1 = "adding to Find Hub..";
+            line2 = "";
+            break;
+          case findhub::FindHub::ST_PROVISIONED:
+            line1 = hub.beacon().isRinging() ? "RINGING" : "registered";
+            line2 = confirming ? "again to REMOVE" : "remove: " PRESS_LABEL;
+            break;
+          default:
+            break;
+        }
+        if (hub.state() == findhub::FindHub::ST_PROVISIONED && hub.consentOpen() && !hub.beacon().isRinging()) {
+          line1 = "registered, key rec.";   // EIK recovery window open (1 min)
+        }
+      }
+      display.setColor(UIColor::secondary_txt);
+      display.drawTextCentered(display.width() / 2, 34, line1);
+      display.drawTextCentered(display.width() / 2, 64 - 11, line2);
+      return 1000;
+#endif
 #ifndef UI_NO_HIBERNATE
     } else if (_page == HomePage::SHUTDOWN) {
       display.setColor(UIColor::corp_blue);
@@ -618,6 +660,34 @@ public:
     }
     if (c == KEY_SELECT && _page == HomePage::DISCOVERY) {
       discovery_disp_names = !discovery_disp_names;
+      return true;
+    }
+#endif
+#ifdef WITH_FINDHUB
+    if (c == KEY_ENTER && _page == HomePage::FINDHUB && findhub_service) {
+      findhub::FindHub& hub = findhub_service->hub();
+      switch (hub.state()) {
+        case findhub::FindHub::ST_IDLE:
+          hub.requestPairing();
+          _task->showAlert("Pairing 10 min", 1000);
+          break;
+        case findhub::FindHub::ST_PAIRING:
+          hub.stopPairing();
+          break;
+        case findhub::FindHub::ST_PROVISIONED:
+          if (millis() < _findhub_confirm_until) {
+            _findhub_confirm_until = 0;
+            // Stops the beacon and forgets the keys here; the phone's Find Hub
+            // app still lists the device until it is removed there.
+            _task->showAlert(findhub_service->clearDevice() ? "Removed" : "Remove failed", 1500);
+          } else {
+            hub.requestPairing();         // provisioned: opens the EIK recovery window
+            _findhub_confirm_until = millis() + 5000;
+          }
+          break;
+        default:
+          break;
+      }
       return true;
     }
 #endif
@@ -744,7 +814,7 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
     _display->turnOn();
   }
 
-#ifdef FINDHUB_BEACON
+#ifdef WITH_FINDHUB
   ui_task_instance = this;
   if (findhub_service) findhub_service->setRingCallback(onFindHubRing);
 #endif
@@ -928,7 +998,7 @@ bool UITask::isButtonPressed() const {
 #endif
 }
 
-#ifdef FINDHUB_BEACON
+#ifdef WITH_FINDHUB
 volatile bool UITask::_findhub_ringing = false;
 
 void UITask::onFindHubRing(bool on) {
@@ -1025,7 +1095,7 @@ void UITask::loop() {
   }
 #endif
 
-#ifdef FINDHUB_BEACON
+#ifdef WITH_FINDHUB
   if (c != 0 && findhub_service && findhub_service->beacon().isRinging()) {
     findhub_service->beacon().buttonPressed();   // any key silences a find request
     c = 0;
@@ -1041,7 +1111,7 @@ void UITask::loop() {
   userLedHandler();
 
 #ifdef PIN_BUZZER
-  #ifdef FINDHUB_BEACON
+  #ifdef WITH_FINDHUB
   if (_findhub_ringing && !buzzer.isPlaying()) buzzer.playForced(FINDHUB_RING_MELODY);
   #endif
   if (buzzer.isPlaying())  buzzer.loop();

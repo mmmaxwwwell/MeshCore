@@ -9,107 +9,214 @@ using namespace findhub;
 FindHubService* findhub_service = nullptr;
 static uint32_t* sd_err_sink = nullptr;
 
-// Beacon Actions: FE2C1238-8366-4814-8EB0-01DE32100BEA (little-endian for Bluefruit).
-static const uint8_t BEACON_ACTIONS_UUID[16] = {
-  0xEA, 0x0B, 0x10, 0x32, 0xDE, 0x01, 0xB0, 0x8E, 0x14, 0x48, 0x66, 0x83, 0x38, 0x12, 0x2C, 0xFE,
-};
+// FE2C12xx-8366-4814-8EB0-01DE32100BEA (little-endian for Bluefruit); byte 12 = xx.
+static BLEUuid fpUuid(uint8_t xx) {
+  uint8_t u[16] = { 0xEA, 0x0B, 0x10, 0x32, 0xDE, 0x01, 0xB0, 0x8E, 0x14, 0x48, 0x66, 0x83, xx, 0x12, 0x2C, 0xFE };
+  return BLEUuid(u);
+}
 static const uint16_t FAST_PAIR_SERVICE_UUID = 0xFE2C;
+static const uint16_t DIS_UUID = 0x180A;
+static const uint16_t FW_REV_UUID = 0x2A26;
 
-#define PROV_FILE      "/findhub"
-#define CLOCK_FILE     "/findhub_clk"
-#define PROV_MAGIC     0x314E4846UL     // "FHN1"
+#define AK_FILE        "/fh_ak"
+#define EIK_FILE       "/fh_eik"
+#define CLOCK_FILE     "/fh_clk"
+#define BOOT_FILE      "/fh_boot"       // exists once Find Hub ran on this device
+#define AK_MAGIC       0x324B4146UL     // "FAK2"
+#define EIK_MAGIC      0x324B4945UL     // "EIK2"
 #define CLOCK_SAVE_SECS 3600            // spec: persist the clock at least daily
-#define GPS_RESYNC_MS   (24UL * 3600 * 1000)   // daily: the nRF52 RC/crystal drift stays well inside a window
-#define GPS_TIMEOUT_MS  (10UL * 60 * 1000)     // cold start indoors may never fix; give up and retry
-#define GPS_RETRY_MS    (60UL * 60 * 1000)
 
-struct ProvRecord {
-  uint32_t magic;
-  Provisioning prov;
-};
+struct AkRecord { uint32_t magic; AccountKeyData d; };
+struct EikRecord { uint32_t magic; uint8_t eik[EIK_LEN]; };
+
+static bool hexToBytes(const char* hex, uint8_t* out, size_t len) {
+  if (strlen(hex) != len * 2) return false;
+  for (size_t i = 0; i < len; i++) {
+    unsigned v;
+    if (sscanf(&hex[i * 2], "%2x", &v) != 1) return false;
+    out[i] = (uint8_t)v;
+  }
+  return true;
+}
+
+static FastPairConfig makeConfig() {
+  FastPairConfig c;
+  uint32_t id = FINDHUB_MODEL_ID;
+  c.model_id[0] = (uint8_t)(id >> 16);
+  c.model_id[1] = (uint8_t)(id >> 8);
+  c.model_id[2] = (uint8_t)id;
+  if (!hexToBytes(FINDHUB_ANTISPOOF_KEY_HEX, c.antispoof_priv, sizeof(c.antispoof_priv))) {
+    memset(c.antispoof_priv, 0, sizeof(c.antispoof_priv));   // ECDH then fails: no initial pairing
+  }
+  return c;
+}
 
 FindHubService::FindHubService()
-  : _svc(FAST_PAIR_SERVICE_UUID), _chr(BEACON_ACTIONS_UUID), _beacon(*this),
-    _clock(nullptr), _board(nullptr), _ring_cb(nullptr), _q_head(0), _q_tail(0), _last_clock_save(0) {
+  : _svc(FAST_PAIR_SERVICE_UUID), _model_id(fpUuid(0x33)), _kbp(fpUuid(0x34)), _passkey(fpUuid(0x35)),
+    _account_key(fpUuid(0x36)), _beacon_chr(fpUuid(0x38)), _dis(DIS_UUID), _fw_rev(FW_REV_UUID),
+    _fw_version("unknown"), _cfg(makeConfig()), _hub(*this, _cfg), _board(nullptr), _ring_cb(nullptr),
+    _q_head(0), _q_tail(0), _started(false), _clock_s(0), _clock_ms_acc(0), _clock_last_ms(0), _clock_saved(0) {
   memset(&_stats, 0, sizeof(_stats));
+  memset(_adv_addr, 0, sizeof(_adv_addr));
   findhub_service = this;
 }
 
-void FindHubService::begin(mesh::RTCClock* clock, mesh::MainBoard* board) {
-  _clock = clock;
+void FindHubService::begin(mesh::MainBoard* board, const char* fw_version) {
   _board = board;
+  if (fw_version) _fw_version = fw_version;
   loadState();
 }
 
 void FindHubService::loadState() {
-  File f = InternalFS.open(PROV_FILE, FILE_O_READ);
+  // Files of the earlier companion-provisioned beacon: incompatible, drop them.
+  InternalFS.remove("/findhub");
+  InternalFS.remove("/findhub_clk");
+
+  bool first_boot = !InternalFS.exists(BOOT_FILE);
+  if (first_boot) {
+    File f = InternalFS.open(BOOT_FILE, FILE_O_WRITE);
+    if (f) f.close();
+  }
+
+  AkRecord ak;
+  bool have_ak = false;
+  File f = InternalFS.open(AK_FILE, FILE_O_READ);
   if (f) {
-    ProvRecord rec;
-    if (f.read((uint8_t*)&rec, sizeof(rec)) == sizeof(rec) && rec.magic == PROV_MAGIC) {
-      _beacon.load(&rec.prov);
-    }
-    memset(&rec, 0, sizeof(rec));
+    have_ak = f.read((uint8_t*)&ak, sizeof(ak)) == sizeof(ak) && ak.magic == AK_MAGIC && ak.d.count <= MAX_ACCOUNT_KEYS;
+    f.close();
+  }
+  EikRecord eik;
+  bool have_eik = false;
+  f = InternalFS.open(EIK_FILE, FILE_O_READ);
+  if (f) {
+    have_eik = f.read((uint8_t*)&eik, sizeof(eik)) == sizeof(eik) && eik.magic == EIK_MAGIC;
     f.close();
   }
 
-  // No RTC on this board: after a reset the clock restarts in 2024. Resume from the
-  // last saved value so the EIDs are at most CLOCK_SAVE_SECS (+ the time off) behind
-  // until GPS, the companion app or the gateway sets the real time.
+  // The beacon clock resumes from the last saved value (spec "Recovery from
+  // power loss"); time spent powered off is lost, and the owner's phone
+  // re-synchronises from the not-discoverable frames sent after boot.
   f = InternalFS.open(CLOCK_FILE, FILE_O_READ);
   if (f) {
     uint32_t saved = 0;
-    if (f.read((uint8_t*)&saved, sizeof(saved)) == sizeof(saved) && _clock && saved > _clock->getCurrentTime()) {
-      _clock->setCurrentTime(saved);
-    }
-    _last_clock_save = saved;
+    if (f.read((uint8_t*)&saved, sizeof(saved)) == sizeof(saved)) _clock_s = saved;
     f.close();
   }
+  _clock_saved = _clock_s;
+  _clock_last_ms = ::millis();
+
+  _hub.begin(have_ak ? &ak.d : NULL, have_eik ? eik.eik : NULL, first_boot);
+  memset(&ak, 0, sizeof(ak));
+  memset(&eik, 0, sizeof(eik));
+  _started = true;
 }
 
-void FindHubService::persistClock() {
-  if (!_beacon.isProvisioned() || !_beacon.clockValid()) return;
-  uint32_t now = unixTime();
-  if (now < _last_clock_save + CLOCK_SAVE_SECS) return;
+uint32_t FindHubService::beaconClock() {
+  uint32_t now = ::millis();
+  _clock_ms_acc += now - _clock_last_ms;     // wrap-safe
+  _clock_last_ms = now;
+  if (_clock_ms_acc >= 1000) {
+    _clock_s += _clock_ms_acc / 1000;
+    _clock_ms_acc %= 1000;
+  }
+  return _clock_s;
+}
+
+void FindHubService::persistClock(bool force) {
+  // Only a device that is (being) paired needs its clock; spare the flash otherwise.
+  if (_hub.fastPair().keyCount() == 0 && !_hub.beacon().isProvisioned()) return;
+  uint32_t now = beaconClock();
+  if (!force && now < _clock_saved + CLOCK_SAVE_SECS) return;
   InternalFS.remove(CLOCK_FILE);
   File f = InternalFS.open(CLOCK_FILE, FILE_O_WRITE);
   if (f) {
     f.write((const uint8_t*)&now, sizeof(now));
     f.close();
   }
-  _last_clock_save = now;
+  _clock_saved = now;
 }
 
-bool FindHubService::saveProvisioning(const Provisioning* p) {
-  InternalFS.remove(PROV_FILE);
-  if (!p) return !InternalFS.exists(PROV_FILE);
-  File f = InternalFS.open(PROV_FILE, FILE_O_WRITE);
+static bool writeFile(const char* path, const void* data, size_t len) {
+  InternalFS.remove(path);
+  if (!data) return !InternalFS.exists(path);
+  File f = InternalFS.open(path, FILE_O_WRITE);
   if (!f) return false;
-  ProvRecord rec;
-  rec.magic = PROV_MAGIC;
-  rec.prov = *p;
-  bool ok = f.write((const uint8_t*)&rec, sizeof(rec)) == sizeof(rec);
-  memset(&rec, 0, sizeof(rec));
+  bool ok = f.write((const uint8_t*)data, len) == len;
   f.close();
+  return ok;
+}
+
+bool FindHubService::saveAccountKeys(const AccountKeyData* d) {
+  if (!d) return writeFile(AK_FILE, NULL, 0);
+  AkRecord rec;
+  rec.magic = AK_MAGIC;
+  rec.d = *d;
+  bool ok = writeFile(AK_FILE, &rec, sizeof(rec));
+  memset(&rec, 0, sizeof(rec));
+  return ok;
+}
+
+bool FindHubService::saveEik(const uint8_t* eik) {
+  if (!eik) return writeFile(EIK_FILE, NULL, 0);
+  EikRecord rec;
+  rec.magic = EIK_MAGIC;
+  memcpy(rec.eik, eik, EIK_LEN);
+  bool ok = writeFile(EIK_FILE, &rec, sizeof(rec));
+  memset(&rec, 0, sizeof(rec));
+  if (ok) persistClock(true);         // the Seeker just took our clock as its reference
   return ok;
 }
 
 void FindHubService::beginGatt() {
   sd_err_sink = &_stats.last_sd_err;
   _svc.begin();
-  _chr.setProperties(CHR_PROPS_READ | CHR_PROPS_WRITE | CHR_PROPS_NOTIFY);
-  _chr.setPermission(SECMODE_OPEN, SECMODE_OPEN);     // spec: not encrypted
-  _chr.setMaxLen(64);
-  _chr.setReadAuthorizeCallback(onReadAuth, false);    // run on the BLE task, just queue
-  _chr.setWriteAuthorizeCallback(onWriteAuth, false);
-  _chr.setWriteCallback(onLongWrite, false);
-  _chr.begin();
+
+  _model_id.setProperties(CHR_PROPS_READ);
+  _model_id.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  _model_id.setFixedLen(MODEL_ID_LEN);
+  _model_id.begin();
+  _model_id.write(_cfg.model_id, MODEL_ID_LEN);
+
+  // Spec: none of these is encrypted. Writes are authorised so the answer (and
+  // the notification before it) comes from the main loop.
+  BLECharacteristic* writable[] = { &_kbp, &_passkey, &_account_key, &_beacon_chr };
+  for (BLECharacteristic* c : writable) {
+    bool notify = c != &_account_key;
+    bool read = c == &_beacon_chr;
+    c->setProperties(CHR_PROPS_WRITE | (notify ? CHR_PROPS_NOTIFY : 0) | (read ? CHR_PROPS_READ : 0));
+    c->setPermission(read ? SECMODE_OPEN : SECMODE_NO_ACCESS, SECMODE_OPEN);
+    c->setMaxLen(c == &_kbp ? FP_BLOCK + P256_PUB_LEN : 64);
+    c->setWriteAuthorizeCallback(onWriteAuth, false);    // run on the BLE task, just queue
+    c->setWriteCallback(onLongWrite, false);
+    if (read) c->setReadAuthorizeCallback(onReadAuth, false);
+    c->begin();
+  }
+
+  // Firmware Revision (Seekers read it during pairing and once a day after).
+  // Spec: readable while discoverable or after an authenticated Beacon Actions op.
+  _dis.begin();
+  _fw_rev.setProperties(CHR_PROPS_READ);
+  _fw_rev.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  _fw_rev.setMaxLen(32);
+  _fw_rev.setReadAuthorizeCallback(onReadAuth, false);
+  _fw_rev.begin();
 }
 
-bool FindHubService::push(ReqType type, uint16_t conn, const uint8_t* data, size_t len) {
+FindHubService::Chr FindHubService::chrOf(BLECharacteristic* c) const {
+  if (c == &_beacon_chr) return CHR_BEACON;
+  if (c == &_kbp) return CHR_KBP;
+  if (c == &_passkey) return CHR_PASSKEY;
+  if (c == &_account_key) return CHR_ACCOUNT_KEY;
+  if (c == &_fw_rev) return CHR_FW_REV;
+  return CHR_NONE;
+}
+
+bool FindHubService::push(ReqType type, Chr chr, uint16_t conn, const uint8_t* data, size_t len) {
   uint8_t next = (_q_head + 1) % QUEUE_LEN;
   if (next == _q_tail) { _stats.queue_full++; return false; }
   Req& r = _queue[_q_head];
   r.type = type;
+  r.chr = chr;
   r.conn = conn;
   r.len = len > sizeof(r.data) ? sizeof(r.data) : len;
   if (data && r.len) memcpy(r.data, data, r.len);
@@ -146,18 +253,20 @@ static void replyWrite(uint16_t conn, uint16_t status, const uint8_t* data, uint
 }
 
 void FindHubService::onReadAuth(uint16_t conn_hdl, BLECharacteristic* chr, ble_gatts_evt_read_t* req) {
-  if (findhub_service && req->offset == 0) findhub_service->_stats.reads++;
-  if (!findhub_service || req->offset != 0 || !findhub_service->push(REQ_READ, conn_hdl, NULL, 0)) {
-    if (findhub_service) findhub_service->_stats.rejected++;
+  FindHubService* s = findhub_service;
+  if (s && req->offset == 0) s->_stats.reads++;
+  if (!s || req->offset != 0 || !s->push(REQ_READ, s->chrOf(chr), conn_hdl, NULL, 0)) {
+    if (s) s->_stats.rejected++;
     replyRead(conn_hdl, BLE_GATT_STATUS_ATTERR_UNLIKELY_ERROR, NULL, 0);
   }
 }
 
 void FindHubService::onWriteAuth(uint16_t conn_hdl, BLECharacteristic* chr, ble_gatts_evt_write_t* req) {
-  if (findhub_service) findhub_service->_stats.writes++;
-  if (!findhub_service || req->offset != 0 || req->len > 64 ||
-      !findhub_service->push(REQ_WRITE, conn_hdl, req->data, req->len)) {
-    if (findhub_service) findhub_service->_stats.rejected++;
+  FindHubService* s = findhub_service;
+  if (s) s->_stats.writes++;
+  if (!s || req->offset != 0 || req->len > sizeof(Req::data) ||
+      !s->push(REQ_WRITE, s->chrOf(chr), conn_hdl, req->data, req->len)) {
+    if (s) s->_stats.rejected++;
     replyWrite(conn_hdl, BLE_GATT_STATUS_ATTERR_UNLIKELY_ERROR, NULL, 0);
   }
 }
@@ -165,84 +274,115 @@ void FindHubService::onWriteAuth(uint16_t conn_hdl, BLECharacteristic* chr, ble_
 // A prepared (long) write is already acknowledged by Bluefruit, so only the
 // notification can carry the outcome.
 void FindHubService::onLongWrite(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
-  if (findhub_service) findhub_service->_stats.long_writes++;
-  if (findhub_service && len <= 64) findhub_service->push(REQ_LONG_WRITE, conn_hdl, data, len);
+  FindHubService* s = findhub_service;
+  if (s) s->_stats.long_writes++;
+  if (s && len <= sizeof(Req::data)) s->push(REQ_LONG_WRITE, s->chrOf(chr), conn_hdl, data, len);
+}
+
+void FindHubService::noteAdvAddress(const uint8_t addr[ADDR_LEN]) {
+  if (memcmp(_adv_addr[0], addr, ADDR_LEN) == 0) return;
+  memcpy(_adv_addr[1], _adv_addr[0], ADDR_LEN);
+  memcpy(_adv_addr[0], addr, ADDR_LEN);
+}
+
+void FindHubService::onConnect(uint16_t conn_hdl) {
+  // Snapshot the addresses now: the scheduler may move on before loop() runs.
+  push(REQ_CONNECT, CHR_NONE, conn_hdl, &_adv_addr[0][0], sizeof(_adv_addr));
 }
 
 void FindHubService::onDisconnect(uint16_t conn_hdl) {
-  push(REQ_DISCONNECT, conn_hdl, NULL, 0);
+  push(REQ_DISCONNECT, CHR_NONE, conn_hdl, NULL, 0);
 }
 
 void FindHubService::handle(const Req& r) {
   uint8_t conn = r.conn < MAX_CONN ? (uint8_t)r.conn : 0xFF;
   switch (r.type) {
-    case REQ_READ: {
-      uint8_t out[1 + NONCE_LEN];
-      size_t n = _beacon.onRead(conn, out);
-      replyRead(r.conn, n ? BLE_GATT_STATUS_SUCCESS : BLE_GATT_STATUS_ATTERR_UNLIKELY_ERROR, n ? out : NULL, n);
-      break;
-    }
-    case REQ_WRITE:
-    case REQ_LONG_WRITE: {
-      uint8_t rsp[MAX_NOTIFY_LEN];
-      size_t rsp_len = 0;
-      uint8_t status = _beacon.onWrite(conn, r.data, r.len, rsp, &rsp_len);
-      if (status == ATT_OK && rsp_len) notify(conn, rsp, rsp_len);   // before the write response (spec)
-      if (r.type == REQ_WRITE) {
-        replyWrite(r.conn, status == ATT_OK ? BLE_GATT_STATUS_SUCCESS : (uint16_t)(0x0100 | status), r.data, r.len);
+    case REQ_READ:
+      if (r.chr == CHR_BEACON) {
+        uint8_t out[1 + NONCE_LEN];
+        size_t n = beacon().onRead(conn, out);
+        replyRead(r.conn, n ? BLE_GATT_STATUS_SUCCESS : BLE_GATT_STATUS_ATTERR_UNLIKELY_ERROR, n ? out : NULL, n);
+      } else if (r.chr == CHR_FW_REV) {
+        bool allowed = _hub.pairingMode() || beacon().authenticated(conn);
+        if (allowed) replyRead(r.conn, BLE_GATT_STATUS_SUCCESS, (const uint8_t*)_fw_version, strlen(_fw_version));
+        else replyRead(r.conn, BLE_GATT_STATUS_ATTERR_INSUF_AUTHORIZATION, NULL, 0);
+      } else {
+        replyRead(r.conn, BLE_GATT_STATUS_ATTERR_UNLIKELY_ERROR, NULL, 0);
       }
+      break;
+    case REQ_WRITE:
+    case REQ_LONG_WRITE:
+      handleWrite(r);
+      break;
+    case REQ_CONNECT: {
+      // The addresses advertised around the connection, plus the tag's own.
+      uint8_t addrs[MAX_LINK_ADDRS][ADDR_LEN];
+      memcpy(addrs, r.data, 2 * ADDR_LEN);
+      size_t n = 2;
+      uint8_t tag[MAX_LINK_ADDRS][ADDR_LEN];
+      size_t nt = _hub.tagAddresses(tag, MAX_LINK_ADDRS);
+      for (size_t i = 0; i < nt && n < MAX_LINK_ADDRS; i++) {
+        if (memcmp(tag[i], addrs[0], ADDR_LEN) && memcmp(tag[i], addrs[1], ADDR_LEN)) memcpy(addrs[n++], tag[i], ADDR_LEN);
+      }
+      _hub.fastPair().onConnect(conn, addrs, n);
       break;
     }
     case REQ_DISCONNECT:
-      _beacon.onDisconnect(conn);
+      _hub.fastPair().onDisconnect(conn);
+      beacon().onDisconnect(conn);
       break;
   }
 }
 
+void FindHubService::handleWrite(const Req& r) {
+  uint8_t conn = r.conn < MAX_CONN ? (uint8_t)r.conn : 0xFF;
+  uint8_t status = 0x0E;      // unlikely error
+  uint8_t rsp[MAX_NOTIFY_LEN];
+  size_t rsp_len = 0;
+  BLECharacteristic* notify_chr = NULL;
+  switch (r.chr) {
+    case CHR_BEACON:
+      status = beacon().onWrite(conn, r.data, r.len, rsp, &rsp_len);
+      notify_chr = &_beacon_chr;
+      break;
+    case CHR_KBP:
+      status = _hub.fastPair().onKeyBasedPairing(conn, r.data, r.len, rsp, &rsp_len);
+      if (status == FP_OK) _stats.kbp_ok++; else _stats.kbp_fail++;
+      notify_chr = &_kbp;
+      break;
+    case CHR_PASSKEY:
+      // Bluefruit answers numeric comparison inside its own event handler, so the
+      // bonding flow cannot wait for this write: it only works without bonding.
+      status = _hub.fastPair().onPasskey(conn, r.data, r.len, rsp, &rsp_len);
+      notify_chr = &_passkey;
+      break;
+    case CHR_ACCOUNT_KEY: {
+      BLEConnection* c = Bluefruit.Connection(r.conn);
+      status = _hub.fastPair().onAccountKey(conn, r.data, r.len, c && c->secured());
+      if (status == FP_OK) _stats.ak_ok++; else _stats.ak_fail++;
+      break;
+    }
+    default:
+      break;
+  }
+  if (status == 0 && rsp_len && notify_chr) {     // before the write response (spec)
+    _stats.notifies++;
+    if (!notify_chr->notify(r.conn, rsp, rsp_len)) _stats.notify_fail++;
+  }
+  if (r.type == REQ_WRITE) {
+    replyWrite(r.conn, status == 0 ? BLE_GATT_STATUS_SUCCESS : (uint16_t)(0x0100 | status), r.data, r.len);
+  }
+}
+
 void FindHubService::loop() {
+  if (!_started) return;
   while (_q_tail != _q_head) {
     __DMB();
     handle(_queue[_q_tail]);
     _q_tail = (_q_tail + 1) % QUEUE_LEN;
   }
-  _beacon.loop();
-  gpsLoop();
-  persistClock();
-}
-
-void FindHubService::gpsLoop() {
-  if (!_sensors || !_beacon.isProvisioned()) return;
-  LocationProvider* loc = _sensors->getLocationProvider();
-  if (!loc) { _gps_state = GPS_NO_GPS; return; }
-  uint32_t now = ::millis();
-  bool user_on = _user_gps && *_user_gps;
-
-  if (_gps_state == GPS_IDLE) {
-    if ((int32_t)(now - _gps_next_try_ms) < 0) return;
-    loc->syncTime();                         // set the RTC from the next good fix
-    if (!user_on) {                          // the user's GPS is already running otherwise
-      if (!_sensors->setSettingValue("gps", "1")) { _gps_state = GPS_NO_GPS; return; }
-      _gps_we_powered = true;
-    }
-    _gps_started_ms = now;
-    _gps_state = GPS_SYNCING;
-    return;
-  }
-
-  if (_gps_state != GPS_SYNCING) return;
-  bool done = !loc->waitingTimeSync();
-  bool timed_out = now - _gps_started_ms > GPS_TIMEOUT_MS;
-  if (!done && !timed_out) return;
-
-  if (done) {
-    _gps_last_ok = true;
-    _gps_last_ok_ms = now;
-  }
-  _gps_next_try_ms = now + (done ? GPS_RESYNC_MS : GPS_RETRY_MS);
-  // Power down only what we powered up, and not if the user switched GPS on meanwhile.
-  if (_gps_we_powered && !(_user_gps && *_user_gps)) _sensors->setSettingValue("gps", "0");
-  _gps_we_powered = false;
-  _gps_state = GPS_IDLE;
+  _hub.loop();
+  persistClock(false);
 }
 
 void FindHubService::randomBytes(uint8_t* dest, size_t len) {
@@ -259,13 +399,9 @@ void FindHubService::randomBytes(uint8_t* dest, size_t len) {
   }
 }
 
-uint32_t FindHubService::unixTime() {
-  return _clock ? _clock->getCurrentTime() : 0;
-}
-
 int8_t FindHubService::calibratedPower() {
   // RSSI at 0 m: TX power minus a typical ~10 dB of antenna/near-field loss for
-  // a small PCB antenna. Only used by seekers for distance hints.
+  // a small PCB antenna. Seekers use it for distance hints only.
   return (int8_t)(BLE_TX_POWER - 10);
 }
 
@@ -280,5 +416,5 @@ BatteryLevel FindHubService::batteryLevel() {
 void FindHubService::notify(uint8_t conn, const uint8_t* data, size_t len) {
   if (conn >= MAX_CONN) return;
   _stats.notifies++;
-  if (!_chr.notify(conn, data, len)) _stats.notify_fail++;
+  if (!_beacon_chr.notify(conn, data, len)) _stats.notify_fail++;
 }

@@ -3,7 +3,7 @@
 #include <string.h>
 #include "ble_gap.h"
 #include "ble_hci.h"
-#ifdef FINDHUB_BEACON
+#ifdef WITH_FINDHUB
   #include "FindHubService.h"
 #endif
 
@@ -22,15 +22,14 @@
 #define BLE_ADV_INTERVAL_MAX       244    // 152.5ms (units: 0.625ms)
 #define BLE_ADV_FAST_TIMEOUT       30     // seconds
 
-#ifdef FINDHUB_BEACON
-// Beacon multiplexing (spec: an FHN frame at least every 2 s). While no companion
-// client is connected the two adverts take turns; with one connected, only the
-// beacon advertises (the second peripheral link is for a ringing phone).
-#define BEACON_SLOT_COMPANION_MS   1200
-#define BEACON_SLOT_BEACON_MS      800
-#define BEACON_ADV_INTERVAL        320    // 200ms, beacon slot
-#define BEACON_COMPANION_INTERVAL  160    // 100ms, companion slot (keeps pairing snappy)
-#define BEACON_ONLY_INTERVAL       800    // 500ms, beacon alone
+#ifdef WITH_FINDHUB
+// Advertising cycle (one SoftDevice advertising set): each wanted advert gets a
+// slot, so the FHN frame comes round well inside the spec's 2 s.
+#define SLOT_COMPANION_MS          900
+#define SLOT_FASTPAIR_MS           600
+#define SLOT_FHN_MS                500
+#define COMPANION_INTERVAL_CYCLE   160    // 100 ms while sharing (keeps pairing snappy)
+#define COMPANION_INTERVAL_ALONE   244    // 152.5 ms, the stock slow interval
 #endif
 
 // RX drain buffer size for overflow protection
@@ -40,10 +39,13 @@ static SerialBLEInterface* instance = nullptr;
 
 void SerialBLEInterface::onConnect(uint16_t connection_handle) {
   BLE_DEBUG_PRINTLN("SerialBLEInterface: connected handle=0x%04X", connection_handle);
+#ifdef WITH_FINDHUB
+  if (findhub_service) findhub_service->onConnect(connection_handle);
+#endif
   if (instance) {
     if (instance->_isDeviceConnected) {
       // A companion client is already secured on another link; this one (e.g. a
-      // phone ringing the Find Hub beacon) gets no companion role.
+      // phone using Fast Pair / Find Hub) gets no companion role.
       BLE_DEBUG_PRINTLN("SerialBLEInterface: extra link, companion stays on 0x%04X", instance->_conn_handle);
       return;
     }
@@ -55,7 +57,7 @@ void SerialBLEInterface::onConnect(uint16_t connection_handle) {
 
 void SerialBLEInterface::onDisconnect(uint16_t connection_handle, uint8_t reason) {
   BLE_DEBUG_PRINTLN("SerialBLEInterface: disconnected handle=0x%04X reason=%u", connection_handle, reason);
-#ifdef FINDHUB_BEACON
+#ifdef WITH_FINDHUB
   if (findhub_service) findhub_service->onDisconnect(connection_handle);
 #endif
   if (instance) {
@@ -165,8 +167,8 @@ void SerialBLEInterface::begin(const char* prefix, char* name, uint32_t pin_code
   #endif
   
   Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
-#ifdef FINDHUB_BEACON
-  bool ble_ok = Bluefruit.begin(2, 0);    // companion client + a phone ringing the beacon
+#ifdef WITH_FINDHUB
+  bool ble_ok = Bluefruit.begin(2, 0);    // companion client + a Fast Pair / Find Hub phone
   BLE_DEBUG_PRINTLN("Bluefruit.begin(2 periph): %s", ble_ok ? "ok" : "FAILED (SoftDevice RAM?)");
 #else
   Bluefruit.begin();
@@ -226,17 +228,24 @@ void SerialBLEInterface::begin(const char* prefix, char* name, uint32_t pin_code
   bledfu.setPermission(SECMODE_ENC_WITH_MITM, SECMODE_ENC_WITH_MITM);
   bledfu.begin();
 
-#ifdef FINDHUB_BEACON
+#ifdef WITH_FINDHUB
   if (findhub_service) findhub_service->beginGatt();
 #endif
 
   setCompanionAdvData();
 
+#ifdef WITH_FINDHUB
+  // The scheduler owns advertising: no restarts from Bluefruit's BLE task.
+  sd_ble_gap_addr_get(&_identity_addr);
+  _current_addr = _identity_addr;
+  Bluefruit.Advertising.setFastTimeout(0);
+  Bluefruit.Advertising.restartOnDisconnect(false);
+#else
   Bluefruit.Advertising.setInterval(BLE_ADV_INTERVAL_MIN, BLE_ADV_INTERVAL_MAX);
   Bluefruit.Advertising.setFastTimeout(BLE_ADV_FAST_TIMEOUT);
 
   Bluefruit.Advertising.restartOnDisconnect(true);
-
+#endif
 }
 
 void SerialBLEInterface::setCompanionAdvData() {
@@ -249,70 +258,100 @@ void SerialBLEInterface::setCompanionAdvData() {
   Bluefruit.ScanResponse.addName();
 }
 
-#ifdef FINDHUB_BEACON
-void SerialBLEInterface::startAdvSlot(AdvSlot slot, const uint8_t* beacon, uint8_t beacon_len) {
+#ifdef WITH_FINDHUB
+bool SerialBLEInterface::setAddress(const uint8_t* addr) {
+  ble_gap_addr_t want = _identity_addr;
+  if (addr) {
+    want.addr_id_peer = 0;
+    want.addr_type = BLE_GAP_ADDR_TYPE_RANDOM_STATIC;
+    memcpy(want.addr, addr, 6);
+  }
+  if (want.addr_type == _current_addr.addr_type && memcmp(want.addr, _current_addr.addr, 6) == 0) return true;
+  // Allowed while connected, not while advertising (we stopped it).
+  if (sd_ble_gap_addr_set(&want) != NRF_SUCCESS) return false;
+  _current_addr = want;
+  return true;
+}
+
+void SerialBLEInterface::startAdvSlot(AdvSlot slot, const uint8_t* data, uint8_t len, const uint8_t* addr,
+                                      bool connectable, uint16_t interval) {
   if (Bluefruit.Advertising.isRunning()) Bluefruit.Advertising.stop();
   _adv_slot = slot;
   _adv_slot_started = millis();
   if (slot == ADV_NONE) return;
 
-  uint16_t interval;
-  if (slot == ADV_BEACON) {
-    // No name or service list next to the beacon frame (spec: no identifying data
-    // unauthenticated); the companion slot still carries them for pairing.
-    Bluefruit.Advertising.clearData();
-    Bluefruit.Advertising.setData(beacon, beacon_len);
-    Bluefruit.ScanResponse.clearData();
-    Bluefruit.ScanResponse.addTxPower();   // keep the scan response non-empty, and anonymous
-    memcpy(_adv_beacon, beacon, beacon_len);
-    _adv_beacon_len = beacon_len;
-    interval = isConnected() ? BEACON_ONLY_INTERVAL : BEACON_ADV_INTERVAL;
-  } else {
-    setCompanionAdvData();
-    interval = BEACON_COMPANION_INTERVAL;
+  if (!setAddress(slot == ADV_COMPANION ? NULL : addr)) {
+    // Could not move off the identity address: never send a tag frame on it.
+    if (slot != ADV_COMPANION) { _adv_slot = ADV_NONE; return; }
   }
+  if (slot == ADV_COMPANION) {
+    setCompanionAdvData();
+  } else {
+    // No name or service list next to Find Hub frames (spec: nothing identifying
+    // unauthenticated).
+    Bluefruit.Advertising.clearData();
+    Bluefruit.Advertising.setData(data, len);
+    Bluefruit.ScanResponse.clearData();
+    if (connectable) Bluefruit.ScanResponse.addTxPower();   // scannable: keep the response non-empty, anonymous
+  }
+  if (len) memcpy(_adv_data, data, len);
+  _adv_len = len;
+  memcpy(_adv_addr, _current_addr.addr, 6);
+  _adv_connectable = connectable;
+  Bluefruit.Advertising.setType(connectable ? BLE_GAP_ADV_TYPE_CONNECTABLE_SCANNABLE_UNDIRECTED
+                                            : BLE_GAP_ADV_TYPE_NONCONNECTABLE_NONSCANNABLE_UNDIRECTED);
   Bluefruit.Advertising.setInterval(interval, interval);
+  if (findhub_service) findhub_service->noteAdvAddress(_current_addr.addr);
   Bluefruit.Advertising.start(0);
 }
 
-bool SerialBLEInterface::advertisingTick() {
-  if (!findhub_service || !findhub_service->wantsAdvertising()) {
-    if (_adv_slot != ADV_NONE) {        // beacon cleared: back to plain companion advertising
-      _adv_slot = ADV_NONE;
-      if (Bluefruit.Advertising.isRunning()) Bluefruit.Advertising.stop();
-      setCompanionAdvData();
-      Bluefruit.Advertising.setInterval(BLE_ADV_INTERVAL_MIN, BLE_ADV_INTERVAL_MAX);
-      if (!isConnected()) Bluefruit.Advertising.start(0);
+void SerialBLEInterface::advertisingTick() {
+  if (!findhub_service) return;
+  // Payloads are rebuilt each tick (the account key filter hashes every key):
+  // 20 ticks a second is plenty for 500 ms slots.
+  static unsigned long last_tick = 0;
+  if (millis() - last_tick < 50 && Bluefruit.Advertising.isRunning()) return;
+  last_tick = millis();
+  findhub::FindHub& hub = findhub_service->hub();
+  uint8_t links = Bluefruit.Periph.connected();
+  bool room = links < 2;           // a connectable advert needs a free peripheral link
+
+  findhub::AdvFrame fp, fhn;
+  bool want[ADV_SLOTS] = { false };
+  want[ADV_COMPANION] = room && !isConnected();
+  want[ADV_FASTPAIR] = room && hub.fastPairFrame(fp);
+  // While any phone is connected the FHN frame is non-connectable (fhnFrame).
+  want[ADV_FHN] = hub.fhnFrame(fhn, links) && (room || !fhn.connectable);
+  int wanted = want[ADV_COMPANION] + want[ADV_FASTPAIR] + want[ADV_FHN];
+
+  // Next slot: stay until this one's time is up, then the next wanted one.
+  static const uint16_t slot_ms[ADV_SLOTS] = { 0, SLOT_COMPANION_MS, SLOT_FASTPAIR_MS, SLOT_FHN_MS };
+  AdvSlot next = _adv_slot;
+  bool expired = _adv_slot == ADV_NONE || !want[_adv_slot] || millis() - _adv_slot_started >= slot_ms[_adv_slot];
+  if (expired) {
+    next = ADV_NONE;
+    for (int i = 1; i < ADV_SLOTS; i++) {
+      AdvSlot s = (AdvSlot)(((_adv_slot == ADV_NONE ? 0 : _adv_slot) + i - 1) % (ADV_SLOTS - 1) + 1);
+      if (want[s]) { next = s; break; }
     }
-    return false;
   }
 
-  uint8_t beacon[findhub::ADV_FRAME_LEN];
-  uint8_t beacon_len = (uint8_t)findhub_service->advertisement(beacon);
-  bool companion_link = isConnected() || _conn_handle != BLE_CONN_HANDLE_INVALID;
-
-  AdvSlot want;
-  if (Bluefruit.Periph.connected() >= 2) {
-    want = ADV_NONE;                    // both links in use; the SoftDevice cannot advertise
-  } else if (companion_link) {
-    want = beacon_len ? ADV_BEACON : ADV_NONE;
-  } else if (!beacon_len) {
-    want = ADV_COMPANION;               // clock unknown: no beacon frames yet
+  const findhub::AdvFrame* f = next == ADV_FASTPAIR ? &fp : next == ADV_FHN ? &fhn : NULL;
+  bool restart = next != _adv_slot || (next != ADV_NONE && !Bluefruit.Advertising.isRunning());
+  if (f && !restart) {   // same slot: the payload or address changed (EID/salt rotation)
+    restart = f->len != _adv_len || memcmp(f->data, _adv_data, f->len) != 0 ||
+              memcmp(f->addr, _adv_addr, 6) != 0 || f->connectable != _adv_connectable;
+  }
+  if (!restart) return;
+  if (next == ADV_COMPANION) {
+    startAdvSlot(next, NULL, 0, NULL, true, wanted > 1 ? COMPANION_INTERVAL_CYCLE : COMPANION_INTERVAL_ALONE);
+  } else if (f) {
+    startAdvSlot(next, f->data, f->len, f->addr, f->connectable, f->interval);
   } else {
-    unsigned long in_slot = millis() - _adv_slot_started;
-    if (_adv_slot == ADV_COMPANION) want = in_slot >= BEACON_SLOT_COMPANION_MS ? ADV_BEACON : ADV_COMPANION;
-    else if (_adv_slot == ADV_BEACON) want = in_slot >= BEACON_SLOT_BEACON_MS ? ADV_COMPANION : ADV_BEACON;
-    else want = ADV_COMPANION;
+    startAdvSlot(ADV_NONE, NULL, 0, NULL, false, 0);
   }
-
-  bool restart = want != _adv_slot
-    || (want != ADV_NONE && !Bluefruit.Advertising.isRunning())     // a connection stopped it
-    || (want == ADV_BEACON && (beacon_len != _adv_beacon_len || memcmp(beacon, _adv_beacon, beacon_len) != 0));
-  if (restart) startAdvSlot(want, beacon, beacon_len);
-  return true;
 }
 #endif
-
 void SerialBLEInterface::clearBuffers() {
   send_queue_len = 0;
   recv_queue_len = 0;
@@ -365,8 +404,10 @@ void SerialBLEInterface::enable() {
   clearBuffers();
   _last_health_check = millis();
 
+#ifndef WITH_FINDHUB
   Bluefruit.Advertising.restartOnDisconnect(true);
   Bluefruit.Advertising.start(0);
+#endif
 }
 
 void SerialBLEInterface::disconnect() {
@@ -381,7 +422,7 @@ void SerialBLEInterface::disable() {
 
   Bluefruit.Advertising.restartOnDisconnect(false);
   Bluefruit.Advertising.stop();
-#ifdef FINDHUB_BEACON
+#ifdef WITH_FINDHUB
   _adv_slot = ADV_NONE;
 #endif
   disconnect();
@@ -455,8 +496,9 @@ size_t SerialBLEInterface::checkRecvFrame(uint8_t dest[]) {
     return len;
   }
   
-#ifdef FINDHUB_BEACON
-  if (_isEnabled && advertisingTick()) return 0;
+#ifdef WITH_FINDHUB
+  if (_isEnabled) advertisingTick();
+  return 0;
 #endif
 
   // Advertising watchdog: periodically check if advertising is running, restart if not
