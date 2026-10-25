@@ -1009,6 +1009,16 @@ void UITask::onFindHubRing(bool on) {
 }
 #endif
 
+bool UITask::onRingRequest(uint16_t seconds) {
+#ifdef PIN_BUZZER
+  buzzer.ring((uint32_t)seconds * 1000);
+  if (seconds) showAlert("RINGING - press a key", 3000);
+  return true;
+#else
+  return false;
+#endif
+}
+
 void UITask::loop() {
   char c = 0;
 #if UI_HAS_JOYSTICK
@@ -1095,6 +1105,13 @@ void UITask::loop() {
   }
 #endif
 
+#ifdef PIN_BUZZER
+  if (c != 0 && buzzer.isRinging()) {
+    buzzer.ring(0);   // any key silences a `ring` request
+    c = 0;
+  }
+#endif
+
 #ifdef WITH_FINDHUB
   if (c != 0 && findhub_service && findhub_service->beacon().isRinging()) {
     findhub_service->beacon().buttonPressed();   // any key silences a find request
@@ -1112,9 +1129,9 @@ void UITask::loop() {
 
 #ifdef PIN_BUZZER
   #ifdef WITH_FINDHUB
-  if (_findhub_ringing && !buzzer.isPlaying()) buzzer.playForced(FINDHUB_RING_MELODY);
+  if (_findhub_ringing && !buzzer.isPlaying()) buzzer.playForced(buzzer.ringSong());
   #endif
-  if (buzzer.isPlaying())  buzzer.loop();
+  buzzer.loop();
 #endif
 
   if (curr) curr->poll();

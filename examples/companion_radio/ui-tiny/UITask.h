@@ -103,6 +103,7 @@ public:
   void onChannelMessageRecv(mesh::Packet *pkt, ChannelDetails& channel_details, const char* text) override;
   void onQueueSizeChanged(int offline_queue_size) override;
   void onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path_len, const uint8_t* path) override;
+  bool onRingRequest(uint16_t seconds) override;
 
   // from AbstractUITask
   void notify(UIEventType t = UIEventType::none) override;

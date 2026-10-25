@@ -117,6 +117,9 @@
 #define FINDHUB_OP_RING               0x04  // deciseconds(u16 LE), 0 = stop
 #define FINDHUB_OP_PAIR               0x05  // pairing mode (unprovisioned) / EIK recovery consent (provisioned)
 
+#define RING_DEFAULT_SECS             30   // `ring` with no argument
+#define RING_MAX_SECS                 300
+
 #define MAX_CHANNEL_DATA_LENGTH       (MAX_FRAME_SIZE - 9)
 
 #define SEND_TIMEOUT_BASE_MILLIS        500
@@ -2173,6 +2176,32 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
 
   if (strcmp(command, "poweroff") == 0 || strcmp(command, "shutdown") == 0) {
     board.powerOff(); // doesn't return
+    return true;
+  }
+
+  // ring [seconds|stop]: find the radio. Reaches here from the companion CLI (BLE/USB) and from
+  // remote admins over LoRa (onCLICommandRecv only passes contacts with remote CLI allowed).
+  if (strcmp(command, "ring") == 0 || memcmp(command, "ring ", 5) == 0) {
+    const char* arg = command[4] ? &command[5] : "";
+    while (*arg == ' ') arg++;
+    uint16_t secs = RING_DEFAULT_SECS;
+    if (strcmp(arg, "stop") == 0) {
+      secs = 0;
+    } else if (*arg) {
+      int n = atoi(arg);
+      if (n < 0 || n > RING_MAX_SECS || (n == 0 && strcmp(arg, "0") != 0)) {
+        sprintf(reply, "Error: ring [1-%d|stop]", RING_MAX_SECS);
+        return true;
+      }
+      secs = n;
+    }
+    if (!_listener || !_listener->onRingRequest(secs)) {
+      strcpy(reply, "Error: no buzzer");
+    } else if (secs == 0) {
+      strcpy(reply, "OK - ring stopped");
+    } else {
+      sprintf(reply, "OK - ringing %u s", secs);
+    }
     return true;
   }
 

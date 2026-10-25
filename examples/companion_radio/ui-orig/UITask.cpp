@@ -471,6 +471,15 @@ void UITask::shutdown(bool restart){
   }
 }
 
+bool UITask::onRingRequest(uint16_t seconds) {
+#ifdef PIN_BUZZER
+  buzzer.ring((uint32_t)seconds * 1000);
+  return true;
+#else
+  return false;
+#endif
+}
+
 void UITask::loop() {
   #ifdef PIN_USER_BTN
     if (_userButton) {
@@ -485,7 +494,7 @@ void UITask::loop() {
   userLedHandler();
 
 #ifdef PIN_BUZZER
-  if (buzzer.isPlaying())  buzzer.loop();
+  buzzer.loop();
 #endif
 
   if (_display != NULL && _display->isOn()) {
@@ -520,6 +529,9 @@ void UITask::handleButtonAnyPress() {
   MESH_DEBUG_PRINTLN("UITask: any press triggered");
   // called on any button press before other events, to wake up the display quickly
   // do not refresh the display here, as it may block the button handler
+#ifdef PIN_BUZZER
+  buzzer.ring(0);   // any press silences a `ring` request
+#endif
   if (_display != NULL) {
     _displayWasOn = _display->isOn();  // Track display state before any action
     if (!_displayWasOn) {

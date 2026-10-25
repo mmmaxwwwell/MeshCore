@@ -48,7 +48,24 @@ bool genericBuzzer::isPlaying() {
     return rtttl::isPlaying();
 }
 
+void genericBuzzer::ring(uint32_t duration_millis) {
+    if (duration_millis == 0) {
+        if (_ringing) { _ringing = false; stop(); }
+        return;
+    }
+    _ringing = true;
+    _ring_until = millis() + duration_millis;
+    playForced(ring_song);
+}
+
 void genericBuzzer::loop() {
+    if (_ringing) {
+        if ((long)(millis() - _ring_until) >= 0) {
+            ring(0);
+            return;
+        }
+        if (!isPlaying()) playForced(ring_song);
+    }
     if (!rtttl::done()) rtttl::play();
 }
 

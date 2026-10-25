@@ -105,6 +105,8 @@ public:
       virtual void onTraceRecv(mesh::Packet *pkt, uint32_t tag, uint32_t auth_code, uint8_t flags,
                                const uint8_t *path_snrs, const uint8_t *path_hashes, uint8_t path_len) { }
       virtual void onRawDataRecv(mesh::Packet *pkt) { }
+      // `ring` CLI command: sound the buzzer for `seconds` (0 = stop). false = no buzzer on this build.
+      virtual bool onRingRequest(uint16_t seconds) { return false; }
       virtual ~Listener() { }
   };
 

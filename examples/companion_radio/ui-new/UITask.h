@@ -48,8 +48,6 @@ struct DiscoveredNode {
 
 #ifdef WITH_FINDHUB
   #include <helpers/nrf52/FindHubService.h>
-  // Loud, repeating, distinct from message tones. Replayed until the beacon stops.
-  #define FINDHUB_RING_MELODY "find:d=8,o=7,b=180:c,e,g,4c8,p,c,e,g,4c8,4p"
 #endif
 
 class UITask : public AbstractUITask {
@@ -129,6 +127,7 @@ public:
   void onChannelMessageRecv(mesh::Packet *pkt, ChannelDetails& channel_details, const char* text) override;
   void onQueueSizeChanged(int offline_queue_size) override;
   void onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path_len, const uint8_t* path) override;
+  bool onRingRequest(uint16_t seconds) override;
   void onControlDataRecv(const mesh::Packet* pkt) override;
 
   // from AbstractUITask

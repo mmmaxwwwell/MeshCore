@@ -609,6 +609,16 @@ bool UITask::isButtonPressed() const {
 #endif
 }
 
+bool UITask::onRingRequest(uint16_t seconds) {
+#ifdef PIN_BUZZER
+  buzzer.ring((uint32_t)seconds * 1000);
+  if (seconds) showAlert("RINGING - press a key", 3000);
+  return true;
+#else
+  return false;
+#endif
+}
+
 void UITask::loop() {
   char c = 0;
 #if UI_HAS_JOYSTICK
@@ -682,6 +692,13 @@ void UITask::loop() {
   }
 #endif
 
+#ifdef PIN_BUZZER
+  if (c != 0 && buzzer.isRinging()) {
+    buzzer.ring(0);   // any key silences a `ring` request
+    c = 0;
+  }
+#endif
+
   if (c != 0 && curr) {
     curr->handleInput(c);
     _auto_off = millis() + AUTO_OFF_MILLIS;   // extend auto-off timer
@@ -691,7 +708,7 @@ void UITask::loop() {
   userLedHandler();
 
 #ifdef PIN_BUZZER
-  if (buzzer.isPlaying())  buzzer.loop();
+  buzzer.loop();
 #endif
 
   if (curr) curr->poll();
